@@ -2,9 +2,8 @@ import time
 
 from tqdm import tqdm
 
-from src.iDriveApiWrapper.downloader.UltraDownloader import UltraDownloader
-from src.iDriveApiWrapper.downloader.state import FileStatus
-
+from ..downloader.UltraDownloader import UltraDownloader
+from ..downloader.state import FileDownloadStatus
 
 def watch_file_download(downloader: UltraDownloader, file_id: str, poll_interval: float = 0.2) -> None:
     state = downloader.get_file_state(file_id)
@@ -31,16 +30,51 @@ def watch_file_download(downloader: UltraDownloader, file_id: str, poll_interval
                 last_bytes = downloaded
 
             if state.status in (
-                FileStatus.COMPLETED,
-                FileStatus.FAILED,
-                FileStatus.CANCELLED,
+                    FileDownloadStatus.COMPLETED,
+                    FileDownloadStatus.FAILED,
+                    FileDownloadStatus.CANCELLED,
             ):
                 break
 
             time.sleep(poll_interval)
 
-    if state.status == FileStatus.FAILED:
+    if state.status == FileDownloadStatus.FAILED:
         raise RuntimeError(f"Download failed for file {file_id}: {state.error}")
 
-    if state.status == FileStatus.CANCELLED:
+    if state.status == FileDownloadStatus.CANCELLED:
         raise RuntimeError(f"Download cancelled for file {file_id}")
+
+def _aggregate_download_progress(downloader: UltraDownloader):
+    total = 0
+    downloaded = 0
+    for state in downloader.get_all_states().values():
+        total += state.size_total
+        downloaded += state.bytes_downloaded
+    return downloaded, total
+
+
+def watch_all_downloads(downloader: UltraDownloader, poll_interval: float = 0.2) -> None:
+    """
+    Monitors overall download progress across all files handled by UltraDownloader.
+    Shows one combined progress bar.
+    """
+
+    downloaded, total = _aggregate_download_progress(downloader)
+
+    with tqdm(
+        total=total,
+        initial=downloaded,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+        desc="Downloading all files",
+    ) as bar:
+
+        last = downloaded
+
+        while True:
+            downloaded, total = _aggregate_download_progress(downloader)
+            delta = downloaded - last
+            if delta > 0:
+                bar.update(delta)
+                last = downloaded

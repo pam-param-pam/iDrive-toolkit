@@ -3,7 +3,7 @@ from typing import Union, List
 
 from .Config import APIConfig
 from .downloader.UltraDownloader import UltraDownloader
-from .exceptions import UnauthorizedError, ResourceNotFoundError
+from .exceptions import BackendUnauthorizedError, BackendResourceNotFoundError
 from .models.DiscordSettings import DiscordSettings
 from .models.File import File
 from .models.Folder import Folder
@@ -43,11 +43,12 @@ class Client:
 
     @classmethod
     def login(cls, username: str, password: str, force_login: bool = False) -> "Client":
+        # todo make sure the file stgores the auth token per username and password(hash perhaps both idk)
         token, device_id = AuthClient.login(username, password, force_login)
         try:
             APIConfig.token = token
             make_request("GET", "user/me")
-        except UnauthorizedError as e:
+        except BackendUnauthorizedError as e:
             logger.info("Cached auth_token is invalid. Attempting to log you in")
             APIConfig.token = None
             token, device_id = AuthClient.login(username, password, force_login=True)
@@ -130,7 +131,7 @@ class Client:
     def get_downloader(self) -> UltraDownloader:
         if not self._ultraDownloader:
             discord_settings = self.get_discord_settings()
-            self._ultraDownloader = UltraDownloader(max_workers=len(discord_settings.bots)*2)
+            self._ultraDownloader = UltraDownloader(max_workers=len(discord_settings.bots)*3)
 
         return self._ultraDownloader
 
@@ -155,6 +156,6 @@ class Client:
         try:
             make_request("GET", f"cleanup/{attachment_id}")
             return True
-        except ResourceNotFoundError:
+        except BackendResourceNotFoundError:
             return False
 

@@ -1,10 +1,10 @@
 import logging
 import os
-import shutil
-from typing import Dict
 
-from src.iDriveApiWrapper.downloader.FileFinalizer import FileFinalizer
-from .state import FileStatus, FileRecord, FileState
+from ..downloader.FileFinalizer import FileFinalizer
+from .DownloadContext import DownloadContext
+from .path_utlis import safe_rmtree, safe_move_src_only
+from .state import FileDownloadStatus
 from ..exceptions import PathDoesntExistError
 
 logger = logging.getLogger("iDrive")
@@ -12,53 +12,62 @@ logger = logging.getLogger("iDrive")
 # Cleaned v.1
 
 class FinalizeWorker:
-    def __init__(self, finalize_q, file_states: Dict[str, FileState], file_records: Dict[str, FileRecord]):
+    def __init__(self, finalize_q, ctx: DownloadContext):
         self.fq = finalize_q
-        self.file_states = file_states
-        self.file_records = file_records
+        self.ctx = ctx
         self.finalizer = FileFinalizer()
 
-    def run(self):
+    def run(self) -> None:
         while True:
             fid = self.fq.get()
+
             if fid is None:
                 self.fq.task_done()
                 break
 
-            state = self.file_states[fid]
-            record = self.file_records[fid]
+            state = self.ctx.states.get(fid)
+            record = self.ctx.records.get(fid)
+
+            if state is None or record is None:
+                self.fq.task_done()
+                continue
 
             try:
-                if state.cancelled:
-                    state.status = FileStatus.CANCELLED
+                cancelled = False
+                with state.lock:
+                    if state.status == FileDownloadStatus.CANCELLED:
+                        cancelled = True
 
-                elif state.error is None:
+                if not cancelled:
+                    # ---- safe to finalize ----
                     self.finalizer.finalize(record)
 
                     output_dir = record.output_dir
-
                     if not os.path.isdir(output_dir):
-                        raise PathDoesntExistError(f"Target directory does not exist: {output_dir}")
+                        raise PathDoesntExistError(
+                            f"Target directory does not exist: {output_dir}"
+                        )
 
-                    target_path = os.path.join(output_dir, os.path.basename(record.output_path))
-                    shutil.move(record.output_path, target_path)
-                    shutil.rmtree(record.file_dir)
+                    safe_move_src_only(record.output_path, record.final_user_output_path)
+                    safe_rmtree(record.file_dir)
 
-                    state.status = FileStatus.COMPLETED
+                    with state.lock:
+                        state.status = FileDownloadStatus.COMPLETED
 
-                else:
-                    state.status = FileStatus.FAILED
+                    # user callback (never under lock)
+                    try:
+                        if record.on_complete:
+                            record.on_complete(fid, state)
+                    except Exception:
+                        logger.exception(f"[FinalizeWorker] on_complete callback failed for file {fid}")
 
             except Exception as e:
-                state.error = e
-                state.status = FileStatus.FAILED
+                with state.lock:
+                    state.status = FileDownloadStatus.FAILED
+                    state.error = e
                 logger.exception(f"[FinalizeWorker] Finalization failed for file {fid}")
 
             finally:
-                try:
-                    if record.on_complete:
-                        record.on_complete(fid, state)
-                except Exception:
-                    logger.exception(f"[FinalizeWorker] on_complete callback failed for file {fid}")
-
+                # terminal → block forever
+                self.ctx.recompute_run_event(state)
                 self.fq.task_done()

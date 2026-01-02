@@ -1,25 +1,21 @@
 import uuid
 from queue import Queue
-from typing import Iterator, Callable
+from typing import Iterator
 
-from src.iDriveApiWrapper.uploader.Encryptor import Encryptor
-from src.iDriveApiWrapper.uploader.VideoExtractor import extract_thumbnail_if_needed, extract_subtitles_if_needed
-from src.iDriveApiWrapper.uploader.state import (UploadInput, DiscordAttachment, DiscordRequest, UploadConfig, UploadFileState, UploadFileStatus,
-                                                 Crypto, ThumbnailAttachment, ChunkAttachment, SubtitleAttachment)
+from .models import DiscordAttachment, DiscordRequest, UploadInput, UploadFileState, UploadFileStatus, Crypto, ThumbnailAttachment, SubtitleAttachment, ChunkAttachment
+from ..uploader.Encryptor import Encryptor
+from ..uploader.UploadContext import UploadContext
+from ..uploader.VideoExtractor import extract_thumbnail_if_needed, extract_subtitles_if_needed
 
 
 class _RequestBuilder:
-    def __init__(self, get_config: Callable[[], UploadConfig]):
-        self._get_config = get_config
+    def __init__(self, ctx: UploadContext):
+        self.ctx = ctx
         self.attachments: list[DiscordAttachment] = []
         self.total_size = 0
 
-    @property
-    def config(self) -> UploadConfig:
-        return self._get_config()
-
     def can_fit(self, attachment: DiscordAttachment) -> bool:
-        return len(self.attachments) < self.config.max_attachments and self.total_size + attachment.size <= self.config.max_size
+        return len(self.attachments) < self.ctx.max_attachments and self.total_size + attachment.size <= self.ctx.max_size
 
     def add(self, attachment: DiscordAttachment) -> None:
         self.attachments.append(attachment)
@@ -37,15 +33,14 @@ class _RequestBuilder:
         return self.flush() if not self.can_fit(attachment) else None
 
     def remaining_size(self) -> int:
-        return self.config.max_size - self.total_size
+        return self.ctx.max_size - self.total_size
 
 
 class PrepareRequestWorker:
-    def __init__(self, input_queue: Queue[UploadInput], upload_queue: Queue[DiscordRequest], get_config: Callable[[], UploadConfig], file_states: dict[uuid.UUID, UploadFileState]):
+    def __init__(self, input_queue: Queue[UploadInput], upload_queue: Queue[DiscordRequest], ctx: UploadContext):
         self._input_queue = input_queue
         self._upload_queue = upload_queue
-        self._builder = _RequestBuilder(get_config)
-        self._file_states = file_states
+        self._builder = _RequestBuilder(ctx)
 
     def run(self) -> None:
         while True:
@@ -81,7 +76,7 @@ class PrepareRequestWorker:
         state.status = UploadFileStatus.SCANNING
         self._file_states[file_id] = state
 
-        method = self._builder.config.encryption_method
+        method = self._builder.ctx.encryption_method
 
         thumbnail = extract_thumbnail_if_needed(path)
         if thumbnail:
@@ -112,7 +107,7 @@ class PrepareRequestWorker:
         offset = 0
         sequence = 1
         file_size = path.stat().st_size
-        max_size = self._builder.config.max_size
+        max_size = self._builder.ctx.max_size
 
         with open(path, "rb") as f:
             while offset < file_size:

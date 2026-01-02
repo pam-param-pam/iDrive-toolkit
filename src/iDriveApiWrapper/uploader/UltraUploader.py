@@ -4,27 +4,31 @@ from pathlib import Path
 from queue import Queue
 from typing import Optional, Union, Dict
 
-from src.iDriveApiWrapper.exceptions import UploadNotAllowedError, PathDoesntExistError
-from src.iDriveApiWrapper.models.Enums import EncryptionMethod
-from src.iDriveApiWrapper.models.Folder import Folder
-from src.iDriveApiWrapper.models.Webhook import Webhook
-from src.iDriveApiWrapper.uploader.PrepareRequestWorker import PrepareRequestWorker
-from src.iDriveApiWrapper.uploader.UploadWorker import UploadWorker
-from src.iDriveApiWrapper.uploader.state import UploadInput, UploadConfig, DiscordRequest, UploadFileState
-from src.iDriveApiWrapper.utils.networker import make_request
+from ..exceptions import UploadNotAllowedError, PathDoesntExistError
+from ..models.Enums import EncryptionMethod
+from ..models.Folder import Folder
+from ..models.Webhook import Webhook
+from .PrepareRequestWorker import PrepareRequestWorker
+from .UploadContext import UploadContext
+from .UploadWorker import UploadWorker
+from .models import BackendFile, UploadInput, DiscordRequest, UploadFileState
+from ..utils.networker import make_request
 
 
 class UltraUploader:
     def __init__(self, max_message_size: int, max_attachments: int, encryption_method: EncryptionMethod):
-        self._config: Optional[UploadConfig] = None
-        self._config_lock = threading.Lock()
-        self.max_message_size = max_message_size
-        self.max_attachments = max_attachments
-        self.encryption_method = encryption_method
+        self._max_message_size = max_message_size
+        self._max_attachments = max_attachments
+        self._encryption_method = encryption_method
+
+        self.ctx = UploadContext()
+        self.MAX_RETRIES = 5
 
         # Persistent queues
         self._input_queue: Queue[UploadInput] = Queue()
         self._upload_queue: Queue[DiscordRequest] = Queue()
+        self._response_queue: Queue[DiscordRequest] = Queue()
+        self._ready_files_queue: Queue[BackendFile] = Queue()
 
         self._file_states: Dict[uuid.UUID, UploadFileState] = {}
         self._global_pause = threading.Event()
@@ -52,13 +56,13 @@ class UltraUploader:
                 return
 
             for _ in range(self._prepare_workers):
-                worker = PrepareRequestWorker(self._input_queue, self._upload_queue, self._get_config, self._file_states)
+                worker = PrepareRequestWorker(self._input_queue, self._upload_queue, ctx=self.ctx)
                 t = threading.Thread(target=worker.run, daemon=True)
                 t.start()
                 self._prepare_threads.append(t)
 
             for _ in range(self._upload_workers):
-                worker = UploadWorker(self._upload_queue, self._file_states, self._get_config, max_retries=5, global_pause=self._global_pause)
+                worker = UploadWorker(self._upload_queue, ctx=self.ctx, max_retries=self.MAX_RETRIES)
                 t = threading.Thread(target=worker.run, daemon=True)
                 t.start()
                 self._upload_threads.append(t)
@@ -89,28 +93,19 @@ class UltraUploader:
     def check_can_upload(self, parent: Folder) -> Optional[str]:
         data = make_request("GET", f"user/canUpload/{parent.id}", headers=parent._get_password_header())
 
-        new_config = UploadConfig(
+        self.ctx.configure(
             webhooks=[Webhook(**hook) for hook in data["webhooks"]],
             extensions=dict(data["extensions"]),
             attachment_name=str(data["attachment_name"]),
-            max_attachments=self.max_attachments,
-            max_size=self.max_message_size,
-            encryption_method=self.encryption_method
+            max_attachments=self._max_attachments,
+            max_size=self._max_message_size,
+            encryption_method=self._encryption_method
         )
-
-        with self._config_lock:
-            self._config = new_config
 
         if not data["can_upload"]:
             raise UploadNotAllowedError()
 
         return data["lockFrom"]
-
-    def _get_config(self) -> UploadConfig:
-        cfg = self._config
-        if cfg is None:
-            raise RuntimeError("Uploader not initialized: call check_can_upload() first")
-        return cfg
 
     # ------------------------------------------------------------------
     # Optional: graceful shutdown

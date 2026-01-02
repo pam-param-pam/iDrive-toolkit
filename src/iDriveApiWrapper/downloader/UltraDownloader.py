@@ -1,62 +1,43 @@
 import os
-import tempfile
 import threading
 from queue import Queue, Empty
-from typing import Dict, List, Optional
+from typing import List, Optional, Iterable
 
+from . import constants
 from .AutoScaler import AutoScaler
+from .DownloadContext import DownloadContext
 from .DownloadWorker import DownloadWorker
 from .FinalizeWorker import FinalizeWorker
 from .MetadataFetcher import MetadataFetcher
 from .TaskPlanner import TaskPlanner
-from .state import (
-    ThrottleState,
-    FragmentTask,
-    FileState,
-    FileRecord,
-    FileStatus, onCompleteCallback,
-)
+from .path_utlis import safe_mkdirs, safe_rmtree
+from .state import ThrottleState, FragmentTask, FileState, onCompleteCallback
 from ..Config import APIConfig
 from ..models.Item import Item
 
 
 class UltraDownloader:
     def __init__(self, max_workers: int):
-        self._temp_download_folder = os.path.join(tempfile.gettempdir(), "idrive_download")
-        os.makedirs(self._temp_download_folder, exist_ok=True)
+        self._temp_download_folder = constants.ROOT_FOLDER
+        safe_mkdirs(self._temp_download_folder)
 
+        self.ctx = DownloadContext()
         self.metadata_fetcher = MetadataFetcher()
         self.planner = TaskPlanner(self._temp_download_folder)
 
         self.throttle = ThrottleState()
         self.scaler = AutoScaler(max_workers=max_workers, throttle_state=self.throttle)
 
-        self.max_retries = 5
-        self.post_workers = 2
+        self.max_retries = constants.MAX_RETRIES
+        self.post_workers = min(8, max(2, os.cpu_count() or 2))
 
-        # Persistent queues
         self._fragment_queue: Queue[FragmentTask] = Queue()
         self._finalize_queue: Queue[str] = Queue()
-
-        # Shared state
-        self._states: Dict[str, FileState] = {}
-        self._records: Dict[str, FileRecord] = {}
-
-        self._global_pause = threading.Event()
-        self._global_pause.set()
-
-        self._lock = threading.RLock()
-        self._last_error: Optional[Exception] = None
 
         self._download_threads: List[threading.Thread] = []
         self._finalize_threads: List[threading.Thread] = []
 
         self._start_workers()
-
-    def _guard_new_file_ids(self, new_states: Dict[str, FileState]) -> None:
-        duplicates = set(new_states.keys()) & set(self._states.keys())
-        if duplicates:
-            raise RuntimeError(f"Attempted to enqueue already-existing file_ids: {sorted(duplicates)}")
 
     # ------------------------------------------------------------------
     # Worker startup (ONCE)
@@ -70,14 +51,11 @@ class UltraDownloader:
         def kill_one():
             self._fragment_queue.put(None)
 
-        # Spawn minimum workers
         for _ in range(self.scaler.min):
             spawn_one()
 
-        # Start autoscaler
         self.scaler.start(spawn_one, kill_one)
 
-        # Start finalize workers
         for _ in range(self.post_workers):
             t = self._start_finalize_thread()
             self._finalize_threads.append(t)
@@ -88,19 +66,10 @@ class UltraDownloader:
 
     def download(self, data: Item, target_dir: str = APIConfig.download_folder, on_complete: onCompleteCallback = None) -> None:
         files = self.metadata_fetcher.fetch_files(data)
-
         plan_queue, finalize_queue, states, records, size_est = self.planner.prepare(files, target_dir, on_complete)
 
-        with self._lock:
-            self._guard_new_file_ids(states)
+        self.ctx.register(states, records)
 
-            for fid, st in states.items():
-                self._states[fid] = st
-
-            for fid, rec in records.items():
-                self._records[fid] = rec
-
-        # enqueue finalize tasks (already completed files)
         while True:
             try:
                 file_id = finalize_queue.get_nowait()
@@ -108,7 +77,6 @@ class UltraDownloader:
                 break
             self._finalize_queue.put(file_id)
 
-        # enqueue fragment tasks
         while True:
             try:
                 task = plan_queue.get_nowait()
@@ -116,71 +84,67 @@ class UltraDownloader:
                 break
             self._fragment_queue.put(task)
 
+    def get_temp_download_folder(self) -> str:
+        return self._temp_download_folder
+
+    def _get_dangling_folders(self) -> Iterable[str]:
+        active = set(self.ctx.states.keys())
+        entries = os.listdir(constants.ROOT_FOLDER)
+
+        for name in entries:
+            path = os.path.join(constants.ROOT_FOLDER, name)
+
+            # Only consider directories and skip active downloads
+            if not os.path.isdir(path) or name in active:
+                continue
+
+            yield name
+
+    def clear_dangling_files(self):
+        for folder in self._get_dangling_folders():
+            safe_rmtree(folder)
+
     # ------------------------------------------------------------------
     # State querying
     # ------------------------------------------------------------------
 
     def get_file_state(self, file_id: str) -> FileState:
-        return self._states[file_id]
+        return self.ctx.get_state(file_id)
 
-    def get_all_states(self) -> Dict[str, FileState]:
-        return dict(self._states)
+    def get_all_states(self):
+        return self.ctx.get_all_states()
 
-    def get_failed_states(self) -> Dict[str, FileState]:
-        return {fid: st for fid, st in self._states.items() if st.error}
+    def get_failed_states(self):
+        return self.ctx.get_failed_states()
 
     def get_download_rate(self) -> float:
         return self.throttle.download_rate()
 
     def get_last_error(self) -> Optional[Exception]:
-        return self._last_error
+        return self.ctx.last_error
 
     # ------------------------------------------------------------------
     # Global pause / resume
     # ------------------------------------------------------------------
 
     def pause_all(self) -> None:
-        self._global_pause.clear()
-        for st in self._states.values():
-            with st.lock:
-                if st.status == FileStatus.DOWNLOADING:
-                    st.status = FileStatus.PAUSED
+        self.ctx.pause_all()
 
     def resume_all(self) -> None:
-        self._global_pause.set()
-        for st in self._states.values():
-            with st.lock:
-                if st.status == FileStatus.PAUSED and not st.cancelled:
-                    st.status = FileStatus.DOWNLOADING
+        self.ctx.resume_all()
 
     # ------------------------------------------------------------------
     # Per-file control
     # ------------------------------------------------------------------
 
     def pause_file(self, file_id: str) -> None:
-        st = self._states[file_id]
-        with st.lock:
-            st.pause_event.clear()
-            if st.status == FileStatus.DOWNLOADING:
-                st.status = FileStatus.PAUSED
+        self.ctx.pause_file(file_id)
 
     def resume_file(self, file_id: str) -> None:
-        st = self._states[file_id]
-        with st.lock:
-            st.pause_event.set()
-            if (
-                st.status == FileStatus.PAUSED
-                and not st.cancelled
-                and st.error is None
-                and st.fragments_downloaded < st.fragments_total
-            ):
-                st.status = FileStatus.DOWNLOADING
+        self.ctx.resume_file(file_id)
 
     def cancel_file(self, file_id: str) -> None:
-        st = self._states[file_id]
-        with st.lock:
-            st.cancelled = True
-            st.status = FileStatus.CANCELLED
+        self.ctx.cancel_file(file_id)
 
     # ------------------------------------------------------------------
     # Worker helpers
@@ -188,20 +152,17 @@ class UltraDownloader:
 
     def _start_download_thread(self) -> threading.Thread:
         worker = DownloadWorker(
-            self._fragment_queue,
-            self._finalize_queue,
-            self._states,
-            self._records,
-            self.max_retries,
-            self.throttle,
-            self._global_pause,
-        )
+            fragment_queue=self._fragment_queue,
+            finalize_queue=self._finalize_queue,
+            ctx=self.ctx,
+            max_retries=self.max_retries,
+            throttle=self.throttle)
         t = threading.Thread(target=worker.run, daemon=True)
         t.start()
         return t
 
     def _start_finalize_thread(self) -> threading.Thread:
-        worker = FinalizeWorker(self._finalize_queue, self._states, self._records)
+        worker = FinalizeWorker(self._finalize_queue, self.ctx)
         t = threading.Thread(target=worker.run, daemon=True)
         t.start()
         return t

@@ -5,7 +5,9 @@ from typing import Optional
 from overrides import overrides
 
 from .Enums import EncryptionMethod
+from .Fragment import Fragment
 from .Moment import Moment
+from .RawMetadata import RawMetadata
 from .Subtitle import Subtitle
 from .Tag import Tag
 from .VideoMetadata import VideoMetadata
@@ -30,7 +32,9 @@ class File(Item):
         self._video_position: Optional[int] = None
         self._duration: Optional[int] = None
         self._crc: Optional[int] = None
-        self._preview_url: Optional[str] = None
+        self._isRawMetadata: Optional[bool] = None
+        self._isVideoMetadata: Optional[bool] = None
+
         self._iso: Optional[str] = None
         self._model_name: Optional[str] = None
         self._aperture: Optional[str] = None
@@ -38,7 +42,8 @@ class File(Item):
         self._focal_length: Optional[str] = None
 
         # _fetch_more_data
-        self._videoMetadata: Optional[VideoMetadata] = None
+        self._videoMetadata: Optional[dict] = None
+        self._rawMetadata: Optional[dict] = None
 
         # _fetch_secrets
         self._encryption_iv: Optional[str] = None
@@ -52,6 +57,9 @@ class File(Item):
 
         # _fetch_tags
         self._tags: Optional[list[Tag]] = None
+
+        # _fetch_fragments
+        self._fragments: Optional[list[Fragment]] = None
 
     @property
     def view_url(self):
@@ -119,11 +127,6 @@ class File(Item):
 
     @property
     @autoFetchProperty('_fetch_data')
-    def preview_url(self):
-        return self._preview_url
-
-    @property
-    @autoFetchProperty('_fetch_data')
     def duration(self):
         return self._duration
 
@@ -138,9 +141,23 @@ class File(Item):
         return self._isVideoMetadata
 
     @property
+    @autoFetchProperty('_fetch_data')
+    def isRawMetadata(self):
+        return self._isRawMetadata
+
+    @property
     @autoFetchProperty('_fetch_more_data')
     def videoMetadata(self):
+        if not self.isVideoMetadata:
+            return None
         return VideoMetadata(self._videoMetadata)
+
+    @property
+    @autoFetchProperty('_fetch_more_data')
+    def rawMetadata(self):
+        if not self.isRawMetadata:
+            return None
+        return RawMetadata(**self._rawMetadata)
 
     @property
     @autoFetchProperty('_fetch_secrets')
@@ -162,6 +179,11 @@ class File(Item):
     def subtitles(self):
         return self._subtitles
 
+    @property
+    @autoFetchProperty('_fetch_fragments')
+    def fragments(self):
+        return self._fragments
+
     def __str__(self):
         return f"File({self.name})"
 
@@ -171,6 +193,7 @@ class File(Item):
     @overrides
     def _set_more_data(self, data):
         self._videoMetadata = data
+        self._rawMetadata = data
 
     @overrides
     def _fetch_data(self):
@@ -214,6 +237,13 @@ class File(Item):
     def create_subtitles(self, timestamp):
         raise NotImplemented()
 
+    def _fetch_fragments(self):
+        res_data = make_request("POST", f"items/ultraDownload/items/{self.id}", headers=self._get_password_header())
+        fragments = [Fragment(**frag) for frag in res_data[0]['fragments']]
+        for frag in fragments:
+            frag.set_password(self.get_password())
+        self._fragments = fragments
+
     def play(self):
         if self.type != "video":
             raise ValueError("File is not a video")
@@ -242,8 +272,6 @@ class File(Item):
                 self._thumbnail_url = value
             elif key == "download_url":
                 self._download_url = value
-            elif key == "preview_url":
-                self._preview_url = value
             elif key == "iso":
                 self._iso = value
             elif key == "model_name":
@@ -260,6 +288,8 @@ class File(Item):
                 self._duration = value
             elif key == "isVideoMetadata":
                 self._isVideoMetadata = value
+            elif key == "isRawMetadata":
+                self._isRawMetadata = value
             elif key == "crc":
                 self._crc = value
             else:

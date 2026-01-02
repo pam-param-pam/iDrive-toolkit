@@ -10,7 +10,7 @@ logger = logging.getLogger("iDrive")
 
 class AutoScaler:
     def __init__(self, max_workers: int, throttle_state: ThrottleState):
-        self.min = 1
+        self.min = 10
         self.max = max_workers
         self.current = self.min
         self.ts = throttle_state

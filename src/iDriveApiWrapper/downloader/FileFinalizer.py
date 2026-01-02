@@ -3,63 +3,47 @@ import base64
 import zlib
 
 from .Decryptor import Decryptor
+from .path_utlis import safe_open
 from .state import FileRecord, FileInfo
-from ..models.Enums import EncryptionMethod
+from ..exceptions import CrcIntegrityError
 
 
 class FileFinalizer:
     def finalize(self, record: FileRecord):
-        file_info = record.file_info
-        file_dir = record.file_dir
-        merged_path = record.merged_path
-        output_path = record.output_path
+        fragments = sorted(record.file_info.fragments, key=lambda f: f.sequence)
+        self._decrypt_merge_and_verify(
+            file_info=record.file_info,
+            fragments=fragments,
+            source_dir=record.file_dir,
+            output_path=record.output_path,
+        )
 
-        fragments = file_info.fragments
+    def _decrypt_merge_and_verify(self, file_info: FileInfo, fragments, source_dir, output_path):
+        key = base64.b64decode(file_info.key)
+        iv = base64.b64decode(file_info.iv)
+        dec = Decryptor(file_info.encryption_method, key, iv)
 
-        if not os.path.exists(merged_path):
-            self._merge_fragments(file_dir, merged_path, len(fragments))
+        overall_crc = 0
 
-        self._decrypt(file_info, merged_path, output_path)
+        with safe_open(output_path, "wb") as out:
+            for frag in fragments:
+                frag_crc = 0
+                frag_path = os.path.join(source_dir, f"{frag.sequence}.part")
 
-        self._verify_crc(output_path, file_info.crc)
+                with safe_open(frag_path, "rb") as i_f:
+                    for chunk in iter(lambda: i_f.read(2 * 1024 * 1024), b""):
+                        dec_chunk = dec.decrypt(chunk)
 
-        self._remove_fragments(file_dir, len(fragments))
+                        frag_crc = zlib.crc32(dec_chunk, frag_crc)
+                        overall_crc = zlib.crc32(dec_chunk, overall_crc)
 
-    def _merge_fragments(self, file_dir, merged_path, count):
-        with open(merged_path, "wb") as out:
-            for i in range(1, count + 1):
-                path = os.path.join(file_dir, f"{i}.part")
-                with open(path, "rb") as p:
-                    out.write(p.read())
+                        out.write(dec_chunk)
 
-    def _decrypt(self, info: FileInfo, input, output):
-        if info.encryption_method == EncryptionMethod.Not_Encrypted:
-            os.rename(input, output)
-            return
+                frag_crc &= 0xFFFFFFFF
+                if frag_crc != frag.crc:
+                    raise CrcIntegrityError(f"Bad fragment CRC. sequence={frag.sequence}, expected={frag.crc}, got={frag_crc}")
 
-        key = base64.b64decode(info.key)
-        iv = base64.b64decode(info.iv)
-        dec = Decryptor(info.encryption_method, key, iv)
-
-        with open(input, "rb") as i, open(output, "wb") as o:
-            for chunk in iter(lambda: i.read(8192), b""):
-                o.write(dec.decrypt(chunk))
-            final = dec.finalize()
-            if final:
-                o.write(final)
-
-        os.remove(input)
-
-    def _verify_crc(self, path, expected):
-        crc = 0
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                crc = zlib.crc32(chunk, crc)
-        if (crc & 0xFFFFFFFF) != expected:
-            raise CrcIntegrityError(f"CRC mismatch. Expected: {expected}, Actual: {actual}")
-
-    def _remove_fragments(self, file_dir, count):
-        for i in range(1, count + 1):
-            p = os.path.join(file_dir, f"{i}.part")
-            if os.path.exists(p):
-                os.remove(p)
+        expected = file_info.crc & 0xFFFFFFFF
+        actual = overall_crc & 0xFFFFFFFF
+        if actual != expected:
+            raise CrcIntegrityError(f"Final CRC mismatch. Expected={expected}, Actual={actual}")

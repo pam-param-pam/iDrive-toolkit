@@ -1,5 +1,5 @@
-from src.iDriveApiWrapper.models.Enums import EncryptionMethod
-from src.iDriveApiWrapper.utils.StreamCipherBase import StreamCipherBase
+from ..models.Enums import EncryptionMethod
+from ..utils.StreamCipherBase import StreamCipherBase
 
 
 class Encryptor(StreamCipherBase):

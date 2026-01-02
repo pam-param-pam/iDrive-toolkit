@@ -3,13 +3,14 @@ import os
 from queue import Queue
 from typing import Tuple, Dict, List, Callable, Optional
 
+from .path_utlis import safe_remove_file
 from .state import (
     FileState,
     FragmentTask,
     FileInfo,
     FragmentInfo,
     FileRecord,
-    FileStatus,
+    FileDownloadStatus,
 )
 
 logger = logging.getLogger("iDrive")
@@ -32,17 +33,21 @@ class TaskPlanner:
             fragments = file.fragments
 
             temp_file_dir = os.path.join(self._temp_folder, file_id)
-            os.makedirs(temp_file_dir, exist_ok=True)
+            output_path = os.path.join(temp_file_dir, file_id)
 
-            merged_path = os.path.join(temp_file_dir, f"{name}.encrypted")
-            output_path = os.path.join(target_dir, name)
+            final_user_output_path = os.path.join(target_dir, name)
 
+            # # todo
+            # if self._check_if_exists(final_user_output_path, file.crc):
+            #     continue
+            #
             missing_fragments, downloaded_fragments, downloaded_bytes, remaining_bytes = self._missing(temp_file_dir, fragments)
 
             remaining_size_est += remaining_bytes
 
             # --- Initialize FileState to reflect disk reality ---
             state = FileState(
+                file_id=file_id,
                 fragments_total=len(fragments),
                 fragments_downloaded=downloaded_fragments,
                 size_total=file.size,
@@ -51,25 +56,25 @@ class TaskPlanner:
             state.bytes_downloaded = downloaded_bytes
 
             if downloaded_fragments == len(fragments):
-                state.status = FileStatus.COMPLETED
+                state.status = FileDownloadStatus.FULLY_DOWNLOADED
             elif downloaded_fragments > 0:
-                state.status = FileStatus.PAUSED
+                state.status = FileDownloadStatus.PAUSED
             else:
-                state.status = FileStatus.PENDING
+                state.status = FileDownloadStatus.PENDING
 
             file_states[file_id] = state
 
             file_records[file_id] = FileRecord(
                 file_info=file,
                 file_dir=temp_file_dir,
-                merged_path=merged_path,
                 output_path=output_path,
+                final_user_output_path=final_user_output_path,
                 output_dir=target_dir,
                 on_complete=on_complete,
             )
 
             # --- Queue work ---
-            if state.status == FileStatus.COMPLETED:
+            if state.status == FileDownloadStatus.FULLY_DOWNLOADED:
                 # Already on disk → finalize immediately
                 finalize_queue.put(file_id)
             else:
@@ -107,7 +112,7 @@ class TaskPlanner:
                     downloaded_bytes += frag.size
                 else:
                     logger.info(f"[TaskPlanner] .part frag size doesnt match: {actual_size}!={frag.size} removing .part file....")
-                    os.remove(part_path)
+                    safe_remove_file(part_path)
                     missing.append(frag)
                     remaining_bytes += frag.size
             else:

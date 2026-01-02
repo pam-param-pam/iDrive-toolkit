@@ -2,18 +2,28 @@ import logging
 import time
 import threading
 import uuid
-from typing import Dict, Set
+from typing import Dict, Set, Callable
 from queue import Queue
 
 from .DiscordUploader import DiscordUploader
-from .state import DiscordRequest, UploadFileState, UploadFileStatus, ChunkAttachment, SubtitleAttachment, ThumbnailAttachment
-from ..exceptions import RateLimitError, ServiceUnavailableError, NetworkError, ServerTimeoutError
+from .models import DiscordRequest, UploadFileState, ResponsePayload
+from ..exceptions import DiscordRateLimitError, BackendRateLimitError, BackendServiceUnavailableError, BackendServerTimeout, DiscordServerTimeout
 
 logger = logging.getLogger("iDrive")
 
 #todo unchecked
+class UploadConfig:
+    pass
+
+
 class UploadWorker:
-    def __init__(self, upload_queue: Queue[DiscordRequest], upload_states: Dict[uuid.UUID, UploadFileState], get_config, max_retries: int, global_pause: threading.Event):
+    def __init__(self,
+                 upload_queue: Queue[DiscordRequest],
+                 response_queue: Queue[ResponsePayload],
+                 upload_states: Dict[uuid.UUID, UploadFileState],
+                 max_retries: int,
+                 global_pause: threading.Event):
+
         self.upload_queue = upload_queue
         self.upload_states = upload_states
         self._get_config = get_config
@@ -51,14 +61,11 @@ class UploadWorker:
 
             try:
                 self._mark_uploading(states)
-
                 self._upload(task)
-
                 self._mark_progress(task)
-
                 self._mark_completed_if_done(states)
 
-            except (RateLimitError, ServiceUnavailableError) as e:
+            except (DiscordRateLimitError, BackendRateLimitError) as e:
                 if task.retries >= self.max_retries:
                     self._fail_states(states, e)
                 else:
@@ -67,7 +74,7 @@ class UploadWorker:
                     task.retries += 1
                     self.upload_queue.put(task)
 
-            except (NetworkError, ServerTimeoutError) as e:
+            except (BackendServiceUnavailableError, BackendServerTimeout, DiscordServerTimeout) as e:
                 self._mark_retrying_network(states)
                 logger.warning(f"[UploadWorker] Network issue ({e.__class__.__name__}) → waiting 5s request={task.request_id}")
                 time.sleep(5)
@@ -83,7 +90,6 @@ class UploadWorker:
     def _upload(self, task: DiscordRequest) -> None:
         if self._any_cancelled(self._states_for_file_ids(self._file_ids_from_task(task))):
             return
-        print(f"UPLOADING: {task}")
         self.http.upload(task)
 
     def _file_ids_from_task(self, task: DiscordRequest) -> Set[uuid.UUID]:

@@ -1,7 +1,7 @@
 from ..models.Resource import Resource
 from ..utils.networker import make_request
 
-
+# todo moment should not inhjerting from Resource
 class Moment(Resource):
     def __init__(self, file_id: str, timestamp: float, created_at, url: str):
         super().__init__(timestamp)

@@ -7,6 +7,7 @@ class VisitsNamedTuple(NamedTuple):
     access_count: int
     last_access_time: str
 
+
 class VideoTrackTuple(NamedTuple):
     bitrate: int
     codec: str
@@ -43,11 +44,13 @@ class SubtitleTrackTuple(NamedTuple):
     number: int
     type: str
 
+
 class User(NamedTuple):
     name: str
     root: str
     maxDiscordMessageSize: int
     maxAttachmentsPerMessage: int
+
 
 class Perms(NamedTuple):
     admin: bool
@@ -58,6 +61,7 @@ class Perms(NamedTuple):
     delete: bool
     share: bool
     download: bool
+
 
 class Device(NamedTuple):
     device_name: str

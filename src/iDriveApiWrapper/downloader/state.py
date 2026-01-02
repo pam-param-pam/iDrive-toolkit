@@ -4,7 +4,21 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, List, Union, Callable
 
-from src.iDriveApiWrapper.models.Enums import EncryptionMethod
+from ..models.Enums import EncryptionMethod
+
+
+class FileDownloadStatus(Enum):
+    FULLY_DOWNLOADED = "fully_downloaded"
+    PENDING = "pending"
+    DOWNLOADING = "downloading"
+    PAUSED = "paused"
+    RETRYING_NETWORK = "retrying_network"
+    RETRYING_SERVER = "retrying_server"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    QUEUED = "queued"
+    SAVING = "saving"
 
 
 @dataclass
@@ -14,6 +28,7 @@ class FragmentInfo:
     offset: int
     sequence: int
     size: int
+    crc: int
 
 
 @dataclass
@@ -67,33 +82,23 @@ class FragmentTask:
     retries: int = 0
 
 
-class FileStatus(Enum):
-    PENDING = "pending"
-    DOWNLOADING = "downloading"
-    PAUSED = "paused"
-    RETRYING_NETWORK = "retrying_network"
-    RETRYING_SERVER = "retrying_server"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-    QUEUED = "queued"
-
-
 @dataclass
 class FileState:
+    file_id: str
     fragments_total: int
     fragments_downloaded: int = 0
     size_total: int = 0
     bytes_downloaded: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
     error: Optional[Exception] = None
-    status: FileStatus = FileStatus.QUEUED
+    status: FileDownloadStatus = FileDownloadStatus.QUEUED
     pause_event: threading.Event = field(default_factory=threading.Event)
+    run_event: threading.Event = field(default_factory=threading.Event)
     cancelled: bool = False
 
     def __post_init__(self):
-        # By default files are not paused
         self.pause_event.set()
+        self.run_event.set()
 
 
 onCompleteCallback = Optional[Callable[[str, FileState], None]]
@@ -103,7 +108,7 @@ onCompleteCallback = Optional[Callable[[str, FileState], None]]
 class FileRecord:
     file_info: FileInfo
     file_dir: str
-    merged_path: str
+    final_user_output_path: str
     output_dir: str
     output_path: str
     on_complete: onCompleteCallback
@@ -112,17 +117,9 @@ class FileRecord:
 class ThrottleState:
     def __init__(self, window: int = 10):
         self.lock = threading.Lock()
-        self.window = window  # lookback window (seconds)
-
-        # hard throttling (429, 503, etc.)
-        self._hard_events = []  # [timestamp]
-
-        # download throughput
-        self._byte_events = []  # [(timestamp, bytes)]
-
-    # ---------------------------
-    # hard errors (429 / 503)
-    # ---------------------------
+        self.window = window
+        self._hard_events = []
+        self._byte_events = []
 
     def signal_error(self) -> None:
         now = time.time()
@@ -136,10 +133,6 @@ class ThrottleState:
         with self.lock:
             self._prune_times(self._hard_events, now)
             return len(self._hard_events)
-
-    # ---------------------------
-    # throughput
-    # ---------------------------
 
     def signal_bytes(self, byte_count: int) -> None:
         """Record bytes downloaded by *any* worker."""
@@ -164,10 +157,6 @@ class ThrottleState:
             first_ts = self._byte_events[0][0]
             duration = max(now - first_ts, 0.001)
             return total_bytes / duration
-
-    # ---------------------------
-    # helpers
-    # ---------------------------
 
     def _prune_times(self, arr, now: float) -> None:
         cutoff = now - self.window

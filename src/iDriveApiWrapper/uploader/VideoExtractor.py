@@ -5,8 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from src.iDriveApiWrapper.uploader.models import VideoMetadata, VideoTrack, AudioTrack, SubtitleTrack
-from src.iDriveApiWrapper.uploader.state import ExtractedThumbnail, ExtractedSubtitle
+from src.iDriveApiWrapper.uploader.models import VideoMetadata, VideoTrack, AudioTrack, SubtitleTrack, ExtractedThumbnail, ExtractedSubtitle
 
 _TEXT_SUB_CODECS = {"mov_text", "tx3g", "subrip", "srt", "ass", "ssa", "webvtt"}
 

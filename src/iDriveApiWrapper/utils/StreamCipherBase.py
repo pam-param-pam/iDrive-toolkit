@@ -37,9 +37,9 @@ class StreamCipherBase:
     def _increment_iv(self, bytes_to_skip):
         blocks_to_skip = bytes_to_skip // 16
         counter_offset = bytes_to_skip % 16
-        counter_int = int.from_bytes(self.iv, byteorder="big")
+        counter_int = int.from_bytes(self.iv)
         counter_int += blocks_to_skip
-        self.iv = counter_int.to_bytes(len(self.iv), byteorder="big")
+        self.iv = counter_int.to_bytes(len(self.iv))
         return counter_offset
 
     def _calculate_nonce(self, bytes_to_skip: int):
