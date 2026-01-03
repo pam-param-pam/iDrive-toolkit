@@ -6,7 +6,7 @@ from typing import Optional
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from src.iDriveApiWrapper.models.Enums import EventType
+from ..models.Enums import EventType
 
 
 class WebsocketEvent:

@@ -1,163 +1,172 @@
 import logging
 import time
-import threading
 import uuid
-from typing import Dict, Set, Callable
 from queue import Queue
+from typing import Dict
 
-from .DiscordUploader import DiscordUploader
-from .models import DiscordRequest, UploadFileState, ResponsePayload
-from ..exceptions import DiscordRateLimitError, BackendRateLimitError, BackendServiceUnavailableError, BackendServerTimeout, DiscordServerTimeout
+import httpx
+
+from .UploadContext import UploadContext
+from .models import DiscordRequest, UploadFileState, FileUploadStatus, ResponsePayload
+from ..downloader.models import ThrottleState
+from ..exceptions import DiscordRateLimitError, BackendRateLimitError, BackendServerTimeout, DiscordServerTimeout, BackendServiceUnavailableError
 
 logger = logging.getLogger("iDrive")
 
-#todo unchecked
-class UploadConfig:
-    pass
-
-
 class UploadWorker:
-    def __init__(self,
-                 upload_queue: Queue[DiscordRequest],
-                 response_queue: Queue[ResponsePayload],
-                 upload_states: Dict[uuid.UUID, UploadFileState],
-                 max_retries: int,
-                 global_pause: threading.Event):
-
-        self.upload_queue = upload_queue
-        self.upload_states = upload_states
-        self._get_config = get_config
+    def __init__(self, request_queue: Queue[DiscordRequest], response_queue: Queue[ResponsePayload], ctx: UploadContext, max_retries: int, throttle: ThrottleState):
+        self.request_queue = request_queue
+        self.response_queue = response_queue
+        self.ctx = ctx
         self.max_retries = max_retries
-        self.global_pause = global_pause
-        self.http = DiscordUploader(self._get_config,  global_pause, upload_states)
+        self.throttle = throttle
+        self._client = httpx.Client(timeout=20.0, follow_redirects=True)
+
+    # -------------------------------------------------
+    # Main loop
+    # -------------------------------------------------
 
     def run(self) -> None:
         while True:
-            task = self.upload_queue.get()
-            print("FOUND TASK", task)
-            if task is None:
-                self.upload_queue.task_done()
-                break
-
-            file_ids = self._file_ids_from_task(task)
-            states = self._states_for_file_ids(file_ids)
-
-            if not states:
-                print("No states found")
-                self.upload_queue.task_done()
-                continue
-
-            if self._any_cancelled(states):
-                print("CANCELED")
-                self.upload_queue.task_done()
-                continue
-
-            if not self._can_run_now(states):
-                print("CANNED")
-                self.upload_queue.put(task)
-                self.upload_queue.task_done()
-                time.sleep(0.05)
-                continue
+            request = self.request_queue.get()
 
             try:
-                self._mark_uploading(states)
-                self._upload(task)
-                self._mark_progress(task)
-                self._mark_completed_if_done(states)
+                if not self._wait_until_can_upload(request):
+                    continue
+
+                self._mark_uploading(request)
+                self._upload(request)
 
             except (DiscordRateLimitError, BackendRateLimitError) as e:
-                if task.retries >= self.max_retries:
-                    self._fail_states(states, e)
+                if request.retries >= self.max_retries:
+                    self._fail_states(request, e)
                 else:
-                    logger.warning(f"[UploadWorker] Throttled ({e.__class__.__name__}) → retrying in {e.wait}s (retry {task.retries}) request={task.request_id}")
+                    logger.warning(
+                        f"[UploadWorker] Throttled ({e.__class__.__name__}) → "
+                        f"retrying in {e.wait}s (retry {request.retries}) "
+                        f"request={request.request_id}"
+                    )
                     time.sleep(e.wait)
-                    task.retries += 1
-                    self.upload_queue.put(task)
+                    request.retries += 1
+                    self.request_queue.put(request)
 
             except (BackendServiceUnavailableError, BackendServerTimeout, DiscordServerTimeout) as e:
-                self._mark_retrying_network(states)
-                logger.warning(f"[UploadWorker] Network issue ({e.__class__.__name__}) → waiting 5s request={task.request_id}")
+                self._mark_retrying_network(request)
+                logger.warning(
+                    f"[UploadWorker] Network issue ({e.__class__.__name__}) → "
+                    f"waiting 5s request={request.request_id}"
+                )
                 time.sleep(5)
-                self.upload_queue.put(task)
+                self.request_queue.put(request)
 
             except Exception as e:
-                self._fail_states(states, e)
-                logger.exception(f"[UploadWorker] Unexpected failure request={task.request_id}")
+                self._fail_states(request, e)
+                logger.exception(f"[UploadWorker] Unexpected failure request={request.request_id}")
 
             finally:
-                self.upload_queue.task_done()
+                self.request_queue.task_done()
 
-    def _upload(self, task: DiscordRequest) -> None:
-        if self._any_cancelled(self._states_for_file_ids(self._file_ids_from_task(task))):
-            return
-        self.http.upload(task)
+    def _upload(self, request: DiscordRequest) -> None:
+        webhook = self._pick_webhook()
+        url = webhook.url
 
-    def _file_ids_from_task(self, task: DiscordRequest) -> Set[uuid.UUID]:
-        ids: Set[uuid.UUID] = set()
-        for att in task.attachments:
-            ids.add(att.frontend_id)
-        return ids
+        try:
+            files = {}
+            payload = {}
 
-    def _states_for_file_ids(self, file_ids: Set[uuid.UUID]) -> Dict[uuid.UUID, UploadFileState]:
-        out: Dict[uuid.UUID, UploadFileState] = {}
-        for fid in file_ids:
-            st = self.upload_states.get(fid)
-            if st is not None:
-                out[fid] = st
-        return out
+            for idx, att in enumerate(request.attachments):
+                files[f"files[{idx}]"] = (
+                    self.ctx.attachment_name,
+                    att.data,
+                    "application/octet-stream",
+                )
 
-    def _any_cancelled(self, states: Dict[uuid.UUID, UploadFileState]) -> bool:
-        for st in states.values():
-            if st.cancelled:
-                return True
-        return False
+            response = self._client.post(url, data=payload, files=files)
 
-    def _can_run_now(self, states: Dict[uuid.UUID, UploadFileState]) -> bool:
-        if not self.global_pause.is_set():
+            if response.status_code == 429:
+                self.throttle.signal_error()
+                raise DiscordRateLimitError(response)
+
+            response.raise_for_status()
+
+            uploaded_bytes = sum(len(att.data) for att in request.attachments)
+            self.throttle.signal_bytes(uploaded_bytes)
+
+            self.response_queue.put(ResponsePayload(
+                response=response,
+                request=request
+            ))
+
+        except (httpx.TimeoutException, httpx.ReadTimeout) as e:
+            self.throttle.signal_error()
+            raise DiscordServerTimeout("Upload timed out") from e
+        except httpx.RequestError as e: # todo
+            self.throttle.signal_error()
+            raise DiscordServerTimeout("Network error during upload") from e
+
+    def _pick_webhook(self):
+        return self.ctx.webhooks[0]
+
+    def _wait_until_can_upload(self, request: DiscordRequest) -> bool:
+        states = self._get_states_from_request(request)
+        # No states → nothing to do
+        if not states:
             return False
-        for st in states.values():
-            if not st.pause_event.is_set():
-                return False
-        return True
 
-    def _mark_uploading(self, states: Dict[uuid.UUID, UploadFileState]) -> None:
+        if len(states) != 1:
+            return False
+
+        # Exactly one file
+        st = next(iter(states.values()))
+
+        while True:
+            with st.lock:
+                if st.cancelled or st.is_terminal():
+                    return False
+
+                # If not paused → proceed immediately
+                if st.run_event.is_set():
+                    return True
+
+            # Paused → wait until resume/cancel
+            st.run_event.wait()
+
+    # -------------------------------------------------
+    # Helpers
+    # -------------------------------------------------
+    def _get_states_from_request(self, request: DiscordRequest) -> Dict[uuid.UUID, UploadFileState]:
+        file_ids = {att.frontend_id for att in request.attachments}
+        states = self.ctx.states
+        return {fid: states[fid] for fid in file_ids if fid in states}
+
+    # -------------------------------------------------
+    # State transitions
+    # -------------------------------------------------
+
+    def _mark_uploading(self, request: DiscordRequest) -> None:
+        states = self._get_states_from_request(request)
         for st in states.values():
             with st.lock:
                 if not st.is_terminal():
-                    st.status = UploadFileStatus.UPLOADING
+                    st.status = FileUploadStatus.UPLOADING
+                    self.ctx.recompute_run_event(st)
 
-    def _mark_retrying_network(self, states: Dict[uuid.UUID, UploadFileState]) -> None:
+    def _mark_retrying_network(self, request: DiscordRequest) -> None:
+        states = self._get_states_from_request(request)
+
         for st in states.values():
             with st.lock:
                 if not st.is_terminal():
-                    st.status = UploadFileStatus.RETRYING_NETWORK
+                    st.status = FileUploadStatus.RETRYING_NETWORK
+                    self.ctx.recompute_run_event(st)
 
-    def _fail_states(self, states: Dict[uuid.UUID, UploadFileState], e: Exception) -> None:
+    def _fail_states(self, request: DiscordRequest, e: Exception) -> None:
+        states = self._get_states_from_request(request)
+
         for st in states.values():
             with st.lock:
                 st.error = e
                 if not st.cancelled:
-                    st.status = UploadFileStatus.FAILED
+                    st.status = FileUploadStatus.FAILED
+                    self.ctx.recompute_run_event(st)
 
-    def _mark_progress(self, task: DiscordRequest) -> None:
-        for att in task.attachments:
-            st = self.upload_states.get(att.frontend_id)
-            if st is None:
-                continue
-            with st.lock:
-                if st.is_terminal() or st.cancelled:
-                    continue
-                if isinstance(att, ChunkAttachment):
-                    st.uploaded_chunks += 1
-                elif isinstance(att, SubtitleAttachment):
-                    st.uploaded_subtitles += 1
-                elif isinstance(att, ThumbnailAttachment):
-                    st.uploaded_thumbnail += 1
-
-    def _mark_completed_if_done(self, states: Dict[uuid.UUID, UploadFileState]) -> None:
-        for st in states.values():
-            with st.lock:
-                if st.cancelled or st.is_terminal():
-                    continue
-                if st.is_fully_extracted():
-                    st.status = UploadFileStatus.COMPLETED

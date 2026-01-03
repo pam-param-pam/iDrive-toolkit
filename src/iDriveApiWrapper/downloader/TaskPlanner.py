@@ -4,14 +4,7 @@ from queue import Queue
 from typing import Tuple, Dict, List, Callable, Optional
 
 from .path_utlis import safe_remove_file
-from .state import (
-    FileState,
-    FragmentTask,
-    FileInfo,
-    FragmentInfo,
-    FileRecord,
-    FileDownloadStatus,
-)
+from .models import FileState, FragmentTask, FileInfo, FragmentInfo, FileRecord, FileDownloadStatus
 
 logger = logging.getLogger("iDrive")
 
@@ -40,7 +33,7 @@ class TaskPlanner:
             # # todo
             # if self._check_if_exists(final_user_output_path, file.crc):
             #     continue
-            #
+
             missing_fragments, downloaded_fragments, downloaded_bytes, remaining_bytes = self._missing(temp_file_dir, fragments)
 
             remaining_size_est += remaining_bytes

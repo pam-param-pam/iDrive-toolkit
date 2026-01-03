@@ -1,5 +1,4 @@
-from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 
 import os
@@ -15,6 +14,17 @@ from httpx import Response
 from ..models.Enums import EncryptionMethod
 from ..models.Folder import Folder
 from ..models.VideoMetadata import VideoMetadata
+
+class FileUploadStatus(Enum):
+    PENDING = "pending"
+    SCANNING = "scanning"
+    UPLOADING = "uploading"
+    PAUSED = "paused"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    RETRYING_NETWORK = "retrying_network"
+    COMPLETED = "completed"
+
 
 @dataclass(frozen=True)
 class Crypto:
@@ -40,7 +50,6 @@ class Crypto:
         raise ValueError(f"Unsupported encryption method: {method}")
 
 
-"""Upload input given to UltraUploader and passed to PrepareRequestWorker"""
 @dataclass(frozen=True)
 class UploadInput:
     path: Path
@@ -48,13 +57,11 @@ class UploadInput:
     lock_from_id: Optional[str]
 
 
-"""Extracted thumbnail"""
 @dataclass(frozen=True)
 class ExtractedThumbnail:
     data: bytes
 
 
-"""Extracted subtitle"""
 @dataclass(frozen=True)
 class ExtractedSubtitle:
     data: bytes
@@ -75,8 +82,9 @@ class DiscordAttachment:
 
 @dataclass(frozen=True)
 class ChunkAttachment(DiscordAttachment):
-    sequence: Optional[int] = None
-    offset: Optional[int] = None
+    sequence: Optional[int]
+    offset: Optional[int]
+    crc: int
 
     def __str__(self):
         return f"ChunkAttachment[frontend_ig={self.frontend_id!r}, sequence={self.sequence!r}, offset={self.offset}]"
@@ -92,8 +100,8 @@ class ThumbnailAttachment(DiscordAttachment):
 
 @dataclass(frozen=True)
 class SubtitleAttachment(DiscordAttachment):
-    language: Optional[str] = None
-    is_forced: Optional[bool] = None
+    language: Optional[str]
+    is_forced: Optional[bool]
 
     def __str__(self):
         return f"SubtitleAttachment[frontend_ig={self.frontend_id!r}, language={self.language!r}, is_forced={self.is_forced}]"
@@ -119,46 +127,40 @@ class ResponsePayload:
     response: Response
     request: DiscordRequest
 
-class UploadFileStatus(Enum):
-    PENDING = "pending"
-    SCANNING = "scanning"
-    READY = "ready"
-    UPLOADING = "uploading"
-    PAUSED = "paused"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-    RETRYING_NETWORK = "retrying_network"
+@dataclass
+class FileArtifacts:
+    file_crypto: Crypto
+    file_crc: int
+    video_metadata: Optional[VideoMetadata]
 
 @dataclass
 class UploadFileState:
-    expected_chunks: int
-    expected_subtitles: int
-    expected_thumbnail: int
+    expected_chunks: int = 0
     uploaded_chunks: int = 0
+    expected_subtitles: int = 0
     uploaded_subtitles: int = 0
-    uploaded_thumbnail: int = 0
-    status: UploadFileStatus = UploadFileStatus.PENDING
+    expected_thumbnail: bool = False
+    uploaded_thumbnail: bool = False
+    video_metadata_required: bool = False
+    status: FileUploadStatus = FileUploadStatus.PENDING
     error: Optional[Exception] = None
     cancelled: bool = False
+    artifacts: FileArtifacts = None
+
+    run_event: threading.Event = field(default_factory=threading.Event)
     pause_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self):
         # By default files are not paused
         self.pause_event.set()
+        self.run_event.set()
 
     def is_fully_extracted(self) -> bool:
         return self.uploaded_chunks == self.expected_chunks and self.uploaded_subtitles == self.expected_subtitles and self.uploaded_thumbnail == self.expected_thumbnail
 
     def is_terminal(self) -> bool:
-        return self.status in (UploadFileStatus.COMPLETED, UploadFileStatus.FAILED, UploadFileStatus.CANCELLED)
-
-@dataclass
-class UploadFileArtifacts:
-    file_crypto: Crypto = None
-    crc: int = 0
-    video_metadata: Optional[VideoMetadata] = None
+        return self.status in (FileUploadStatus.COMPLETED, FileUploadStatus.FAILED, FileUploadStatus.CANCELLED)
 
 
 @dataclass
@@ -267,4 +269,3 @@ class BackendFile:
     videoMetadata: Optional[VideoMetadata]
     subtitles: Optional[List[BackendSubtitle]]
     fragments: Optional[List[BackendFragment]] = field(default_factory=list)
-

@@ -1,5 +1,5 @@
-from src.iDriveApiWrapper.models.Resource import Resource
-from src.iDriveApiWrapper.utils.networker import make_request
+from ..models.Resource import Resource
+from ..utils.networker import make_request
 
 
 class Fragment(Resource):

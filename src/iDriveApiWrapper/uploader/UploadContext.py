@@ -2,14 +2,13 @@ import threading
 import uuid
 from typing import Dict, Optional, Mapping
 
-from .models import UploadFileState
+from .models import UploadFileState, FileUploadStatus
 from ..models.Enums import EncryptionMethod
 from ..models.Webhook import Webhook
 
 
 class UploadContext:
     def __init__(self):
-        # --- immutable upload configuration (set once) ---
         self.attachment_name: Optional[str] = None
         self.max_attachments: Optional[int] = None
         self.max_size: Optional[int] = None
@@ -17,7 +16,6 @@ class UploadContext:
         self.extensions: Mapping[str, list[str]] = {}
         self.encryption_method: Optional[EncryptionMethod] = None
 
-        # --- runtime state ---
         self.lock = threading.RLock()
         self.states: Dict[uuid.UUID, UploadFileState] = {}
 
@@ -40,11 +38,10 @@ class UploadContext:
 
     def recompute_run_event(self, st: UploadFileState) -> None:
         can_run = (
-            self.global_pause.is_set()
-            and st.pause_event.is_set()
-            and not st.cancelled
+            not st.cancelled
             and st.error is None
-            and not st.completed
+            and not st.is_terminal()
+            and st.pause_event.is_set()
         )
 
         if can_run:
@@ -64,8 +61,6 @@ class UploadContext:
             self.states[file_id] = state
             st = state
 
-            # initialize permission
-            st.run_event.set()
             self.recompute_run_event(st)
 
     # -------------------------------------------------
@@ -95,8 +90,8 @@ class UploadContext:
 
         for st in states:
             with st.lock:
-                if st.status == UploadStatus.UPLOADING:
-                    st.status = UploadStatus.PAUSED
+                if st.status == FileUploadStatus.UPLOADING:
+                    st.status = FileUploadStatus.PAUSED
                 self.recompute_run_event(st)
 
     def resume_all(self) -> None:
@@ -106,8 +101,8 @@ class UploadContext:
 
         for st in states:
             with st.lock:
-                if st.status == UploadStatus.PAUSED and not st.cancelled:
-                    st.status = UploadStatus.UPLOADING
+                if st.status == FileUploadStatus.PAUSED and not st.cancelled:
+                    st.status = FileUploadStatus.UPLOADING
                 self.recompute_run_event(st)
 
     # -------------------------------------------------
@@ -118,21 +113,21 @@ class UploadContext:
         st = self.get_state(file_id)
         with st.lock:
             st.pause_event.clear()
-            if st.status == UploadStatus.UPLOADING:
-                st.status = UploadStatus.PAUSED
+            if st.status == FileUploadStatus.UPLOADING:
+                st.status = FileUploadStatus.PAUSED
             self.recompute_run_event(st)
 
     def resume_file(self, file_id: uuid.UUID) -> None:
         st = self.get_state(file_id)
         with st.lock:
             st.pause_event.set()
-            if st.status == UploadStatus.PAUSED and not st.cancelled and st.error is None:
-                st.status = UploadStatus.UPLOADING
+            if st.status == FileUploadStatus.PAUSED and not st.cancelled and st.error is None:
+                st.status = FileUploadStatus.UPLOADING
             self.recompute_run_event(st)
 
     def cancel_file(self, file_id: uuid.UUID) -> None:
         st = self.get_state(file_id)
         with st.lock:
             st.cancelled = True
-            st.status = UploadStatus.CANCELLED
+            st.status = FileUploadStatus.CANCELLED
             self.recompute_run_event(st)

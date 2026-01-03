@@ -1,11 +1,12 @@
 import uuid
+import zlib
 from queue import Queue
 from typing import Iterator
 
-from .models import DiscordAttachment, DiscordRequest, UploadInput, UploadFileState, UploadFileStatus, Crypto, ThumbnailAttachment, SubtitleAttachment, ChunkAttachment
+from .models import DiscordAttachment, DiscordRequest, UploadInput, UploadFileState, Crypto, ThumbnailAttachment, SubtitleAttachment, ChunkAttachment, FileUploadStatus, FileArtifacts
 from ..uploader.Encryptor import Encryptor
 from ..uploader.UploadContext import UploadContext
-from ..uploader.VideoExtractor import extract_thumbnail_if_needed, extract_subtitles_if_needed
+from ..uploader.VideoExtractor import extract_thumbnail_if_needed, extract_subtitles_if_needed, extract_video_metadata
 
 
 class _RequestBuilder:
@@ -41,6 +42,7 @@ class PrepareRequestWorker:
         self._input_queue = input_queue
         self._upload_queue = upload_queue
         self._builder = _RequestBuilder(ctx)
+        self.ctx = ctx
 
     def run(self) -> None:
         while True:
@@ -72,11 +74,24 @@ class PrepareRequestWorker:
 
         file_id = uuid.uuid4()
 
-        state = UploadFileState(expected_chunks=0, expected_subtitles=0, expected_thumbnail=0)
-        state.status = UploadFileStatus.SCANNING
-        self._file_states[file_id] = state
+        state.artifacts = FileArtifacts(
+            frontend_id=file_id,
+            extension=extension,
+            created_at=created_at,
+            size=size,
+            parent_id=parent_id,
+            lock_from_id=lock_from_id,
+            parent_password=parent_password,
+            file_crypto=file_crypto,
+            file_crc=overall_crc,
+            video_metadata=video_metadata
+        )
 
+        state = UploadFileState()
+        state.status = FileUploadStatus.SCANNING
+        self.ctx.states[file_id] = state
         method = self._builder.ctx.encryption_method
+        video_metadata = extract_video_metadata(path)
 
         thumbnail = extract_thumbnail_if_needed(path)
         if thumbnail:
@@ -108,6 +123,7 @@ class PrepareRequestWorker:
         sequence = 1
         file_size = path.stat().st_size
         max_size = self._builder.ctx.max_size
+        overall_crc = 0
 
         with open(path, "rb") as f:
             while offset < file_size:
@@ -122,11 +138,14 @@ class PrepareRequestWorker:
 
                 take = min(remaining_request, remaining_file)
                 raw_chunk = f.read(take)
+                overall_crc = zlib.crc32(raw_chunk, overall_crc)
+                chunk_crc = zlib.crc32(raw_chunk)
+
                 if not raw_chunk:
                     break
 
                 encrypted = file_encryptor.encrypt(raw_chunk)
-                att = ChunkAttachment(frontend_id=file_id, data=encrypted, sequence=sequence, offset=offset, crypto=file_crypto)
+                att = ChunkAttachment(frontend_id=file_id, data=encrypted, sequence=sequence, offset=offset, crypto=file_crypto, crc=chunk_crc)
                 state.expected_chunks += 1
                 req = self._builder.flush_if_needed(att)
                 if req:
@@ -136,8 +155,9 @@ class PrepareRequestWorker:
                 offset += len(raw_chunk)
                 sequence += 1
 
+
+
         req = self._builder.flush()
         if req:
             yield req
 
-        state.status = UploadFileStatus.READY

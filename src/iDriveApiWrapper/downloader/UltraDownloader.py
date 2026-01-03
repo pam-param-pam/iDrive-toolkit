@@ -4,16 +4,16 @@ from queue import Queue, Empty
 from typing import List, Optional, Iterable
 
 from . import constants
-from .AutoScaler import AutoScaler
 from .DownloadContext import DownloadContext
 from .DownloadWorker import DownloadWorker
 from .FinalizeWorker import FinalizeWorker
 from .MetadataFetcher import MetadataFetcher
 from .TaskPlanner import TaskPlanner
 from .path_utlis import safe_mkdirs, safe_rmtree
-from .state import ThrottleState, FragmentTask, FileState, onCompleteCallback
+from .models import ThrottleState, FragmentTask, FileState, onCompleteCallback
 from ..Config import APIConfig
 from ..models.Item import Item
+from ..utils.AutoScaler import AutoScaler
 
 
 class UltraDownloader:
@@ -26,7 +26,7 @@ class UltraDownloader:
         self.planner = TaskPlanner(self._temp_download_folder)
 
         self.throttle = ThrottleState()
-        self.scaler = AutoScaler(max_workers=max_workers, throttle_state=self.throttle)
+        self.scaler = AutoScaler(throttle_state=self.throttle, max_workers=max_workers)
 
         self.max_retries = constants.MAX_RETRIES
         self.post_workers = min(8, max(2, os.cpu_count() or 2))
@@ -118,7 +118,7 @@ class UltraDownloader:
         return self.ctx.get_failed_states()
 
     def get_download_rate(self) -> float:
-        return self.throttle.download_rate()
+        return self.throttle.bytes_rate()
 
     def get_last_error(self) -> Optional[Exception]:
         return self.ctx.last_error
@@ -145,6 +145,7 @@ class UltraDownloader:
 
     def cancel_file(self, file_id: str) -> None:
         self.ctx.cancel_file(file_id)
+        self.clear_dangling_files()  # todo remove only 1 folder not all
 
     # ------------------------------------------------------------------
     # Worker helpers
@@ -155,8 +156,9 @@ class UltraDownloader:
             fragment_queue=self._fragment_queue,
             finalize_queue=self._finalize_queue,
             ctx=self.ctx,
-            max_retries=self.max_retries,
-            throttle=self.throttle)
+            throttle=self.throttle,
+            max_retries=self.max_retries
+        )
         t = threading.Thread(target=worker.run, daemon=True)
         t.start()
         return t
@@ -172,6 +174,8 @@ class UltraDownloader:
     # ------------------------------------------------------------------
 
     def shutdown(self) -> None:
+        self.scaler.stop()
+
         for _ in self._download_threads:
             self._fragment_queue.put(None)
         for t in self._download_threads:

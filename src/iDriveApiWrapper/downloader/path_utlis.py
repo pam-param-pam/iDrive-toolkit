@@ -13,14 +13,8 @@ def _ensure_within_root(path: str) -> None:
     real_path = _real_path(path)
     real_root = _real_path(ROOT_FOLDER)
 
-    # os.path.commonpath is safe (unlike commonprefix)
     if os.path.commonpath([real_path, real_root]) != real_root:
-        raise UnsafePathError(
-            f"Refusing filesystem operation outside root.\n"
-            f"  path: {real_path}\n"
-            f"  root: {real_root}"
-        )
-
+        raise UnsafePathError(f"Refusing filesystem operation outside root.\npath: {real_path}\nroot: {real_root}")
 
 def safe_remove_file(path: str) -> None:
     _ensure_within_root(path)
@@ -45,21 +39,14 @@ def safe_mkdirs(path: str, exist_ok: bool = True) -> None:
 
 @contextmanager
 def safe_open(path: str, mode: str, **kwargs):
-    # 1. Guard the *intended* path
     _ensure_within_root(path)
 
-    # 2. Open the file
     f = open(path, mode, **kwargs)
 
     try:
-        # 3. Guard what was *actually opened*
         real_fd_path = os.path.realpath(f.name)
         _ensure_within_root(real_fd_path)
-
         yield f
 
     finally:
-        try:
-            f.close()
-        except Exception:
-            pass
+        f.close()

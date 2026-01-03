@@ -1,6 +1,6 @@
 import logging
 
-from .state import FileInfo
+from .models import FileInfo
 from ..models.Item import Item
 from ..utils.networker import make_request
 

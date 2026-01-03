@@ -2,18 +2,18 @@ import threading
 import time
 import logging
 
-from ..downloader.state import ThrottleState
+from ..downloader.models import ThrottleState
 
 logger = logging.getLogger("iDrive")
 
 # todo needs refactoring
 
 class AutoScaler:
-    def __init__(self, max_workers: int, throttle_state: ThrottleState):
-        self.min = 10
+    def __init__(self, throttle_state: ThrottleState, max_workers: int):
         self.max = max_workers
+        self.throttle_state = throttle_state
+        self.min = 10
         self.current = self.min
-        self.ts = throttle_state
         self.lock = threading.Lock()
         self.stop_flag = False
 
@@ -24,8 +24,8 @@ class AutoScaler:
         self._last_scale_up_time = 0.0
         self._last_scale_down_time = 0.0
 
-        self._scale_up_cooldown = 3     # seconds
-        self._scale_down_cooldown = 6  # seconds
+        self._scale_up_cooldown = 3
+        self._scale_down_cooldown = 6
 
     # -------------------------------
     # Worker count management
@@ -47,26 +47,26 @@ class AutoScaler:
             self._last_scale_down_time = time.time()
             logger.info(f"[AutoScaler] Scaled DOWN → workers={self.current}")
         else:
-            logger.info( f"[AutoScaler] Wanted scale DOWN but already at min={self.min}")
+            logger.info(f"[AutoScaler] Wanted scale DOWN but already at min={self.min}")
 
     # -------------------------------
     # Autoscaling loop
     # -------------------------------
 
-    def start(self, spawn_fn, kill_fn):
-        t = threading.Thread(target=self._loop, args=(spawn_fn, kill_fn), daemon=True)
+    def start(self, spawn_func, kill_func):
+        t = threading.Thread(target=self._loop, args=(spawn_func, kill_func), daemon=True)
         t.start()
         return t
 
-    def _loop(self, spawn_fn, kill_fn):
+    def _loop(self, spawn_func, kill_func):
         logger.info("[AutoScaler] Started autoscaling loop")
 
         while not self.stop_flag:
             time.sleep(1.5)
 
             now = time.time()
-            hard_errors = self.ts.error_rate()
-            rate = self.ts.download_rate()
+            hard_errors = self.throttle_state.error_rate()
+            rate = self.throttle_state.bytes_rate()
 
             # cooldown checks
             can_scale_up = (now - self._last_scale_up_time) >= self._scale_up_cooldown
@@ -77,7 +77,7 @@ class AutoScaler:
                 if hard_errors > 0:
                     logger.warning(f"[AutoScaler] Hard throttling ({hard_errors}) → request scale DOWN")
                     if can_scale_down:
-                        self._dec_workers(kill_fn)
+                        self._dec_workers(kill_func)
                     else:
                         logger.debug("[AutoScaler] DOWN blocked by cooldown")
                     self._last_rate = rate
@@ -92,7 +92,7 @@ class AutoScaler:
                 if self._no_improve_steps >= 4 and self.current > self.min:
                     logger.info(f"[AutoScaler] Throughput plateau: rate={rate:.1f}, prev={self._last_rate:.1f}")
                     if can_scale_down:
-                        self._dec_workers(kill_fn)
+                        self._dec_workers(kill_func)
                     else:
                         logger.debug("[AutoScaler] DOWN blocked by cooldown")
                     self._last_rate = rate
@@ -102,7 +102,7 @@ class AutoScaler:
                 if hard_errors == 0 and can_scale_up:
                     if rate > self._last_rate * 1.10:  # >10% improvement
                         logger.info("[AutoScaler] Improving throughput → scale UP")
-                        self._inc_workers(spawn_fn)
+                        self._inc_workers(spawn_func)
                 else:
                     if not can_scale_up:
                         logger.debug("[AutoScaler] UP blocked by cooldown")
@@ -114,4 +114,3 @@ class AutoScaler:
     def stop(self):
         logger.info("[AutoScaler] Stop requested")
         self.stop_flag = True
-

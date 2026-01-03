@@ -135,7 +135,7 @@ class ThrottleState:
             return len(self._hard_events)
 
     def signal_bytes(self, byte_count: int) -> None:
-        """Record bytes downloaded by *any* worker."""
+        """Record bytes processed by *any* worker."""
         if byte_count <= 0:
             return
         now = time.time()
@@ -143,7 +143,7 @@ class ThrottleState:
             self._byte_events.append((now, byte_count))
             self._prune_bytes(now)
 
-    def download_rate(self) -> float:
+    def bytes_rate(self) -> float:
         """
         Bytes/sec averaged over the window.
         """

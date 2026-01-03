@@ -1,7 +1,7 @@
 import threading
 from typing import Dict, Optional
 
-from .state import FileState, FileRecord, FileDownloadStatus
+from .models import FileState, FileRecord, FileDownloadStatus
 
 
 class DownloadContext:
