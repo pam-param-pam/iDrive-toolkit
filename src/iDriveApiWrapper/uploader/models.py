@@ -1,9 +1,9 @@
+import base64
 from typing import List
 
 
 import os
 import threading
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -19,10 +19,12 @@ class FileUploadStatus(Enum):
     PENDING = "pending"
     SCANNING = "scanning"
     UPLOADING = "uploading"
+    SAVING = "saving"
     PAUSED = "paused"
+    RETRYING = "retrying"
     FAILED = "failed"
+    SAVE_FAILED = "save_failed"
     CANCELLED = "cancelled"
-    RETRYING_NETWORK = "retrying_network"
     COMPLETED = "completed"
 
 
@@ -49,6 +51,15 @@ class Crypto:
 
         raise ValueError(f"Unsupported encryption method: {method}")
 
+    def key_b64(self) -> Optional[str]:
+        if self.key is None:
+            return None
+        return base64.b64encode(self.key).decode("ascii")
+
+    def iv_b64(self) -> Optional[str]:
+        if self.iv is None:
+            return None
+        return base64.b64encode(self.iv).decode("ascii")
 
 @dataclass(frozen=True)
 class UploadInput:
@@ -71,7 +82,7 @@ class ExtractedSubtitle:
 
 @dataclass(frozen=True)
 class DiscordAttachment:
-    frontend_id: uuid.UUID
+    frontend_id: str
     data: bytes
     crypto: Crypto
 
@@ -109,10 +120,9 @@ class SubtitleAttachment(DiscordAttachment):
     __repr__ = __str__
 
 
-@dataclass(frozen=True)
+@dataclass()
 class DiscordRequest:
     attachments: list[ChunkAttachment | ThumbnailAttachment | SubtitleAttachment | DiscordAttachment]
-    request_id: uuid.UUID = uuid.uuid4()
     retries: int = 0
 
     @property
@@ -129,9 +139,19 @@ class ResponsePayload:
 
 @dataclass
 class FileArtifacts:
+    frontend_id: str
+    name: str
+    extension: str
+    created_at: int
+    size: int
+    parent_id: str
+    lock_from_id: str
+    parent_password: str
     file_crypto: Crypto
-    file_crc: int
-    video_metadata: Optional[VideoMetadata]
+    encryption_method: EncryptionMethod
+    video_metadata: VideoMetadata
+    duration: int
+    file_crc: Optional[int] = 0
 
 @dataclass
 class UploadFileState:
@@ -146,6 +166,7 @@ class UploadFileState:
     error: Optional[Exception] = None
     cancelled: bool = False
     artifacts: FileArtifacts = None
+    bytes_uploaded: int = 0
 
     run_event: threading.Event = field(default_factory=threading.Event)
     pause_event: threading.Event = field(default_factory=threading.Event)
@@ -156,7 +177,7 @@ class UploadFileState:
         self.pause_event.set()
         self.run_event.set()
 
-    def is_fully_extracted(self) -> bool:
+    def is_fully_uploaded(self) -> bool:
         return self.uploaded_chunks == self.expected_chunks and self.uploaded_subtitles == self.expected_subtitles and self.uploaded_thumbnail == self.expected_thumbnail
 
     def is_terminal(self) -> bool:
@@ -232,8 +253,8 @@ class BackendThumbnail:
     channel_id: str
     message_id: str
     attachment_id: str
-    iv: bytes
-    key: bytes
+    iv: str
+    key: str
     message_author_id: str
 
 
@@ -245,8 +266,8 @@ class BackendSubtitle:
     attachment_id: str
     language: str
     is_forced: bool
-    iv: bytes
-    key: bytes
+    iv: str
+    key: str
     message_author_id: str
 
 
@@ -258,10 +279,10 @@ class BackendFile:
     size: int
     frontend_id: str
     encryption_method: int
-    created_at: str
+    created_at: int
     duration: Optional[int]
-    iv: bytes
-    key: bytes
+    iv: str
+    key: str
     crc: int
     parent_password: str
     lock_from: str

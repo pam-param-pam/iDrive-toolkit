@@ -4,7 +4,7 @@ from typing import Optional, Dict
 
 from .UploadContext import UploadContext
 from .models import ResponsePayload, UploadFileState, BackendFile, BackendFragment, BackendThumbnail, BackendSubtitle, ChunkAttachment, ThumbnailAttachment, SubtitleAttachment, \
-    DiscordAttachment
+    DiscordAttachment, FileUploadStatus
 
 logger = logging.getLogger("iDrive")
 
@@ -14,7 +14,6 @@ class ResponseConsumerWorker:
         self.response_queue = response_queue
         self.ready_files_queue = ready_files_queue
         self.ctx = ctx
-
         self._backend_state: Dict[str, BackendFile] = {}
 
     def run(self) -> None:
@@ -54,42 +53,41 @@ class ResponseConsumerWorker:
     # Backend state handling (JS: getOrCreateState)
     # -------------------------------------------------
 
-    def _get_or_create_backend_file(self, st: UploadFileState) -> BackendFile:
-        fid = st
-
-        if fid not in self._backend_state:
-            self._backend_state[fid] = BackendFile(
-                name=st.name,
-                parent_id=st.folder_id,
-                extension=st.extension,
-                size=st.size,
-                frontend_id=fid,
-                encryption_method=int(st.encryption_method),
-                created_at=st.created_at,
-                duration=st.duration,
-                iv=st.iv,
-                key=st.key,
+    def _get_or_create_backend_file(self, state: UploadFileState) -> BackendFile:
+        file_id = str(state.artifacts.frontend_id)
+        if file_id not in self._backend_state:
+            self._backend_state[file_id] = BackendFile(
+                name=state.artifacts.name,
+                parent_id=state.artifacts.parent_id,
+                extension=state.artifacts.extension,
+                size=state.artifacts.size,
+                frontend_id=str(state.artifacts.frontend_id),
+                encryption_method=state.artifacts.encryption_method.value,
+                created_at=state.artifacts.created_at,
+                duration=state.artifacts.duration,
+                iv=state.artifacts.file_crypto.iv_b64(),
+                key=state.artifacts.file_crypto.key_b64(),
                 crc=0,
-                parent_password=st.file_obj.parent_password,
-                lock_from=st.file_obj.lock_from,
+                parent_password=state.artifacts.parent_password,
+                lock_from=state.artifacts.lock_from_id,
                 thumbnail=None,
                 videoMetadata=None,
                 subtitles=[],
                 fragments=[],
             )
 
-        return self._backend_state[fid]
+        return self._backend_state[file_id]
 
     # -------------------------------------------------
     # Attachment processing (JS: fillAttachmentInfo)
     # -------------------------------------------------
 
     def _fill_attachment_info(self, attachment: ChunkAttachment | ThumbnailAttachment | SubtitleAttachment | DiscordAttachment, discord_response: dict, discord_attachment: dict) -> None:
-        st: UploadFileState = self.ctx.get_state(attachment.frontend_id)
-        backend_file = self._get_or_create_backend_file(st)
+        state: UploadFileState = self.ctx.get_state(attachment.frontend_id)
+        backend_file = self._get_or_create_backend_file(state)
 
         if isinstance(attachment, ChunkAttachment):
-            backend_file.crc = st.crc
+            backend_file.crc = state.artifacts.file_crc
 
             backend_file.fragments.append(
                 BackendFragment(
@@ -104,20 +102,20 @@ class ResponseConsumerWorker:
                 )
             )
 
-            st.increment_chunk()
+            state.uploaded_chunks += 1
 
         elif isinstance(attachment, ThumbnailAttachment):
             backend_file.thumbnail = BackendThumbnail(
-                size=len(attachment.raw_blob),
+                size=len(attachment.data),
                 channel_id=discord_response["channel_id"],
                 message_id=discord_response["id"],
                 attachment_id=discord_attachment["id"],
-                iv=attachment.iv,
-                key=attachment.key,
+                iv=attachment.crypto.iv_b64(),
+                key=attachment.crypto.key_b64(),
                 message_author_id=discord_response["author"]["id"],
             )
 
-            st.mark_thumbnail_uploaded()
+            state.uploaded_thumbnail = True
 
         elif isinstance(attachment, SubtitleAttachment):
             backend_file.subtitles.append(
@@ -128,20 +126,20 @@ class ResponseConsumerWorker:
                     attachment_id=discord_attachment["id"],
                     language=attachment.language,
                     is_forced=attachment.is_forced,
-                    iv=attachment.crypto.iv,
-                    key=attachment.crypto.key,
+                    iv=attachment.crypto.iv_b64(),
+                    key=attachment.crypto.key_b64(),
                     message_author_id=discord_response["author"]["id"],
                 )
             )
 
-            if st.extracted_subtitle_count == len(backend_file.subtitles):
-                st.mark_subtitles_uploaded()
+            state.uploaded_subtitles += 1
 
         # -------------------------------------------------
         # Finalization (JS: isFullyUploaded)
         # -------------------------------------------------
 
-        if st.is_fully_uploaded():
-            st.mark_file_uploaded()
-            backend_file = self._backend_state.pop(st.file_obj.frontend_id)
+        if state.is_fully_uploaded():
+            with state.lock:
+                state.status = FileUploadStatus.SAVING
+            backend_file = self._backend_state.pop(str(state.artifacts.frontend_id))
             self.ready_files_queue.put(backend_file)

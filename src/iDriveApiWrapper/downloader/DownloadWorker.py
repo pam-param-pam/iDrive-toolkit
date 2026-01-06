@@ -56,7 +56,7 @@ class DownloadWorker:
                         if state.fragments_downloaded == state.fragments_total:
                             self.finalize_queue.put(fragment.file_id)
 
-            except (DiscordRateLimitError, BackendRateLimitError) as e:
+            except (DiscordRateLimitError, BackendRateLimitError, BackendServiceUnavailableError) as e:
                 self.throttle.signal_error()
                 if fragment.retries >= self.max_retries:
                     with state.lock:
@@ -68,18 +68,18 @@ class DownloadWorker:
                     fragment.retries += 1
                     self.fragment_queue.put(fragment)
 
-            except (BackendServiceUnavailableError, BackendServerTimeout, DiscordServerTimeout) as e:
+            except (BackendServerTimeout, DiscordServerTimeout) as e:
                 with state.lock:
-                    state.status = FileDownloadStatus.RETRYING_NETWORK
-                logger.warning(f"[DownloadWorker] Network issue ({e.__class__.__name__}) → waiting 10s")
-                time.sleep(10)
+                    state.status = FileDownloadStatus.RETRYING
+                logger.warning(f"[DownloadWorker] Network issue ({e.__class__.__name__}) → waiting 5s")
+                time.sleep(5)
                 self.fragment_queue.put(fragment)
 
             except Exception as e:
                 with state.lock:
                     state.error = e
                     state.status = FileDownloadStatus.FAILED
-                logger.exception(f"[DownloadWorker] Unexpected failure for file {fragment.file_id}")
+                logger.exception(f"[DownloadWorker] Unexpected failure for file {fragment.file_id}")  # todo fail entire file and cancel it if its failed lol
 
             finally:
                 self.fragment_queue.task_done()

@@ -2,8 +2,8 @@ import time
 
 from tqdm import tqdm
 
+from .models import FileDownloadStatus
 from ..downloader.UltraDownloader import UltraDownloader
-from ..downloader.state import FileDownloadStatus
 
 def watch_file_download(downloader: UltraDownloader, file_id: str, poll_interval: float = 0.2) -> None:
     state = downloader.get_file_state(file_id)

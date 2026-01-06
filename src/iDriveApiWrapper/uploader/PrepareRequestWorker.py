@@ -3,10 +3,10 @@ import zlib
 from queue import Queue
 from typing import Iterator
 
+from .Extractor import extract_video_metadata_if_needed, extract_thumbnail_if_needed, extract_subtitles_if_needed, get_file_extension
 from .models import DiscordAttachment, DiscordRequest, UploadInput, UploadFileState, Crypto, ThumbnailAttachment, SubtitleAttachment, ChunkAttachment, FileUploadStatus, FileArtifacts
 from ..uploader.Encryptor import Encryptor
 from ..uploader.UploadContext import UploadContext
-from ..uploader.VideoExtractor import extract_thumbnail_if_needed, extract_subtitles_if_needed, extract_video_metadata
 
 
 class _RequestBuilder:
@@ -54,6 +54,7 @@ class PrepareRequestWorker:
             try:
                 for request in self.prepare_upload(item):
                     self._upload_queue.put(request)
+
             finally:
                 self._input_queue.task_done()
 
@@ -72,51 +73,57 @@ class PrepareRequestWorker:
                 yield from self.prepare_upload(UploadInput(path=child, parent=new_parent, lock_from_id=lock_from_id))
             return
 
-        file_id = uuid.uuid4()
+        frontend_id = str(uuid.uuid4())
+        state = UploadFileState()
+        self.ctx.states[frontend_id] = state
+
+        # try:
+        state.status = FileUploadStatus.SCANNING
+
+        extension = get_file_extension(path.name)
+
+        encryption_method = self.ctx.encryption_method
+        video_metadata, duration = extract_video_metadata_if_needed(self.ctx.extensions, extension, path)
+        file_crypto = Crypto.generate(encryption_method)
 
         state.artifacts = FileArtifacts(
-            frontend_id=file_id,
+            frontend_id=frontend_id,
+            name=path.name,
             extension=extension,
-            created_at=created_at,
-            size=size,
-            parent_id=parent_id,
+            created_at=int(path.stat().st_mtime * 1000),
+            size=path.stat().st_size,
+            parent_id=parent.id,
             lock_from_id=lock_from_id,
-            parent_password=parent_password,
+            parent_password=parent.get_password(),
+            encryption_method=encryption_method,
             file_crypto=file_crypto,
-            file_crc=overall_crc,
+            duration=duration,
             video_metadata=video_metadata
         )
 
-        state = UploadFileState()
-        state.status = FileUploadStatus.SCANNING
-        self.ctx.states[file_id] = state
-        method = self._builder.ctx.encryption_method
-        video_metadata = extract_video_metadata(path)
-
-        thumbnail = extract_thumbnail_if_needed(path)
+        thumbnail = extract_thumbnail_if_needed(self.ctx.extensions, extension, path)
         if thumbnail:
-            thumbnail_crypto = Crypto.generate(method)
+            thumbnail_crypto = Crypto.generate(encryption_method)
             thumb_encryptor = Encryptor(method=thumbnail_crypto.method, key=thumbnail_crypto.key, iv=thumbnail_crypto.iv)
             encrypted_thumb = thumb_encryptor.encrypt(thumbnail.data)
-            att = ThumbnailAttachment(frontend_id=file_id, data=encrypted_thumb, crypto=thumbnail_crypto)
-            state.expected_thumbnail += 1
+            att = ThumbnailAttachment(frontend_id=frontend_id, data=encrypted_thumb, crypto=thumbnail_crypto)
+            state.expected_thumbnail = True
             req = self._builder.flush_if_needed(att)
             if req:
                 yield req
             self._builder.add(att)
 
-        for sub in extract_subtitles_if_needed(path):
-            subtitle_crypto = Crypto.generate(method)
+        for sub in extract_subtitles_if_needed(self.ctx.extensions, extension, path):
+            subtitle_crypto = Crypto.generate(encryption_method)
             sub_encryptor = Encryptor(method=subtitle_crypto.method, key=subtitle_crypto.key, iv=subtitle_crypto.iv)
             encrypted_sub = sub_encryptor.encrypt(sub.data)
-            att = SubtitleAttachment(frontend_id=file_id, data=encrypted_sub, language=sub.language, is_forced=sub.is_forced, crypto=subtitle_crypto)
+            att = SubtitleAttachment(frontend_id=frontend_id, data=encrypted_sub, language=sub.language, is_forced=sub.is_forced, crypto=subtitle_crypto)
             state.expected_subtitles += 1
             req = self._builder.flush_if_needed(att)
             if req:
                 yield req
             self._builder.add(att)
 
-        file_crypto = Crypto.generate(method)
         file_encryptor = Encryptor(method=file_crypto.method, key=file_crypto.key, iv=file_crypto.iv)
 
         offset = 0
@@ -145,7 +152,7 @@ class PrepareRequestWorker:
                     break
 
                 encrypted = file_encryptor.encrypt(raw_chunk)
-                att = ChunkAttachment(frontend_id=file_id, data=encrypted, sequence=sequence, offset=offset, crypto=file_crypto, crc=chunk_crc)
+                att = ChunkAttachment(frontend_id=frontend_id, data=encrypted, sequence=sequence, offset=offset, crypto=file_crypto, crc=chunk_crc)
                 state.expected_chunks += 1
                 req = self._builder.flush_if_needed(att)
                 if req:
@@ -155,9 +162,12 @@ class PrepareRequestWorker:
                 offset += len(raw_chunk)
                 sequence += 1
 
-
+        state.artifacts.file_crc = overall_crc
 
         req = self._builder.flush()
         if req:
             yield req
 
+        # except Exception as err:
+        #     state.status = FileUploadStatus.FAILED
+        #     state.error = err

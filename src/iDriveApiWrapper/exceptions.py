@@ -57,26 +57,23 @@ class BackendHttpError(HttpError):
 class DiscordHttpError(HttpError):
     """A base class for all discord http errors like 400, 401, 404 etc"""
 
-class _RateLimitError(HttpError):
+
+class DiscordRateLimitError(DiscordHttpError):
     def __init__(self, response):
-        header_wait = response.headers.get("Retry-After")
+        header_wait = response.headers.get("X-RateLimit-Reset-After")
 
         if header_wait and header_wait.isdigit():
             self.wait = int(header_wait)
         else:
-            self.wait = 2.0
+            self.wait = 5.0
 
         msg = (
-            f"Rate limited (HTTP 429). Retry after {self.wait} seconds."
+            f"Discord rate limited (HTTP 429). Retry after {self.wait} seconds."
             if self.wait is not None
-            else f"Rate limited (HTTP 429). Retry-After header missing. Fallback to {self.wait}"
+            else f"Discord rate limited (HTTP 429). X-RateLimit-Reset-After header missing. Fallback to {self.wait}"
         )
 
         super().__init__(response, message=msg)
-
-
-class DiscordRateLimitError(DiscordHttpError, _RateLimitError):
-    """Raised when 429 raised by the discord"""
 
 """
 ============================================
@@ -100,8 +97,22 @@ class BackendResourceNotFoundError(BackendHttpError):
 class BackendBadMethodError(BackendHttpError):
     """Raised when 405 on backend"""
 
-class BackendRateLimitError(BackendHttpError, _RateLimitError):
-    """Raised when 429 raised by the backend"""
+class BackendRateLimitError(BackendHttpError):
+    def __init__(self, response):
+        header_wait = response.headers.get("Retry-After")
+
+        if header_wait and header_wait.isdigit():
+            self.wait = int(header_wait)
+        else:
+            self.wait = 2.0
+
+        msg = (
+            f"Backend rate limited (HTTP 429). Retry after {self.wait} seconds."
+            if self.wait is not None
+            else f"Backend rate limited (HTTP 429). Retry-After header missing. Fallback to {self.wait}"
+        )
+
+        super().__init__(response, message=msg)
 
 class BackendMissingOrIncorrectResourcePasswordError(BackendHttpError):
     """Raised when 469 on backend"""

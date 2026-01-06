@@ -7,12 +7,13 @@ from ..downloader.models import ThrottleState
 logger = logging.getLogger("iDrive")
 
 # todo needs refactoring
+# very much actually...
 
 class AutoScaler:
     def __init__(self, throttle_state: ThrottleState, max_workers: int):
-        self.max = max_workers
+        self.max = 15
         self.throttle_state = throttle_state
-        self.min = 10
+        self.min = 15  # todo
         self.current = self.min
         self.lock = threading.Lock()
         self.stop_flag = False

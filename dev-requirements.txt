@@ -4,3 +4,6 @@ overrides~=7.7.0
 requests
 cryptography
 websockets
+numpy
+rawpy
+pillow
