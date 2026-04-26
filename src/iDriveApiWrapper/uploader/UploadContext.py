@@ -1,10 +1,14 @@
 import threading
+from enum import Enum, auto
 from typing import Dict, Optional, Mapping
 
-from .models import UploadFileState, FileUploadStatus
+from .models import UploadFileState, FileUploadStatus, FileArtifacts
 from ..models.Enums import EncryptionMethod
 from ..models.Webhook import Webhook
 
+class UploadContextState(Enum):
+    RUNNING = auto()
+    PAUSED = auto()
 
 class UploadContext:
     def __init__(self):
@@ -18,10 +22,15 @@ class UploadContext:
         self.lock = threading.RLock()
         self.states: Dict[str, UploadFileState] = {}
 
+        self.state = UploadContextState.RUNNING
+
         self.global_pause = threading.Event()
         self.global_pause.set()
 
-        self.last_error: Optional[Exception] = None
+        self.total_size: int = 0
+        self.processed_size: int = 0
+        self._size_lock = threading.Lock()
+
         self._webhook_idx = 0
 
     def configure(self, attachment_name: str, max_attachments: int, max_size: int, webhooks: list[Webhook], extensions: Mapping[str, list[str]], encryption_method: EncryptionMethod) -> None:
@@ -32,36 +41,40 @@ class UploadContext:
             self.webhooks = webhooks
             self.extensions = extensions
             self.encryption_method = encryption_method
-    # -------------------------------------------------
-    # Core policy
-    # -------------------------------------------------
-
-    def recompute_run_event(self, st: UploadFileState) -> None:
-        can_run = (
-            not st.cancelled
-            and st.error is None
-            and not st.is_terminal()
-            and st.pause_event.is_set()
-        )
-
-        if can_run:
-            st.run_event.set()
-        else:
-            st.run_event.clear()
 
     # -------------------------------------------------
     # Registration (atomic)
     # -------------------------------------------------
-
     def register(self, file_id: str, state: UploadFileState) -> None:
         with self.lock:
             if file_id in self.states:
                 raise RuntimeError(f"Upload already registered: {file_id}")
 
             self.states[file_id] = state
-            st = state
 
-            self.recompute_run_event(st)
+    def set_status(self, file_id: str, status: FileUploadStatus) -> None:
+        with self.lock:
+            self.states[file_id].status = status
+
+    def set_artifacts(self, file_id: str, artifacts: FileArtifacts) -> None:
+        with self.lock:
+            self.states[file_id].artifacts = artifacts
+
+    def set_expected_thumbnail(self, file_id, value):
+        with self.lock:
+            self.states[file_id].expected_thumbnail = value
+
+    def increment_expected_subtitles(self, file_id):
+        with self.lock:
+            self.states[file_id].expected_subtitles += 1
+
+    def increment_expected_chunks(self, file_id):
+        with self.lock:
+            self.states[file_id].expected_chunks += 1
+
+    def set_crc(self, file_id, file_crc):
+        with self.lock:
+            self.states[file_id].artifacts.file_crc = file_crc
 
     # -------------------------------------------------
     # State querying
@@ -89,55 +102,50 @@ class UploadContext:
     # -------------------------------------------------
 
     def pause_all(self) -> None:
-        self.global_pause.clear()
         with self.lock:
-            states = list(self.states.values())
-
-        for st in states:
-            with st.lock:
-                if st.status == FileUploadStatus.UPLOADING:
-                    st.status = FileUploadStatus.PAUSED
-                self.recompute_run_event(st)
+            self.global_pause.clear()
 
     def resume_all(self) -> None:
-        self.global_pause.set()
         with self.lock:
-            states = list(self.states.values())
-
-        for st in states:
-            with st.lock:
-                if st.status == FileUploadStatus.PAUSED and not st.cancelled:
-                    st.status = FileUploadStatus.UPLOADING
-                self.recompute_run_event(st)
-
-    # -------------------------------------------------
-    # Per-file control
-    # -------------------------------------------------
-
-    def pause_file(self, file_id: str) -> None:
-        st = self.get_state(file_id)
-        with st.lock:
-            st.pause_event.clear()
-            if st.status == FileUploadStatus.UPLOADING:
-                st.status = FileUploadStatus.PAUSED
-            self.recompute_run_event(st)
-
-    def resume_file(self, file_id: str) -> None:
-        st = self.get_state(file_id)
-        with st.lock:
-            st.pause_event.set()
-            if st.status == FileUploadStatus.PAUSED and not st.cancelled and st.error is None:
-                st.status = FileUploadStatus.UPLOADING
-            self.recompute_run_event(st)
-
-    def cancel_file(self, file_id: str) -> None:
-        st = self.get_state(file_id)
-        with st.lock:
-            st.cancelled = True
-            st.status = FileUploadStatus.CANCELLED
-            self.recompute_run_event(st)
+            self.global_pause.set()
 
     def pick_webhook(self):
         webhook = self.webhooks[self._webhook_idx]
         self._webhook_idx = (self._webhook_idx + 1) % len(self.webhooks)
         return webhook
+
+    def is_paused(self) -> bool:
+        return self.state == UploadContextState.PAUSED
+
+    # -------------------------------------------------
+    # Size tracking
+    # -------------------------------------------------
+
+    def add_total_size(self, size: int) -> None:
+        if size <= 0:
+            return
+
+        with self._size_lock:
+            self.total_size += size
+
+    def add_processed_size(self, size: int) -> None:
+        if size <= 0:
+            return
+
+        with self._size_lock:
+            self.processed_size += size
+
+    def get_sizes(self) -> tuple[int, int]:
+        with self._size_lock:
+            return self.total_size, self.processed_size
+
+    def get_progress(self) -> float:
+        with self._size_lock:
+            if self.total_size == 0:
+                return 0.0
+            return self.processed_size / self.total_size
+
+    def reset_sizes(self) -> None:
+        with self._size_lock:
+            self.total_size = 0
+            self.processed_size = 0

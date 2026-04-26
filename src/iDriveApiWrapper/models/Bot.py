@@ -1,11 +1,12 @@
+from .Credential import Credential
 from ..utils.networker import make_request
 
 
-class Bot:
-    def __init__(self, name, created_at, discord_id, primary):
+class Bot(Credential):
+    def __init__(self, name, created_at, discord_id, primary, is_blocked, blocked_until, block_reason, discord_error_code):
+        super().__init__(discord_id, name, is_blocked, blocked_until, block_reason, discord_error_code)
         self.name = name
         self.created_at = created_at
-        self.discord_id = discord_id
         self.primary = primary
 
     def __str__(self):

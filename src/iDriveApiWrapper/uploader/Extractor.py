@@ -3,12 +3,13 @@ import logging
 import os
 import re
 import subprocess
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 import rawpy
-from PIL import Image, ImageOps
+from PIL import Image
 
 from .models import VideoMetadata, VideoTrack, AudioTrack, SubtitleTrack, ExtractedThumbnail, ExtractedSubtitle
 
@@ -22,19 +23,21 @@ def get_file_extension(filename: str) -> str:
     return "." + filename.rsplit(".", 1)[1]
 
 def _run(cmd: List[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3)
 
-def _run_ffprobe(path: str) -> Dict[str, Any]:
+def _run_ffprobe(path: str, extensions, extension) -> Dict[str, Any]:
+    if not _is_type(extensions, extension, "Video"):
+        return {}
     cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path]
     return json.loads(_run(cmd).stdout)
 
-def _safe_int(x):
+def _safe_int(x) -> Optional[int]:
     try:
         return int(float(x))
     except Exception:
         return None
 
-def _safe_float(x):
+def _safe_float(x) -> Optional[float]:
     try:
         return float(x)
     except Exception:
@@ -57,9 +60,8 @@ def _slug(s: str) -> str:
 
 # ---------- metadata ----------
 
-def extract_video_metadata(path: Path) -> Tuple[VideoMetadata, int]:
+def extract_video_metadata(data, path: Path) -> Tuple[VideoMetadata | None, int | None]:
     path = os.path.abspath(path)
-    data = _run_ffprobe(path)
 
     format_info = data.get("format", {})
     streams = data.get("streams", [])
@@ -67,11 +69,7 @@ def extract_video_metadata(path: Path) -> Tuple[VideoMetadata, int]:
     # -------- duration --------
     duration_sec = _safe_float(format_info.get("duration"))
     if duration_sec is None:
-        duration_sec = max(
-            (_safe_float(s.get("duration")) for s in streams),
-            default=None
-        )
-    # --------------------------
+        return None, None
 
     video_tracks, audio_tracks, subtitle_tracks = [], [], []
 
@@ -89,7 +87,7 @@ def extract_video_metadata(path: Path) -> Tuple[VideoMetadata, int]:
                 language=tags.get("language"),
                 height=s.get("height"),
                 width=s.get("width"),
-                fps=_fps_from_ratio(s.get("r_frame_rate")),
+                fps=round(_fps_from_ratio(s.get("r_frame_rate"))),
                 track_number=s.get("index"),
             ))
 
@@ -100,10 +98,10 @@ def extract_video_metadata(path: Path) -> Tuple[VideoMetadata, int]:
                 size=_safe_int(s.get("bit_rate")),
                 duration=duration,
                 language=tags.get("language"),
-                name=tags.get("handler_name"),
+                name=tags.get("handler_name") or "und",
                 channel_count=s.get("channels"),
                 sample_rate=_safe_int(s.get("sample_rate")),
-                sample_size=s.get("bits_per_sample"),
+                sample_size=_safe_int(s.get("bit_rate")),
                 track_number=s.get("index"),
             ))
 
@@ -161,17 +159,16 @@ def _is_type(extensions: Mapping[str, list[str]], extension: str, file_type: str
     return result
 
 
-def extract_video_metadata_if_needed(extensions: Mapping[str, list[str]], extension: str, path: Path) -> Tuple[Optional[VideoMetadata], Optional[int]]:
+def extract_video_metadata_if_needed(extensions: Mapping[str, list[str]], extension: str, path: Path, probe) -> Tuple[Optional[VideoMetadata], Optional[int]]:
     if not _is_type(extensions, extension, "Video"):
         return None, None
-    return extract_video_metadata(path)
+    return extract_video_metadata(probe, path)
 
 
-def extract_subtitles_if_needed(extensions: Mapping[str, list[str]], extension: str, path: Path) -> List[ExtractedSubtitle]:
+def extract_subtitles_if_needed(extensions: Mapping[str, list[str]], extension: str, path: Path, probe) -> List[ExtractedSubtitle]:
     if not _is_type(extensions, extension, "Video"):
         return []
     path = os.path.abspath(path)
-    probe = _run_ffprobe(path)
 
     streams = probe.get("streams", [])
 
@@ -217,7 +214,7 @@ def extract_subtitles_if_needed(extensions: Mapping[str, list[str]], extension: 
         ]
 
         try:
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=3)
             if proc.stdout:
                 results.append(
                     ExtractedSubtitle(
@@ -237,7 +234,7 @@ def extract_thumbnail_if_needed(extensions: Mapping[str, list[str]], extension: 
         return _extract_video_thumbnail(path)
 
     elif _is_type(extensions, extension, "Audio"):
-        return _extract_image_thumbnail(path)
+        return _extract_audio_thumbnail(path)
 
     elif _is_type(extensions, extension, "Image"):
         return _extract_image_thumbnail(path)
@@ -247,17 +244,19 @@ def extract_thumbnail_if_needed(extensions: Mapping[str, list[str]], extension: 
     else:
         return None
 
-def _encode_webp_thumbnail(img: Image.Image, quality: int = 80) -> Optional[ExtractedThumbnail]:
+
+def _encode_webp_thumbnail(img: Image.Image, quality: int = 70) -> Optional[ExtractedThumbnail]:
     try:
-        img.thumbnail((1280, 720), Image.LANCZOS)
+        # --- downscale only, keep aspect ratio ---
+        small = img.copy()
+        small.thumbnail((1920, 1080), Image.Resampling.BILINEAR)
 
         buf = BytesIO()
-        img.save(
+        small.save(
             buf,
             format="WEBP",
             quality=quality,
             method=6,
-            exact=True,
         )
 
         data = buf.getvalue()
@@ -271,13 +270,9 @@ def _encode_webp_thumbnail(img: Image.Image, quality: int = 80) -> Optional[Extr
         return None
 
 def _extract_image_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
+    return None
     try:
         with Image.open(path) as img:
-            img = ImageOps.exif_transpose(img)
-
-            if img.mode not in ("RGB", "RGBA"):
-                img = img.convert("RGB")
-
             return _encode_webp_thumbnail(img)
 
     except Exception:
@@ -307,12 +302,13 @@ def _extract_video_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
         cmd = [
             "ffmpeg",
             "-y",
-            "-ss", "1",
             "-i", str(path),
+            "-ss", "00:00:01.00",
+            "-vf", "scale=320:320:force_original_aspect_ratio=decrease,format=yuv420p",
             "-frames:v", "1",
-            "-vf", "scale=min(1280\\,iw):-2",
             "-c:v", "libwebp",
             "-quality", "80",
+            "-compression_level", "6",
             "-f", "webp",
             "pipe:1",
         ]
@@ -321,10 +317,11 @@ def _extract_video_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=3,
             check=True,
         )
 
-        if not proc.stdout:
+        if not proc.stdout or len(proc.stdout) < 100:
             return None
 
         return ExtractedThumbnail(data=proc.stdout)
@@ -339,6 +336,45 @@ def _extract_video_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
 
 
 def _extract_audio_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
-    pass
+    # time.sleep(0.2)
+    # return None
+    try:
+        cmd = [
+            "ffmpeg",
+            "-v", "error",
+            "-i", str(path),
+            "-map", "0:v",        # cover art stream
+            "-frames:v", "1",
+            "-f", "image2pipe",
+            "-vcodec", "png",
+            "-",
+        ]
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=True,
+        )
+
+        if result.returncode != 0 or not result.stdout:
+            return None
+
+        # Load into PIL
+        bio = BytesIO(result.stdout)
+
+        with Image.open(bio) as img:
+            img.load()  # force full decode v(doesnt do anything)
+            return _encode_webp_thumbnail(img)
+
+    except subprocess.TimeoutExpired:
+        # todo fix this for audio files. failing  on the nth file
+        logger.error("[Extractor] audio thumbnail timeout")
+        return None
+
+    except Exception:
+        logger.exception("[Extractor] audio thumbnail extraction failed")
+        return None
 
 

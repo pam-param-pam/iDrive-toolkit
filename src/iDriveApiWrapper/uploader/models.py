@@ -1,4 +1,5 @@
 import base64
+import logging
 from typing import List
 
 
@@ -15,16 +16,16 @@ from ..models.Enums import EncryptionMethod
 from ..models.Folder import Folder
 from ..models.VideoMetadata import VideoMetadata
 
+logger = logging.getLogger("iDrive")
+
 class FileUploadStatus(Enum):
     PENDING = "pending"
     SCANNING = "scanning"
     UPLOADING = "uploading"
     SAVING = "saving"
-    PAUSED = "paused"
     RETRYING = "retrying"
     FAILED = "failed"
     SAVE_FAILED = "save_failed"
-    CANCELLED = "cancelled"
     COMPLETED = "completed"
 
 
@@ -134,8 +135,20 @@ class DiscordRequest:
 
 @dataclass
 class ResponsePayload:
-    response: Response
-    request: DiscordRequest
+    response: Optional[Response]
+    request: Optional[DiscordRequest]
+    frontend_id: Optional[str] = None
+    is_empty: bool = False
+
+    def __post_init__(self):
+        if self.is_empty:
+            if self.frontend_id is None:
+                raise ValueError("frontend_id is required for empty payload")
+            if self.response is not None or self.request is not None:
+                raise ValueError("empty payload must not have response/request")
+        else:
+            if self.response is None or self.request is None:
+                raise ValueError("non-empty payload requires response and request")
 
 @dataclass
 class FileArtifacts:
@@ -164,24 +177,36 @@ class UploadFileState:
     video_metadata_required: bool = False
     status: FileUploadStatus = FileUploadStatus.PENDING
     error: Optional[Exception] = None
-    cancelled: bool = False
     artifacts: FileArtifacts = None
     bytes_uploaded: int = 0
 
     run_event: threading.Event = field(default_factory=threading.Event)
-    pause_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self):
         # By default files are not paused
-        self.pause_event.set()
         self.run_event.set()
 
     def is_fully_uploaded(self) -> bool:
-        return self.uploaded_chunks == self.expected_chunks and self.uploaded_subtitles == self.expected_subtitles and self.uploaded_thumbnail == self.expected_thumbnail
+        result = (
+                self.uploaded_chunks == self.expected_chunks and
+                self.uploaded_subtitles == self.expected_subtitles and
+                self.uploaded_thumbnail == self.expected_thumbnail
+        )
+
+        logger.debug(
+            "[UploadFileState] fully_uploaded=%s | "
+            "chunks: %s/%s | subtitles: %s/%s | thumbnail: %s/%s",
+            result,
+            self.uploaded_chunks, self.expected_chunks,
+            self.uploaded_subtitles, self.expected_subtitles,
+            self.uploaded_thumbnail, self.expected_thumbnail,
+        )
+
+        return result
 
     def is_terminal(self) -> bool:
-        return self.status in (FileUploadStatus.COMPLETED, FileUploadStatus.FAILED, FileUploadStatus.CANCELLED)
+        return self.status in (FileUploadStatus.COMPLETED, FileUploadStatus.FAILED)
 
 
 @dataclass

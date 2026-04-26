@@ -11,19 +11,16 @@ class FileDownloadStatus(Enum):
     FULLY_DOWNLOADED = "fully_downloaded"
     PENDING = "pending"
     DOWNLOADING = "downloading"
-    PAUSED = "paused"
     RETRYING = "retrying"
     COMPLETED = "completed"
     FAILED = "failed"
-    CANCELLED = "cancelled"
     QUEUED = "queued"
     SAVING = "saving"
 
 
 @dataclass
 class FragmentInfo:
-    message_id: str
-    attachment_id: str
+    fragment_id: str
     offset: int
     sequence: int
     size: int
@@ -34,6 +31,7 @@ class FragmentInfo:
 class FileInfo:
     id: str
     name: str
+    path: str
     encryption_method: EncryptionMethod
     size: int
     crc: int
@@ -60,6 +58,7 @@ class FileInfo:
             file_obj = FileInfo(
                 id=item["id"],
                 name=item["name"],
+                path=item["path"],
                 encryption_method=EncryptionMethod(item["encryption_method"]),
                 crc=item["crc"],
                 size=item["size"],
@@ -91,14 +90,6 @@ class FileState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     error: Optional[Exception] = None
     status: FileDownloadStatus = FileDownloadStatus.QUEUED
-    pause_event: threading.Event = field(default_factory=threading.Event)
-    run_event: threading.Event = field(default_factory=threading.Event)
-    cancelled: bool = False
-
-    def __post_init__(self):
-        self.pause_event.set()
-        self.run_event.set()
-
 
 onCompleteCallback = Optional[Callable[[str, FileState], None]]
 
@@ -106,10 +97,10 @@ onCompleteCallback = Optional[Callable[[str, FileState], None]]
 @dataclass
 class FileRecord:
     file_info: FileInfo
-    file_dir: str
+    temp_file_dir: str
     final_user_output_path: str
     output_dir: str
-    output_path: str
+    temp_file_path: str
     on_complete: onCompleteCallback
 
 

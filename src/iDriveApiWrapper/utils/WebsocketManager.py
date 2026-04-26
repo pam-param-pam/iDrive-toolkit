@@ -8,7 +8,6 @@ import websockets
 from websockets import WebSocketException
 
 from ..Config import APIConfig
-from ..Constants import BASE_WSS
 from ..models.Enums import EventType
 from ..models.WebsocketEvent import WebsocketEvent
 
@@ -104,7 +103,7 @@ class WebsocketManager:
         while not self._stop_ws.is_set():
             try:
                 async with websockets.connect(
-                    BASE_WSS,
+                    APIConfig.base_ws + '/user',
                     additional_headers={"Authorization": f"Bearer {APIConfig.token}"}
                 ) as ws:
 
@@ -115,7 +114,7 @@ class WebsocketManager:
                     async for raw in ws:
                         if self._stop_ws.is_set():
                             break
-                        self._handle_ws_event(json.loads(raw))
+                        self._handle_ws_event(raw)
 
             except WebSocketException as e:
                 if self._stop_ws.is_set():
@@ -133,9 +132,13 @@ class WebsocketManager:
 
         logger.info("Websocket listener stopped cleanly.")
 
-    def _handle_ws_event(self, data: dict):
+    def _handle_ws_event(self, data: str):
+        if data == "PING":
+            # logger.debug(f"Received PING, sending PONG!")
+            self.send_message("PONG")
+            return
         try:
-            event = WebsocketEvent(data)
+            event = WebsocketEvent(json.loads(data))
             logger.info(f"Received WebSocket event: {event}")
 
             # Check forced logout first

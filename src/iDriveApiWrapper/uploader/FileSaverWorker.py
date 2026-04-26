@@ -72,7 +72,6 @@ class FileSaverWorker:
     # ---------------- backend interaction ----------------
 
     def _save_files(self, files: List[BackendFile]) -> None:
-
         resource_passwords: Dict[str, str] = {}
 
         for file in files:
@@ -91,6 +90,8 @@ class FileSaverWorker:
             self._on_backend_save(files)
 
         except Exception as exc:
+            logger.error("Save failed")
+            print(exc)
             self._on_backend_save_error(files, exc)
 
     # ---------------- result handling ----------------

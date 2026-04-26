@@ -30,11 +30,18 @@ class ResponseConsumerWorker:
             finally:
                 self.response_queue.task_done()
 
-    # -------------------------------------------------
-    # Core logic (JS: handleDiscordResult)
-    # -------------------------------------------------
-
     def _handle_response(self, payload: ResponsePayload) -> None:
+        # Handle empty files
+        if payload.is_empty:
+            state = self.ctx.get_state(payload.frontend_id)
+            backend_file = self._get_or_create_backend_file(state)
+
+            with state.lock:
+                state.status = FileUploadStatus.SAVING
+
+            self.ready_files_queue.put(backend_file)
+            return
+
         request = payload.request
         response = payload.response
 
@@ -49,38 +56,31 @@ class ResponseConsumerWorker:
                 discord_attachment=discord_attachment,
             )
 
-    # -------------------------------------------------
-    # Backend state handling (JS: getOrCreateState)
-    # -------------------------------------------------
-
     def _get_or_create_backend_file(self, state: UploadFileState) -> BackendFile:
-        file_id = str(state.artifacts.frontend_id)
+        artifacts = state.artifacts
+        file_id = str(artifacts.frontend_id)
         if file_id not in self._backend_state:
             self._backend_state[file_id] = BackendFile(
-                name=state.artifacts.name,
-                parent_id=state.artifacts.parent_id,
-                extension=state.artifacts.extension,
-                size=state.artifacts.size,
-                frontend_id=str(state.artifacts.frontend_id),
-                encryption_method=state.artifacts.encryption_method.value,
-                created_at=state.artifacts.created_at,
-                duration=state.artifacts.duration,
-                iv=state.artifacts.file_crypto.iv_b64(),
-                key=state.artifacts.file_crypto.key_b64(),
+                name=artifacts.name,
+                parent_id=artifacts.parent_id,
+                extension=artifacts.extension,
+                size=artifacts.size,
+                frontend_id=str(artifacts.frontend_id),
+                encryption_method=artifacts.file_crypto.method.value,
+                created_at=artifacts.created_at,
+                duration=artifacts.duration,
+                iv=artifacts.file_crypto.iv_b64(),
+                key=artifacts.file_crypto.key_b64(),
                 crc=0,
-                parent_password=state.artifacts.parent_password,
-                lock_from=state.artifacts.lock_from_id,
-                thumbnail=None,
-                videoMetadata=None,
+                parent_password=artifacts.parent_password,
+                lock_from=artifacts.lock_from_id,
+                thumbnail=None,  # filled later
+                videoMetadata=artifacts.video_metadata,
                 subtitles=[],
                 fragments=[],
             )
 
         return self._backend_state[file_id]
-
-    # -------------------------------------------------
-    # Attachment processing (JS: fillAttachmentInfo)
-    # -------------------------------------------------
 
     def _fill_attachment_info(self, attachment: ChunkAttachment | ThumbnailAttachment | SubtitleAttachment | DiscordAttachment, discord_response: dict, discord_attachment: dict) -> None:
         state: UploadFileState = self.ctx.get_state(attachment.frontend_id)
@@ -133,10 +133,6 @@ class ResponseConsumerWorker:
             )
 
             state.uploaded_subtitles += 1
-
-        # -------------------------------------------------
-        # Finalization (JS: isFullyUploaded)
-        # -------------------------------------------------
 
         if state.is_fully_uploaded():
             with state.lock:

@@ -7,7 +7,7 @@ from overrides import overrides
 from .Enums import EncryptionMethod
 from .Fragment import Fragment
 from .Moment import Moment
-from .RawMetadata import RawMetadata
+from .RawMetadata import RawMetadata, PhotoMetadata
 from .Subtitle import Subtitle
 from .Tag import Tag
 from .VideoMetadata import VideoMetadata
@@ -30,20 +30,18 @@ class File(Item):
         self._encryption_method: Optional[int] = None
         self._download_url: Optional[str] = None
         self._video_position: Optional[int] = None
-        self._duration: Optional[int] = None
         self._crc: Optional[int] = None
+        self._media_position: Optional[bool] = None
+
         self._isRawMetadata: Optional[bool] = None
         self._isVideoMetadata: Optional[bool] = None
-
-        self._iso: Optional[str] = None
-        self._model_name: Optional[str] = None
-        self._aperture: Optional[str] = None
-        self._exposure_time: Optional[str] = None
-        self._focal_length: Optional[str] = None
+        self._isPhotoMetadata: Optional[bool] = None
+        self._hasSubtitles: Optional[bool] = None
 
         # _fetch_more_data
-        self._videoMetadata: Optional[dict] = None
         self._rawMetadata: Optional[dict] = None
+        self._videoMetadata: Optional[dict] = None
+        self._photoMetadata: Optional[dict] = None
 
         # _fetch_secrets
         self._encryption_iv: Optional[str] = None
@@ -106,34 +104,30 @@ class File(Item):
         return self._crc
 
     @property
-    @autoFetchProperty('_fetch_data')
-    def iso(self):
-        return self._iso
+    @autoFetchProperty('_fetch_more_data')
+    def videoMetadata(self):
+        if not self.isVideoMetadata or not self._videoMetadata:
+            return None
+        return VideoMetadata(self._videoMetadata)
 
     @property
-    @autoFetchProperty('_fetch_data')
-    def aperture(self):
-        return self._aperture
+    @autoFetchProperty('_fetch_more_data')
+    def rawMetadata(self):
+        if not self.isRawMetadata or not self._rawMetadata:
+            return None
+        return RawMetadata(**self._rawMetadata)
 
     @property
-    @autoFetchProperty('_fetch_data')
-    def exposure_time(self):
-        return self._exposure_time
-
-    @property
-    @autoFetchProperty('_fetch_data')
-    def focal_length(self):
-        return self._focal_length
+    @autoFetchProperty('_fetch_more_data')
+    def photoMetadata(self):
+        if not self.isPhotoMetadata or not self._photoMetadata:
+            return None
+        return PhotoMetadata(**self._photoMetadata)
 
     @property
     @autoFetchProperty('_fetch_data')
     def duration(self):
         return self._duration
-
-    @property
-    @autoFetchProperty('_fetch_tags')
-    def tags(self):
-        return self._tags
 
     @property
     @autoFetchProperty('_fetch_data')
@@ -146,18 +140,14 @@ class File(Item):
         return self._isRawMetadata
 
     @property
-    @autoFetchProperty('_fetch_more_data')
-    def videoMetadata(self):
-        if not self.isVideoMetadata:
-            return None
-        return VideoMetadata(self._videoMetadata)
+    @autoFetchProperty('_fetch_data')
+    def isPhotoMetadata(self):
+        return self._isPhotoMetadata
 
     @property
-    @autoFetchProperty('_fetch_more_data')
-    def rawMetadata(self):
-        if not self.isRawMetadata:
-            return None
-        return RawMetadata(**self._rawMetadata)
+    @autoFetchProperty('_fetch_tags')
+    def tags(self):
+        return self._tags
 
     @property
     @autoFetchProperty('_fetch_secrets')
@@ -191,9 +181,10 @@ class File(Item):
         return str(self)
 
     @overrides
-    def _set_more_data(self, data):
+    def _set_more_data(self, data): #todo we need to know what to set, not set to all XD
         self._videoMetadata = data
         self._rawMetadata = data
+        self._photoMetadata = data
 
     @overrides
     def _fetch_data(self):
@@ -239,6 +230,7 @@ class File(Item):
 
     def _fetch_fragments(self):
         res_data = make_request("POST", f"items/ultraDownload/items/{self.id}", headers=self._get_password_header())
+        print(res_data)
         fragments = [Fragment(**frag) for frag in res_data[0]['fragments']]
         for frag in fragments:
             frag.set_password(self.get_password())
@@ -272,16 +264,6 @@ class File(Item):
                 self._thumbnail_url = value
             elif key == "download_url":
                 self._download_url = value
-            elif key == "iso":
-                self._iso = value
-            elif key == "model_name":
-                self._model_name = value
-            elif key == "aperture":
-                self._aperture = value
-            elif key == "exposure_time":
-                self._exposure_time = value
-            elif key == "focal_length":
-                self._focal_length = value
             elif key == "tags":
                 self._tags = value
             elif key == "duration":
@@ -290,6 +272,12 @@ class File(Item):
                 self._isVideoMetadata = value
             elif key == "isRawMetadata":
                 self._isRawMetadata = value
+            elif key == "isPhotoMetadata":
+                self._isPhotoMetadata = value
+            elif key == "hasSubtitles":
+                self._hasSubtitles = value
+            elif key == "media_position":
+                self._media_position = value
             elif key == "crc":
                 self._crc = value
             else:

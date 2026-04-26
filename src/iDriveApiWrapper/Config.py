@@ -2,6 +2,8 @@ import threading
 
 
 class APIConfig:
+    base_url = None
+    base_ws = None
     token = None
     download_folder = "downloads"
     user = None

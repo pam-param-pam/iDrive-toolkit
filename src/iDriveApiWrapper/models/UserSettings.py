@@ -58,7 +58,7 @@ class Settings:
     def __init__(self, locale: str, hideLockedFolders: bool, dateFormat, theme: str,
                  viewMode: str, sortingBy: str, sortByAsc: bool, subfoldersInShares: bool,
                  concurrentUploadRequests: int, encryptionMethod: int,
-                 keepCreationTimestamp: bool, popupPreview: bool):
+                 keepCreationTimestamp: bool, popupPreview: bool, itemInfoShortcut: bool):
         self.locale = locale
         self.hideLockedFolders = hideLockedFolders
         self.dateFormat = dateFormat
@@ -71,6 +71,7 @@ class Settings:
         self.encryptionMethod = EncryptionMethod(encryptionMethod)
         self.keepCreationTimestamp = keepCreationTimestamp
         self.popupPreview = popupPreview
+        self.itemInfoShortcut = itemInfoShortcut
 
     def builder(self) -> SettingsBuilder:
         return SettingsBuilder(self)

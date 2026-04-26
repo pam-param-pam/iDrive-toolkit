@@ -5,7 +5,6 @@ import time
 import httpx as httpx
 
 from ..Config import APIConfig
-from ..Constants import BASE_URL
 from ..exceptions import BackendServerTimeout, BackendHttpError, BackendRateLimitError, BackendServiceUnavailableError, BackendInternalServerError, \
     BackendMissingOrIncorrectResourcePasswordError, BackendBadMethodError, BackendResourceNotFoundError, BackendResourcePermissionError, BackendUnauthorizedError, BackendBadRequestError
 
@@ -34,11 +33,11 @@ def make_request(method: str, endpoint: str, data: dict = None, headers: dict = 
         key: (_mask_preserving_spaces(value) if key.lower() in SENSITIVE_HEADERS else value)
         for key, value in headers.items()
     }
-    url = f"{BASE_URL}/{endpoint}"
+    url = f"{APIConfig.base_url}/{endpoint}"
     logger.debug(f"Calling... Endpoint={endpoint}, Method={method}, Headers={safe_headers}")
 
     try:
-        response = httpxClient.request(method, url, headers=headers, json=data, params=params, files=files, timeout=10)
+        response = httpxClient.request(method, url, headers=headers, json=data, params=params, files=files, timeout=20)
     except httpx.TimeoutException as e:
         raise BackendServerTimeout("Request timed out") from e
 

@@ -1,5 +1,6 @@
 import logging
 from typing import Union, List
+from urllib.parse import urlparse, urlunparse
 
 from .Config import APIConfig
 from .downloader.UltraDownloader import UltraDownloader
@@ -34,7 +35,10 @@ logger.addHandler(console_handler)
 
 
 class Client:
-    def __init__(self, token: str, device_id: str):
+    def __init__(self, _internal: bool, base_url: str, token: str, device_id: str):
+        if not _internal:
+            raise RuntimeError("Use login() instead.")
+        APIConfig.base_url = base_url
         APIConfig.token = token
         APIConfig.device_id = device_id
         self._ultraDownloader = None
@@ -42,8 +46,54 @@ class Client:
         self.websocket = WebsocketManager()
 
     @classmethod
-    def login(cls, username: str, password: str, force_login: bool = False) -> "Client":
-        # todo make sure the file stgores the auth token per username and password(hash perhaps both idk)
+    def _validate_base_url(cls, base_url):
+        if not isinstance(base_url, str):
+            raise ValueError("base_url must be a string")
+
+        base_url = base_url.strip()
+        if not base_url:
+            raise ValueError("base_url cannot be empty")
+
+        parsed = urlparse(base_url)
+
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("base_url must start with http:// or https://")
+
+        if not parsed.netloc:
+            raise ValueError("base_url must include a hostname")
+
+        # normalize: remove trailing slash
+        normalized = base_url.rstrip("/")
+
+        return normalized
+
+    @classmethod
+    def _to_ws_base_url(cls, base_url: str) -> str:
+        parsed = urlparse(base_url)
+
+        if parsed.scheme == "http":
+            ws_scheme = "ws"
+        elif parsed.scheme == "https":
+            ws_scheme = "wss"
+        else:
+            raise ValueError("base_url must start with http:// or https://")
+
+        ws_url = parsed._replace(scheme=ws_scheme)
+
+        # normalize: drop trailing slash
+        return str(urlunparse(ws_url).rstrip("/"))
+
+    @classmethod
+    def _validate_and_set_base(cls, base_url):
+        base_url = cls._validate_base_url(base_url)
+        base_ws = cls._to_ws_base_url(base_url)
+        APIConfig.base_url = base_url
+        APIConfig.base_ws = base_ws
+
+    @classmethod
+    def login(cls, base_url: str, username: str, password: str, force_login: bool = False) -> "Client":
+        cls._validate_and_set_base(base_url)
+        # todo make sure the file stores the auth token per username and password(hash perhaps both idk)
         token, device_id = AuthClient.login(username, password, force_login)
         try:
             APIConfig.token = token
@@ -53,7 +103,7 @@ class Client:
             APIConfig.token = None
             token, device_id = AuthClient.login(username, password, force_login=True)
 
-        return cls(token=token, device_id=device_id)
+        return cls(_internal=True, base_url=base_url, token=token, device_id=device_id)
 
     def logout(self):
         pass
@@ -131,14 +181,20 @@ class Client:
     def get_downloader(self) -> UltraDownloader:
         if not self._ultraDownloader:
             discord_settings = self.get_discord_settings()
-            self._ultraDownloader = UltraDownloader(max_workers=len(discord_settings.bots)*3)
+            max_workers = len(discord_settings.bots)*3
+            self._ultraDownloader = UltraDownloader(min_workers=1, max_workers=max_workers)
 
         return self._ultraDownloader
 
     def get_uploader(self) -> UltraUploader:
         if not self._ultra_uploader:
             user_settings = self.get_user_profile()
+            discord_settings = self.get_discord_settings()
+
+            max_workers = len(discord_settings.webhooks) * 2
             self._ultra_uploader = UltraUploader(
+                min_workers=1,
+                max_workers=max_workers,
                 max_message_size=user_settings.user.maxDiscordMessageSize,
                 max_attachments=user_settings.user.maxAttachmentsPerMessage,
                 encryption_method=user_settings.settings.encryptionMethod
@@ -158,4 +214,3 @@ class Client:
             return True
         except BackendResourceNotFoundError:
             return False
-

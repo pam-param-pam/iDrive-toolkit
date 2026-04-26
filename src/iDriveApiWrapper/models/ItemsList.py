@@ -76,5 +76,3 @@ class ItemsList:
 
     def __repr__(self):
         return f"{self._items}"
-
-# todo make an actual library

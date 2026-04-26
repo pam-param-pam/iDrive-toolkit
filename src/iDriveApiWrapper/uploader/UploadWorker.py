@@ -8,7 +8,7 @@ import httpx
 from .UploadContext import UploadContext
 from .models import DiscordRequest, UploadFileState, FileUploadStatus, ResponsePayload
 from ..downloader.models import ThrottleState
-from ..exceptions import DiscordRateLimitError, BackendRateLimitError, BackendServerTimeout, DiscordServerTimeout, BackendServiceUnavailableError, DiscordHttpError
+from ..exceptions import DiscordRateLimitError, DiscordServerTimeout, DiscordHttpError
 
 logger = logging.getLogger("iDrive")
 
@@ -19,7 +19,7 @@ class UploadWorker:
         self.ctx = ctx
         self.max_retries = max_retries
         self.throttle = throttle
-        self._client = httpx.Client(timeout=20.0, follow_redirects=True)
+        self._client = httpx.Client(timeout=20.0)
 
     # -------------------------------------------------
     # Main loop
@@ -28,41 +28,58 @@ class UploadWorker:
     def run(self) -> None:
         while True:
             request = self.request_queue.get()
+            if not request:
+                print("breaking")
+                self.request_queue.task_done()
+                break
 
             try:
-                if not self._wait_until_can_upload(request):
-                    continue
+                while True:  # retry loop for THIS request
+                    try:
+                        self._wait_until_can_upload()
 
-                self._mark_uploading(request)
-                self._upload(request)
+                        self._mark_uploading(request)
+                        self._upload(request)
+                        break  # success → exit retry loop
 
-            except DiscordRateLimitError as e:
-                self.throttle.signal_error()
+                    except DiscordRateLimitError as e:
+                        self.throttle.signal_error()
 
-                if request.retries >= self.max_retries:
-                    self._fail_states(request, e)
-                else:
-                    logger.warning(
-                        f"[UploadWorker] Throttled ({e.__class__.__name__}) → "
-                        f"retrying in {e.wait}s (retry {request.retries})"
-                    )
-                    time.sleep(e.wait)
-                    request.retries += 1
-                    self.request_queue.put(request)
+                        if request.retries >= self.max_retries:
+                            self._fail_states(request, e)
+                            break
 
-            except DiscordServerTimeout as e:
-                self.throttle.signal_error()
-                self._mark_retrying(request)
-                logger.warning(
-                    f"[UploadWorker] Network issue ({e.__class__.__name__}) → "
-                    f"waiting 5s"
-                )
-                time.sleep(5)
-                self.request_queue.put(request)
+                        logger.warning(
+                            f"[UploadWorker] Throttled ({e.__class__.__name__}) → "
+                            f"retrying in {e.wait}s (retry {request.retries})"
+                        )
+
+                        time.sleep(e.wait)
+                        request.retries += 1
+                        continue  # retry SAME request
+
+                    except DiscordServerTimeout as e:
+                        self.throttle.signal_error()
+                        self._mark_retrying(request)
+
+                        logger.warning(
+                            f"[UploadWorker] Network issue ({e.__class__.__name__}) → "
+                            f"waiting 5s"
+                        )
+
+                        time.sleep(5)
+                        request.retries += 1
+
+                        if request.retries >= self.max_retries:
+                            self._fail_states(request, e)
+                            break
+
+                        continue  # retry SAME request
 
             except Exception as e:
-                self._fail_states(request, e)
                 logger.exception(f"[UploadWorker] Unexpected failure")
+                self._fail_states(request, e)
+
             finally:
                 self.request_queue.task_done()
 
@@ -84,7 +101,6 @@ class UploadWorker:
             response = self._client.post(url, data=payload, files=files)
 
             if response.status_code == 429:
-                print(response.headers)
                 self.throttle.signal_error()
                 raise DiscordRateLimitError(response)
 
@@ -93,10 +109,8 @@ class UploadWorker:
             self._add_bytes(request)
             uploaded_bytes = sum(len(att.data) for att in request.attachments)
             self.throttle.signal_bytes(uploaded_bytes)
-            self.response_queue.put(ResponsePayload(
-                response=response,
-                request=request
-            ))
+            self.response_queue.put(ResponsePayload(response=response, request=request))
+
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
 
@@ -109,34 +123,15 @@ class UploadWorker:
         except (httpx.TimeoutException, httpx.ReadTimeout) as e:
             raise DiscordServerTimeout("Upload timed out") from e
 
-    def _wait_until_can_upload(self, request: DiscordRequest) -> bool:
-        states = self._get_states_from_request(request)
-        # No states → nothing to do
-        if not states:
-            return False
-
-        if len(states) != 1:
-            return False
-
-        # Exactly one file
-        st = next(iter(states.values()))
-
-        while True:
-            with st.lock:
-                if st.cancelled or st.is_terminal():
-                    return False
-
-                # If not paused → proceed immediately
-                if st.run_event.is_set():
-                    return True
-
-            # Paused → wait until resume/cancel
-            st.run_event.wait()
+    def _wait_until_can_upload(self):
+        self.ctx.global_pause.wait()
 
     # -------------------------------------------------
     # Helpers
     # -------------------------------------------------
     def _get_states_from_request(self, request: DiscordRequest) -> Dict[str, UploadFileState]:
+        print("_get_states_from_request")
+        print(request)
         file_ids = {att.frontend_id for att in request.attachments}
         states = self.ctx.states
         return {fid: states[fid] for fid in file_ids if fid in states}
@@ -151,7 +146,6 @@ class UploadWorker:
             with st.lock:
                 if not st.is_terminal():
                     st.status = FileUploadStatus.UPLOADING
-                    self.ctx.recompute_run_event(st)
 
     def _mark_retrying(self, request: DiscordRequest) -> None:
         states = self._get_states_from_request(request)
@@ -160,7 +154,6 @@ class UploadWorker:
             with st.lock:
                 if not st.is_terminal():
                     st.status = FileUploadStatus.RETRYING
-                    self.ctx.recompute_run_event(st)
 
     def _fail_states(self, request: DiscordRequest, error: Exception) -> None:
         states = self._get_states_from_request(request)
@@ -170,12 +163,11 @@ class UploadWorker:
                 st.error = error
                 if not st.cancelled:
                     st.status = FileUploadStatus.FAILED
-                    self.ctx.recompute_run_event(st)
 
     def _add_bytes(self, request: DiscordRequest):
         for att in request.attachments:
             state = self.ctx.states.get(att.frontend_id)
-            uploaded = len(att.data)
+            uploaded = att.size
             state.bytes_uploaded += uploaded
-
+            self.ctx.add_processed_size(uploaded)
 

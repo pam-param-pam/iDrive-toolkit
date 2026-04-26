@@ -22,7 +22,7 @@ class DownloadWorker:
         self.ctx = ctx
         self.throttle = throttle
         self.max_retries = max_retries
-        self._client = httpx.Client(timeout=10.0)
+        self._client = httpx.Client(timeout=10.0, limits=httpx.Limits(max_connections=100, max_keepalive_connections=20))
 
     def run(self) -> None:
         while True:
@@ -35,14 +35,11 @@ class DownloadWorker:
 
             try:
                 # wait if file is paused
-                state.run_event.wait()
-                if state.cancelled:
-                    self.fragment_queue.task_done()
-                    continue
+                self.ctx.global_pause.wait()
 
-                with state.lock:
-                    if state.status not in (FileDownloadStatus.COMPLETED, FileDownloadStatus.FAILED, FileDownloadStatus.CANCELLED):
-                        state.status = FileDownloadStatus.DOWNLOADING
+                # with state.lock:
+                #     if state.status not in (FileDownloadStatus.COMPLETED, FileDownloadStatus.FAILED):
+                #         state.status = FileDownloadStatus.DOWNLOADING
 
                 bytes_downloaded = self._download_fragment(fragment)
 
@@ -51,10 +48,9 @@ class DownloadWorker:
                         state.bytes_downloaded += bytes_downloaded
 
                 with state.lock:
-                    if not state.cancelled:
-                        state.fragments_downloaded += 1
-                        if state.fragments_downloaded == state.fragments_total:
-                            self.finalize_queue.put(fragment.file_id)
+                    state.fragments_downloaded += 1
+                    if state.fragments_downloaded == state.fragments_total:
+                        self.finalize_queue.put(fragment.file_id)
 
             except (DiscordRateLimitError, BackendRateLimitError, BackendServiceUnavailableError) as e:
                 self.throttle.signal_error()
@@ -91,19 +87,17 @@ class DownloadWorker:
 
     def _download(self, task: FragmentTask) -> int:
         state = self.ctx.states.get(task.file_id)
-        if state is None or state.cancelled:
-            return 0
 
         record = self.ctx.records[task.file_id]
         fragment = task.fragment
 
-        file_dir = record.file_dir
+        file_dir = record.temp_file_dir
         part_path = os.path.join(file_dir, f"{fragment.sequence}.part")
         safe_mkdirs(file_dir)
 
         response_data = make_request(
             "GET",
-            f"items/ultraDownload/attachments/{fragment.attachment_id}",
+            f"items/ultraDownload/fragments/{fragment.fragment_id}",
             headers={"x-resource-password": task.file_password},
         )
         url = response_data["url"]
@@ -121,19 +115,12 @@ class DownloadWorker:
                         if not chunk:
                             continue
 
-                        # wait if paused
-                        state.run_event.wait()
-
-                        # if cancelled return immiediatly
-                        if state.cancelled:
-                            return total
-
                         f.write(chunk)
                         total += len(chunk)
 
             return total
 
-        except (httpx.TimeoutException, httpx.ReadTimeout) as e:
+        except (httpx.TimeoutException, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
             self._cleanup_file(part_path)
             raise DiscordServerTimeout("Download stream timed out") from e
 

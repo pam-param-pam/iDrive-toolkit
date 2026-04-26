@@ -8,3 +8,8 @@ class RawMetadata:
     shutter: str
     aperture: str
     focal_length: str
+
+@dataclass
+class PhotoMetadata:
+    width: int
+    height: int

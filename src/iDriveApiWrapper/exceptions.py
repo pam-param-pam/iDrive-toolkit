@@ -1,3 +1,6 @@
+from abc import ABC
+
+
 class IDriveException(Exception):
     """A base class for all IDriveWrapper exceptions."""
 
@@ -12,6 +15,11 @@ class BackendNetworkError(NetworkError):
 
 class DiscordNetworkError(NetworkError):
     """A base class for all discord network related errors"""
+
+
+class NetworkRetryable(ABC):
+    pass
+
 
 class BackendServerTimeout(BackendNetworkError):
     """Raised when backend timeouts"""
@@ -60,12 +68,17 @@ class DiscordHttpError(HttpError):
 
 class DiscordRateLimitError(DiscordHttpError):
     def __init__(self, response):
-        header_wait = response.headers.get("X-RateLimit-Reset-After")
+        is_shared = response.headers.get("x-ratelimit-scope")
+        if is_shared:
+            header_wait = response.headers.get("retry-after")
+        else:
+            header_wait = response.headers.get("X-RateLimit-Reset-After")
 
         if header_wait and header_wait.isdigit():
             self.wait = int(header_wait)
         else:
             self.wait = 5.0
+        self.wait = 15.0 #todo
 
         msg = (
             f"Discord rate limited (HTTP 429). Retry after {self.wait} seconds."
@@ -121,6 +134,10 @@ class BackendInternalServerError(BackendHttpError):
     """Raised when 500 on backend"""
 
 class BackendServiceUnavailableError(BackendHttpError):
+    def __init__(self, response, message=None):
+        self.wait = 5.0
+        super().__init__(response, message)
+
     """Raised when 503 on backend"""
 
 
