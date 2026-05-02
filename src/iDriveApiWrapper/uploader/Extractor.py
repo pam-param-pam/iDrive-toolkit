@@ -3,7 +3,6 @@ import logging
 import os
 import re
 import subprocess
-import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Mapping
@@ -17,13 +16,18 @@ _TEXT_SUB_CODECS = {"mov_text", "tx3g", "subrip", "srt", "ass", "ssa", "webvtt"}
 
 logger = logging.getLogger("iDrive")
 
+
+## this is all soooo fucked
+
 def get_file_extension(filename: str) -> str:
     if "." not in filename or filename.endswith("."):
         return ".txt"
     return "." + filename.rsplit(".", 1)[1]
 
+
 def _run(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3)
+
 
 def _run_ffprobe(path: str, extensions, extension) -> Dict[str, Any]:
     if not _is_type(extensions, extension, "Video"):
@@ -31,17 +35,20 @@ def _run_ffprobe(path: str, extensions, extension) -> Dict[str, Any]:
     cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", path]
     return json.loads(_run(cmd).stdout)
 
+
 def _safe_int(x) -> Optional[int]:
     try:
         return int(float(x))
     except Exception:
         return None
 
+
 def _safe_float(x) -> Optional[float]:
     try:
         return float(x)
     except Exception:
         return None
+
 
 def _fps_from_ratio(r: Optional[str]) -> Optional[float]:
     if not r or "/" not in r:
@@ -52,11 +59,13 @@ def _fps_from_ratio(r: Optional[str]) -> Optional[float]:
         return None
     return fa / fb
 
+
 def _slug(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"\s+", "_", s)
     s = re.sub(r"[^A-Za-z0-9._-]+", "", s)
     return s or "unknown"
+
 
 # ---------- metadata ----------
 
@@ -101,7 +110,7 @@ def extract_video_metadata(data, path: Path) -> Tuple[VideoMetadata | None, int 
                 name=tags.get("handler_name") or "und",
                 channel_count=s.get("channels"),
                 sample_rate=_safe_int(s.get("sample_rate")),
-                sample_size=_safe_int(s.get("bit_rate")),
+                sample_size=_safe_int(s.get("bit_rate")) or 0,
                 track_number=s.get("index"),
             ))
 
@@ -269,6 +278,7 @@ def _encode_webp_thumbnail(img: Image.Image, quality: int = 70) -> Optional[Extr
         logger.exception("[Extractor] WEBP encoding failed")
         return None
 
+
 def _extract_image_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
     return None
     try:
@@ -343,7 +353,7 @@ def _extract_audio_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
             "ffmpeg",
             "-v", "error",
             "-i", str(path),
-            "-map", "0:v",        # cover art stream
+            "-map", "0:v",  # cover art stream
             "-frames:v", "1",
             "-f", "image2pipe",
             "-vcodec", "png",
@@ -376,5 +386,3 @@ def _extract_audio_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
     except Exception:
         logger.exception("[Extractor] audio thumbnail extraction failed")
         return None
-
-

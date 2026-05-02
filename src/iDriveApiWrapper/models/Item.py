@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
 from ..models.Resource import Resource
@@ -20,8 +21,8 @@ class Item(Resource, ABC):
         self._name: Optional[str] = None
         self._parent: Optional[Folder] = None
         self._parent_id: Optional[str] = None
-        self._created: Optional[str] = None
-        self._last_modified: Optional[str] = None
+        self._created_at: Optional[str] = None
+        self._last_modified_at: Optional[str] = None
         self._in_trash_since: Optional[str] = None
         self._is_locked: Optional[bool] = None
         self._lock_from: Optional[str] = None
@@ -55,9 +56,9 @@ class Item(Resource, ABC):
             elif key == "in_trash_since":
                 self._in_trash_since = value
             elif key == "created":
-                self._created = value
+                self._created_at = value
             elif key == "last_modified":
-                self._last_modified = value
+                self._last_modified_at = value
             elif key == "isLocked":
                 self._is_locked = value
             elif key == "lockFrom":
@@ -79,13 +80,18 @@ class Item(Resource, ABC):
 
     @property
     @autoFetchProperty('_fetch_data')
-    def created(self):
-        return self._created
+    def created_at(self) -> datetime:
+        return datetime.fromisoformat(self._created_at)
 
     @property
     @autoFetchProperty('_fetch_data')
-    def last_modified(self):
-        return self._last_modified
+    def last_modified_at(self) -> datetime:
+        return datetime.fromisoformat(self._last_modified_at)
+
+    @property
+    @autoFetchProperty('_fetch_data')
+    def in_trash_since(self) -> datetime:
+        return datetime.fromisoformat(self._in_trash_since)
 
     @property
     @autoFetchProperty('_fetch_data')
@@ -96,11 +102,6 @@ class Item(Resource, ABC):
     @autoFetchProperty('_fetch_data')
     def lock_from(self):
         return self._lock_from
-
-    @property
-    @autoFetchProperty('_fetch_data')
-    def in_trash_since(self):
-        return self._in_trash_since
 
     @property
     def parent(self):

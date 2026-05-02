@@ -194,14 +194,14 @@ class UploadFileState:
                 self.uploaded_thumbnail == self.expected_thumbnail
         )
 
-        logger.debug(
-            "[UploadFileState] fully_uploaded=%s | "
-            "chunks: %s/%s | subtitles: %s/%s | thumbnail: %s/%s",
-            result,
-            self.uploaded_chunks, self.expected_chunks,
-            self.uploaded_subtitles, self.expected_subtitles,
-            self.uploaded_thumbnail, self.expected_thumbnail,
-        )
+        # logger.debug(
+        #     "[UploadFileState] fully_uploaded=%s | "
+        #     "chunks: %s/%s | subtitles: %s/%s | thumbnail: %s/%s",
+        #     result,
+        #     self.uploaded_chunks, self.expected_chunks,
+        #     self.uploaded_subtitles, self.expected_subtitles,
+        #     self.uploaded_thumbnail, self.expected_thumbnail,
+        # )
 
         return result
 

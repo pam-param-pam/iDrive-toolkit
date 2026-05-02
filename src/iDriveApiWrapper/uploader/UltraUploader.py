@@ -116,8 +116,8 @@ class UltraUploader:
                 last_uploaded = total_uploaded
                 last_time = now
 
-        # t = threading.Thread(target=monitor, daemon=True)
-        # t.start()
+        t = threading.Thread(target=monitor, daemon=True)
+        t.start()
 
     def _start_workers(self) -> None:
         # request prepare workers

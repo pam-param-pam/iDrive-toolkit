@@ -2,14 +2,15 @@ import base64
 import logging
 import os
 import zlib
+from pathlib import Path
 from queue import Queue
 from typing import List
 
 from .Decryptor import Decryptor
 from .DownloadContext import DownloadContext
 from .models import FileDownloadStatus, FileRecord, FileInfo, FragmentInfo
-from .path_utlis import safe_rmtree, safe_move_src_only, safe_open, safe_remove_file
 from ..exceptions import PathDoesntExistError
+from ..state.Storage import safe_move_src_only, safe_rmtree, safe_open, safe_remove_file
 
 logger = logging.getLogger("iDrive")
 
@@ -35,7 +36,7 @@ class FinalizeWorker:
                 self._finalize(record)
 
                 output_dir = record.output_dir
-                if not os.path.isdir(output_dir):
+                if output_dir.is_dir():
                     raise PathDoesntExistError(f"Target directory does not exist: {output_dir}")
 
                 # todo make this safe under the download dir ensure within root
@@ -72,7 +73,7 @@ class FinalizeWorker:
             temp_file_path=record.temp_file_path,
         )
 
-    def _decrypt_merge_and_verify(self, file_info: FileInfo, fragments: List[FragmentInfo], source_dir: str, temp_file_path: str):
+    def _decrypt_merge_and_verify(self, file_info: FileInfo, fragments: List[FragmentInfo], source_dir: Path, temp_file_path: Path):
         key = base64.b64decode(file_info.key)
         iv = base64.b64decode(file_info.iv)
         dec = Decryptor(file_info.encryption_method, key, iv)
@@ -82,7 +83,7 @@ class FinalizeWorker:
         with safe_open(temp_file_path, "wb") as out:
             for frag in fragments:
                 frag_crc = 0
-                frag_path = os.path.join(source_dir, f"{frag.sequence}.part")
+                frag_path = source_dir / f"{frag.sequence}.part"
 
                 with safe_open(frag_path, "rb") as i_f:
                     for chunk in iter(lambda: i_f.read(2 * 1024 * 1024), b""):
@@ -102,4 +103,4 @@ class FinalizeWorker:
         # expected = file_info.crc & 0xFFFFFFFF
         # actual = overall_crc & 0xFFFFFFFF
         # if actual != expected:
-        #     raise CrcIntegrityError(f"Final CRC mismatch. Expected={expected}, Actual={actual}")
+        #     raise CrcIntegrityError(f"Final CRC mismatch. Expected={expected}, Actual={actual}") #todo uncomment

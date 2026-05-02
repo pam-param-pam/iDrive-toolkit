@@ -29,9 +29,9 @@ class UploadWorker:
         while True:
             request = self.request_queue.get()
             if not request:
-                print("breaking")
+                print("not request")
                 self.request_queue.task_done()
-                break
+                continue
 
             try:
                 while True:  # retry loop for THIS request
@@ -130,8 +130,6 @@ class UploadWorker:
     # Helpers
     # -------------------------------------------------
     def _get_states_from_request(self, request: DiscordRequest) -> Dict[str, UploadFileState]:
-        print("_get_states_from_request")
-        print(request)
         file_ids = {att.frontend_id for att in request.attachments}
         states = self.ctx.states
         return {fid: states[fid] for fid in file_ids if fid in states}

@@ -6,20 +6,18 @@ from pathlib import Path
 from queue import Queue, Empty
 from typing import List, Optional, Iterable
 
-from . import constants
 from .DownloadContext import DownloadContext
 from .DownloadWorker import DownloadWorker
 from .FinalizeWorker import FinalizeWorker
 from .MetadataFetcher import MetadataFetcher
 from .TaskPlanner import TaskPlanner
-from .path_utlis import safe_mkdirs, safe_rmtree
 from .models import ThrottleState, FragmentTask, FileState, onCompleteCallback
 from ..Config import APIConfig
 from ..models.Item import Item
+from ..state.Storage import get_storage, safe_rmtree
 from ..utils.workers.AutoScalePolicy import AutoScalePolicy
 from ..utils.workers.AutoScaler import AutoScaler
 # todo make this not break on empty files
-
 
 UPLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
     scale_up_step=1,
@@ -41,8 +39,8 @@ UPLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
 
 class UltraDownloader:
     def __init__(self, min_workers: int, max_workers: int):
-        self._temp_download_folder = constants.ROOT_FOLDER
-        safe_mkdirs(self._temp_download_folder)
+        self.storage = get_storage()
+        self._temp_download_folder = self.storage.get_temp_path("downloader")
 
         self.ctx = DownloadContext()
         self.metadata_fetcher = MetadataFetcher()
@@ -55,7 +53,7 @@ class UltraDownloader:
         )
         self.scaler = AutoScaler(throttle_state=self.throttle, policy=self.policy)
 
-        self.max_retries = constants.MAX_RETRIES
+        self.max_retries = 5
         self.post_workers = min(8, max(2, os.cpu_count() or 2))
 
         self._fragment_queue: Queue[FragmentTask] = Queue()  # todo add max size and make sure the DownloadWorker cannot deadlock
@@ -133,21 +131,21 @@ class UltraDownloader:
                 break
             self._fragment_queue.put(task)
 
-    def get_temp_download_folder(self) -> str:
+    def get_temp_download_folder(self) -> Path:
         return self._temp_download_folder
 
-    def _get_dangling_folders(self) -> Iterable[str]:
+    def _get_dangling_folders(self) -> Iterable[Path]:
         active = set(self.ctx.states.keys())
-        entries = os.listdir(constants.ROOT_FOLDER)
+        root = self.storage.temp_download_dir
 
-        for name in entries:
-            path = os.path.join(constants.ROOT_FOLDER, name)
-
-            # Only consider directories and skip active downloads
-            if not os.path.isdir(path) or name in active:
+        for entry in root.iterdir():
+            if not entry.is_dir():
                 continue
 
-            yield path
+            if entry.name in active:
+                continue
+
+            yield entry
 
     def clear_dangling_files(self):
         for folder in self._get_dangling_folders():
@@ -168,9 +166,6 @@ class UltraDownloader:
 
     def get_download_rate(self) -> float:
         return self.throttle.bytes_rate()
-
-    def get_last_error(self) -> Optional[Exception]:
-        return self.ctx.last_error
 
     # ------------------------------------------------------------------
     # Global pause / resume

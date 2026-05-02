@@ -1,15 +1,16 @@
 import logging
 import os
 import time
+from pathlib import Path
 from queue import Queue
 
 import httpx
 
 from .DownloadContext import DownloadContext
-from .path_utlis import safe_mkdirs, safe_remove_file, safe_open
 from .models import ThrottleState, FileDownloadStatus, FragmentTask
 from ..exceptions import BackendRateLimitError, BackendServerTimeout, BackendServiceUnavailableError
 from ..exceptions import DiscordRateLimitError, DiscordServerTimeout
+from ..state.Storage import safe_mkdirs, safe_remove_file, safe_open
 from ..utils.networker import make_request
 
 logger = logging.getLogger("iDrive")
@@ -34,7 +35,7 @@ class DownloadWorker:
             state = self.ctx.states[fragment.file_id]
 
             try:
-                # wait if file is paused
+                # wait if upload is paused globally
                 self.ctx.global_pause.wait()
 
                 # with state.lock:
@@ -86,13 +87,11 @@ class DownloadWorker:
         return bytes_count
 
     def _download(self, task: FragmentTask) -> int:
-        state = self.ctx.states.get(task.file_id)
-
         record = self.ctx.records[task.file_id]
         fragment = task.fragment
 
         file_dir = record.temp_file_dir
-        part_path = os.path.join(file_dir, f"{fragment.sequence}.part")
+        part_path = file_dir / f"{fragment.sequence}.part"
         safe_mkdirs(file_dir)
 
         response_data = make_request(
@@ -124,10 +123,10 @@ class DownloadWorker:
             self._cleanup_file(part_path)
             raise DiscordServerTimeout("Download stream timed out") from e
 
-    def _cleanup_file(self, path: str) -> None:
+    def _cleanup_file(self, path: Path) -> None:
         logger.info("[FragmentDownloader] Cleaning up file after network error")
         try:
-            if os.path.exists(path):
+            if path.exists():
                 safe_remove_file(path)
         except Exception:
             logger.exception("[FragmentDownloader] Failed to cleanup partial file")

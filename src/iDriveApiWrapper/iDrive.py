@@ -12,6 +12,7 @@ from .models.Item import Item
 from .models.ItemsList import ItemsList
 from .models.Share import Share
 from .models.UserProfile import UserProfile
+from .state.Storage import IdriveStorage, set_storage
 from .uploader.UltraUploader import UltraUploader
 from .utils import common
 from .utils.AuthClient import AuthClient
@@ -38,6 +39,7 @@ class Client:
     def __init__(self, _internal: bool, base_url: str, token: str, device_id: str):
         if not _internal:
             raise RuntimeError("Use login() instead.")
+        set_storage(IdriveStorage())
         APIConfig.base_url = base_url
         APIConfig.token = token
         APIConfig.device_id = device_id
@@ -92,6 +94,8 @@ class Client:
 
     @classmethod
     def login(cls, base_url: str, username: str, password: str, force_login: bool = False) -> "Client":
+        set_storage(IdriveStorage())
+
         cls._validate_and_set_base(base_url)
         # todo make sure the file stores the auth token per username and password(hash perhaps both idk)
         token, device_id = AuthClient.login(username, password, force_login)

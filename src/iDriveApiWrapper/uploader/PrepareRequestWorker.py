@@ -8,7 +8,7 @@ from typing import Iterator
 
 from .Extractor import extract_thumbnail_if_needed, get_file_extension, extract_video_metadata_if_needed, extract_subtitles_if_needed, _run_ffprobe, _is_type
 from .models import DiscordAttachment, DiscordRequest, UploadInput, UploadFileState, Crypto, ThumbnailAttachment, SubtitleAttachment, ChunkAttachment, FileUploadStatus, FileArtifacts, \
-    BackendFile, ResponsePayload
+    ResponsePayload
 from ..uploader.Encryptor import Encryptor
 from ..uploader.UploadContext import UploadContext
 
@@ -160,11 +160,11 @@ class PrepareRequestWorker:
 
         if file_size == 0:
             self.response_queue.put(ResponsePayload(
-                    response=None,
-                    request=None,
-                    frontend_id=frontend_id,
-                    is_empty=True,
-                ))
+                response=None,
+                request=None,
+                frontend_id=frontend_id,
+                is_empty=True,
+            ))
             return
 
         with prof.measure("thumbnail"):

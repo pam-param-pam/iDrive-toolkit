@@ -1,20 +1,20 @@
 import logging
-import os
 import zlib
+from pathlib import Path
 from queue import Queue
 from typing import Tuple, Dict, List, Callable, Optional
 
-from .path_utlis import safe_remove_file
 from .models import FileState, FragmentTask, FileInfo, FragmentInfo, FileRecord, FileDownloadStatus
+from ..state.Storage import safe_remove_file
 
 logger = logging.getLogger("iDrive")
 
 
 class TaskPlanner:
-    def __init__(self, temp_folder: str):
+    def __init__(self, temp_folder: Path):
         self._temp_folder = temp_folder
 
-    def prepare(self, files: List[FileInfo], target_dir: str, on_complete: Optional[Callable] = None) -> Tuple[Queue[FragmentTask], Queue[str], Dict[str, FileState], Dict[str, FileRecord], int]:
+    def prepare(self, files: List[FileInfo], target_dir: Path, on_complete: Optional[Callable] = None) -> Tuple[Queue[FragmentTask], Queue[str], Dict[str, FileState], Dict[str, FileRecord], int]:
         fragment_queue: Queue[FragmentTask] = Queue()
         finalize_queue: Queue[str] = Queue()
         file_states: Dict[str, FileState] = {}
@@ -27,9 +27,9 @@ class TaskPlanner:
             path = file.path
             fragments = file.fragments
 
-            temp_file_dir = os.path.join(self._temp_folder, file_id)
-            temp_file_path = os.path.join(temp_file_dir, file_id)
-            final_user_output_path = os.path.join(target_dir, path, name)
+            temp_file_dir = Path(self._temp_folder) / file_id
+            temp_file_path = temp_file_dir / file_id
+            final_user_output_path = Path(target_dir) / path / name
 
             if self._is_final_file_valid(final_user_output_path, file.size, file.crc):
                 state = FileState(
@@ -100,17 +100,17 @@ class TaskPlanner:
 
         return fragment_queue, finalize_queue, file_states, file_records, remaining_size_est
 
-    def _missing(self, file_dir: str, fragments: List[FragmentInfo]) -> Tuple[List[FragmentInfo], int, int, int]:
+    def _missing(self, file_dir: Path, fragments: List[FragmentInfo]) -> Tuple[List[FragmentInfo], int, int, int]:
         missing: List[FragmentInfo] = []
         downloaded_fragments = 0
         downloaded_bytes = 0
         remaining_bytes = 0
 
         for frag in fragments:
-            part_path = os.path.join(file_dir, f"{frag.sequence}.part")
+            part_path = Path(file_dir) / f"{frag.sequence}.part"
 
-            if os.path.exists(part_path):
-                actual_size = os.path.getsize(part_path)
+            if part_path.exists():
+                actual_size = part_path.stat().st_size
 
                 if actual_size == frag.size and self._verify_fragment_crc(part_path, frag.crc):
                     downloaded_fragments += 1
@@ -126,18 +126,18 @@ class TaskPlanner:
 
         return missing, downloaded_fragments, downloaded_bytes, remaining_bytes
 
-    def _verify_fragment_crc(self, path: str, expected_crc: int) -> bool:
+    def _verify_fragment_crc(self, path: Path, expected_crc: int) -> bool:
         crc = 0
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 crc = zlib.crc32(chunk, crc)
         return (crc & 0xFFFFFFFF) == expected_crc
 
-    def _is_final_file_valid(self, path: str, expected_size: int, expected_crc: int) -> bool:
-        if not os.path.exists(path):
+    def _is_final_file_valid(self, path: Path, expected_size: int, expected_crc: int) -> bool:
+        if not path.exists():
             return False
 
-        actual_size = os.path.getsize(path)
+        actual_size = path.stat().st_size
 
         if actual_size != expected_size:
             return False

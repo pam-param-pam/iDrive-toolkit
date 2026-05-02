@@ -2,6 +2,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Optional, List, Union, Callable
 
 from ..models.Enums import EncryptionMethod
@@ -91,16 +92,16 @@ class FileState:
     error: Optional[Exception] = None
     status: FileDownloadStatus = FileDownloadStatus.QUEUED
 
-onCompleteCallback = Optional[Callable[[str, FileState], None]]
 
+onCompleteCallback = Optional[Callable[[str, FileState], None]]
 
 @dataclass
 class FileRecord:
     file_info: FileInfo
-    temp_file_dir: str
-    final_user_output_path: str
-    output_dir: str
-    temp_file_path: str
+    temp_file_dir: Path
+    final_user_output_path: Path
+    output_dir: Path
+    temp_file_path: Path
     on_complete: onCompleteCallback
 
 

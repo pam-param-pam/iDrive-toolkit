@@ -21,6 +21,7 @@ class Folder(Item):
         self._folder_size: Optional[Folder] = None
         self._file_count: Optional[Folder] = None
         self._folder_count: Optional[Folder] = None
+        # todo set breadcrumbs
 
     @property
     @autoFetchProperty('_fetch_data')
@@ -58,11 +59,11 @@ class Folder(Item):
         self._fetched = True
 
     def lock_with_password(self, new_password) -> None:
-        make_request("POST", f"folder/password/{self.id}", headers=self._get_password_header(), data={"new_password": new_password})
+        make_request("POST", f"folders/{self.id}/password", headers=self._get_password_header(), data={"new_password": new_password})
         self.set_password(new_password)
 
     def unlock(self) -> None:
-        make_request("POST", f"folder/password/{self.id}", headers=self._get_password_header(), data={"new_password": None})
+        make_request("POST", f"folders/{self.id}/password", headers=self._get_password_header(), data={"new_password": None})
         self.set_password(None)
 
     @staticmethod
@@ -102,3 +103,18 @@ class Folder(Item):
                 self._children = self._parse_children(self, value)
             else:
                 logger.warning(f"[FOLDER] Unexpected renderer: {key}")
+
+    def reset_password(self, account_password: str, new_folder_password: str = "") -> None:
+        make_request("POST", f"folders/{self.id}/password/reset", data={"accountPassword": account_password, "folderPassword": new_folder_password})
+
+    def get_usage(self) -> dict:
+        data = make_request("GET", f"folders/{self.id}/usage", headers=self._get_password_header())
+        return data
+
+    def get_stats(self) -> dict:
+        data = make_request("GET", f"folders/{self.id}/stats", headers=self._get_password_header())
+        return data
+
+    def get_hash(self) -> str:
+        data = make_request("GET", f"folders/{self.id}/hash", headers=self._get_password_header())
+        return data['hash']
