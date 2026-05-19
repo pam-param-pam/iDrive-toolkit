@@ -13,4 +13,4 @@ class Credential(ABC):
         self.discord_error_code = discord_error_code
 
     def re_enable(self):
-        make_request("POST", f"user/discordSettings/credentials/{self.discord_id}/:enable")
+        make_request("POST", f"user/discord-settings/credentials/{self.discord_id}/enable")

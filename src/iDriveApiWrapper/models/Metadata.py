@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import logging
 from typing import Optional
 
@@ -5,8 +6,22 @@ from ..models.namedTuples import VideoTrackTuple, SubtitleTrackTuple, AudioTrack
 
 logger = logging.getLogger("iDrive")
 
-class VideoMetadata:
+@dataclass
+class RawMetadata:
+    camera: str
+    camera_owner: str
+    iso: str
+    shutter: str
+    aperture: str
+    focal_length: str
 
+@dataclass
+class PhotoMetadata:
+    width: int
+    height: int
+
+
+class VideoMetadata:
     def __init__(self, data):
         self._brands: Optional[str, None] = None
         self._mime: Optional[str, None] = None

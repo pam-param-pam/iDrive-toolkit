@@ -1,13 +1,18 @@
 from pathlib import Path
+from typing import Callable
 
-from .DiffEngine import DiffEngine, DiffResult
+from .DiffEngine import DiffEngine, DiffResult, DiffEntry
 from .LocalScanner import LocalScanner
 from .RemoteScanner import RemoteScanner
 from .state import StateStore
+from ..models.Folder import Folder
 
 
 class Syncer:
-    def __init__(self):
+    def __init__(self, get_uploader: Callable[[], "Uploader"], get_downloader: Callable[[], "Downloader"],):
+        self._get_uploader = get_uploader
+        self._get_downloader = get_downloader
+
         self.state = StateStore()
         self.state.load()
 
@@ -19,24 +24,21 @@ class Syncer:
     # Public API
     # -------------------------
 
-    def diff(self, local_root: Path, remote_root) -> DiffResult:
+    def diff(self, local_root: Path, remote_root: Folder) -> DiffResult:
         return self.diff_engine.diff_one_level(local_root, remote_root)
 
-    def sync_one_level(self, local_root: Path, remote_root):
+    def sync_one_level(self, local_root: Path, remote_root: Folder):
         result = self.diff(local_root, remote_root)
 
         # --- plan actions ---
-        for node in result.only_local:
-            self._handle_only_local(node)
+        for entry in result.only_local:
+            self._handle_only_local(entry, remote_root)
 
-        for node in result.only_remote:
-            self._handle_only_remote(node)
+        for entry in result.only_remote:
+            self._handle_only_remote(entry)
 
-        for local, remote in result.changed:
-            self._handle_changed(local, remote)
-
-        for local, remote in result.same:
-            self._handle_same(local, remote)
+        for entry in result.changed:
+            self._handle_changed(entry)
 
         return result
 
@@ -44,16 +46,14 @@ class Syncer:
     # Handlers (extension points)
     # -------------------------
 
-    def _handle_only_local(self, node):
+    def _handle_only_local(self, entry: DiffEntry, remote_root: Folder):
+        uploader = self._get_uploader()
+        uploader.upload(entry.local_path, parent=remote_root)
+
+    def _handle_only_remote(self, entry: DiffEntry):
         pass
 
-    def _handle_only_remote(self, node):
-        pass
-
-    def _handle_changed(self, local, remote):
-        pass
-
-    def _handle_same(self, local, remote):
+    def _handle_changed(self, entry: DiffEntry):
         pass
 
     def get_cache_folder(self) -> Path:

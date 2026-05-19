@@ -19,17 +19,16 @@ class NodeStatus(Enum):
 
 @dataclass
 class DiffResult:
-    only_local: list[Node] = field(default_factory=list)
-    only_remote: list[Node] = field(default_factory=list)
-    changed: list[tuple[Node, Node]] = field(default_factory=list)
-    same: list[tuple[Node, Node]] = field(default_factory=list)
+    only_local: list[DiffEntry] = field(default_factory=list)
+    only_remote: list[DiffEntry] = field(default_factory=list)
+    changed: list[DiffEntry] = field(default_factory=list)
+    same: list[DiffEntry] = field(default_factory=list)
 
 @dataclass
-class DiffNode:
-    node: Node
-    origin: NodeOrigin
+class DiffEntry:
     status: NodeStatus | None = None
-    counterpart: Optional["DiffNode"] = None
+    local: Optional["Node"] = None
+    remote: Optional["Node"] = None
 
     # -------------------------
     # Identity
@@ -37,22 +36,14 @@ class DiffNode:
 
     @property
     def remote_id(self) -> str | None:
-        if self.origin == NodeOrigin.REMOTE:
-            return str(self.node.uid)
-
-        if self.counterpart and self.counterpart.origin == NodeOrigin.REMOTE:
-            return str(self.counterpart.node.uid)
-
+        if self.remote:
+            return str(self.remote.uid)
         return None
 
     @property
     def local_path(self) -> Path | None:
-        if self.origin == NodeOrigin.LOCAL:
-            return Path(self.node.uid)
-
-        if self.counterpart and self.counterpart.origin == NodeOrigin.LOCAL:
-            return Path(self.counterpart.node.uid)
-
+        if self.local:
+            return Path(self.local.uid)
         return None
 
     # -------------------------
@@ -61,7 +52,42 @@ class DiffNode:
 
     @property
     def is_folder(self) -> bool:
-        return self.node.kind == NodeKind.FOLDER
+        if self.local:
+            return self.local.kind == NodeKind.FOLDER
+        return self.remote.kind == NodeKind.FOLDER
+
+    def __post_init__(self):
+        if self.status is None:
+            raise ValueError("status must be set")
+
+        if self.status == NodeStatus.ONLY_LOCAL:
+            if not self.local or self.remote:
+                raise ValueError("ONLY_LOCAL requires local only")
+
+        elif self.status == NodeStatus.ONLY_REMOTE:
+            if not self.remote or self.local:
+                raise ValueError("ONLY_REMOTE requires remote only")
+
+        elif self.status in (NodeStatus.SAME, NodeStatus.CHANGED):
+            if not self.local or not self.remote:
+                raise ValueError("SAME/CHANGED require both sides")
+            if self.local.kind != self.remote.kind:
+                raise ValueError("KIND must be the same")
+
+        else:
+            raise ValueError(f"Unknown status: {self.status}")
+
+    def __str__(self):
+        n = self.local or self.remote
+        if not n:
+            return "<invalid>"
+
+        name = n.name or "<unnamed>"
+
+        if n.kind == NodeKind.FOLDER:
+            return f"Folder({name})"
+        else:
+            return f"File({name})"
 
 
 class DiffEngine:
@@ -81,96 +107,75 @@ class DiffEngine:
         # -------------------------
         # FOLDERS (by name)
         # -------------------------
-        all_dir_names = set(l_dirs.keys()) | set(r_dirs.keys())
+        all_dir_names = sorted(set(l_dirs.keys()) | set(r_dirs.keys()))
 
         for name in all_dir_names:
             l = l_dirs.get(name)
             r = r_dirs.get(name)
 
             if l is None:
-                result.only_remote.append(r)
-            elif r is None:
-                result.only_local.append(l)
-            elif self._is_same(l, r):
-                result.same.append((l, r))
-            else:
-                result.changed.append((l, r))
+                result.only_remote.append(
+                    DiffEntry(status=NodeStatus.ONLY_REMOTE, remote=r)
+                )
 
-        TARGET = ""
+            elif r is None:
+                result.only_local.append(
+                    DiffEntry(status=NodeStatus.ONLY_LOCAL, local=l)
+                )
+
+            elif self._is_same(l, r):
+                result.same.append(
+                    DiffEntry(status=NodeStatus.SAME, local=l, remote=r)
+                )
+
+            else:
+                result.changed.append(
+                    DiffEntry(status=NodeStatus.CHANGED, local=l, remote=r)
+                )
 
         # -------------------------
         # FILES (by hash)
         # -------------------------
-
-        logger.warning("Total local hash buckets: %d", len(l_files))
-        logger.warning("Total remote hash buckets: %d", len(r_files))
-
-        all_hashes = set(l_files.keys()) | set(r_files.keys())
+        all_hashes = sorted(set(l_files.keys()) | set(r_files.keys()))
 
         for h in all_hashes:
-            l_nodes = l_files.get(h, [])
-            r_nodes = r_files.get(h, [])
-
-            # detect target presence
-            target_in_local = any(TARGET in n.name for n in l_nodes)
-            target_in_remote = any(TARGET in n.name for n in r_nodes)
-
-            if target_in_local or target_in_remote:
-                logger.warning("---- TARGET HASH BUCKET ----")
-                logger.warning("Hash: %s", h)
-                logger.warning("Local count: %d", len(l_nodes))
-                logger.warning("Remote count: %d", len(r_nodes))
-
-                for n in l_nodes:
-                    logger.warning(
-                        "  L name=%s hash=%s size=%s uid=%s",
-                        n.name, n.hash, n.size, n.uid
-                    )
-
-                for n in r_nodes:
-                    logger.warning(
-                        "  R name=%s hash=%s size=%s uid=%s",
-                        n.name, n.hash, n.size, n.uid
-                    )
-
-            # make pairing deterministic (critical)
-            l_nodes = sorted(l_nodes, key=lambda n: str(n.uid))
-            r_nodes = sorted(r_nodes, key=lambda n: str(n.uid))
+            l_nodes = sorted(l_files.get(h, []), key=lambda n: str(n.uid))
+            r_nodes = sorted(r_files.get(h, []), key=lambda n: str(n.uid))
 
             pairs = min(len(l_nodes), len(r_nodes))
 
-            if target_in_local or target_in_remote:
-                logger.warning("Pairs computed: %d", pairs)
-
-            # pair strictly by position
+            # matched pairs → SAME
             for i in range(pairs):
-                if target_in_local or target_in_remote:
-                    logger.warning(
-                        "PAIR[%d]: L=%s <-> R=%s",
-                        i,
-                        l_nodes[i].name,
-                        r_nodes[i].name
+                result.same.append(
+                    DiffEntry(
+                        status=NodeStatus.SAME,
+                        local=l_nodes[i],
+                        remote=r_nodes[i],
                     )
-                result.same.append((l_nodes[i], r_nodes[i]))
+                )
 
             # leftovers
-            local_left = l_nodes[pairs:]
-            remote_left = r_nodes[pairs:]
+            for l in l_nodes[pairs:]:
+                result.only_local.append(
+                    DiffEntry(status=NodeStatus.ONLY_LOCAL, local=l)
+                )
 
-            if target_in_local and any(TARGET in n.name for n in local_left):
-                logger.warning("TARGET ended in ONLY_LOCAL")
-                for n in local_left:
-                    if TARGET in n.name:
-                        logger.warning("  LEFT L: %s", n.name)
+            for r in r_nodes[pairs:]:
+                result.only_remote.append(
+                    DiffEntry(status=NodeStatus.ONLY_REMOTE, remote=r)
+                )
 
-            if target_in_remote and any(TARGET in n.name for n in remote_left):
-                logger.warning("TARGET ended in ONLY_REMOTE")
-                for n in remote_left:
-                    if TARGET in n.name:
-                        logger.warning("  LEFT R: %s", n.name)
+        # -------------------------
+        # FINAL SORT (deterministic)
+        # -------------------------
+        def _sort_key(e: DiffEntry):
+            n = e.local or e.remote
+            return n.kind, n.name or "", str(n.uid)
 
-            result.only_local.extend(local_left)
-            result.only_remote.extend(remote_left)
+        result.only_local.sort(key=_sort_key)
+        result.only_remote.sort(key=_sort_key)
+        result.same.sort(key=_sort_key)
+        result.changed.sort(key=_sort_key)
 
         return result
 
@@ -178,10 +183,13 @@ class DiffEngine:
         files_by_hash = defaultdict(list)
         folders_by_name = {}
 
-        for child in scanner.list_children(root_id):
+        children = list(scanner.list_children(root_id))
+        children.sort(key=lambda n: (n.kind, n.name or "", str(n.uid)))
+
+        for child in children:
             if child.kind == NodeKind.FILE:
                 files_by_hash[child.hash].append(child)
-            else:  # folder
+            else:
                 folders_by_name[child.name] = child
 
         return files_by_hash, folders_by_name

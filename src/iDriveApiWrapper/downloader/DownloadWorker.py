@@ -96,7 +96,7 @@ class DownloadWorker:
 
         response_data = make_request(
             "GET",
-            f"items/ultraDownload/fragments/{fragment.fragment_id}",
+            f"ultraDownload/fragments/{fragment.fragment_id}",
             headers={"x-resource-password": task.file_password},
         )
         url = response_data["url"]

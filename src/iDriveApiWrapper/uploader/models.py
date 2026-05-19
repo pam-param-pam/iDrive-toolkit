@@ -14,7 +14,7 @@ from httpx import Response
 
 from ..models.Enums import EncryptionMethod
 from ..models.Folder import Folder
-from ..models.VideoMetadata import VideoMetadata
+from ..models.Metadata import VideoMetadata
 
 logger = logging.getLogger("iDrive")
 
@@ -162,9 +162,9 @@ class FileArtifacts:
     parent_password: str
     file_crypto: Crypto
     encryption_method: EncryptionMethod
-    video_metadata: VideoMetadata
-    duration: int
-    file_crc: Optional[int] = 0
+    video_metadata: Optional[VideoMetadata]
+    duration: Optional[int]
+    file_crc: int = 0
 
 @dataclass
 class UploadFileState:

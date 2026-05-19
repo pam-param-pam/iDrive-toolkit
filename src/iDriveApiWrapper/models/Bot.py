@@ -16,4 +16,4 @@ class Bot(Credential):
         return self.__str__()
 
     def delete(self) -> None:
-        make_request("DELETE", f"user/discordSettings/bots/{self.discord_id}")
+        make_request("DELETE", f"user/discord-settings/bots/{self.discord_id}")

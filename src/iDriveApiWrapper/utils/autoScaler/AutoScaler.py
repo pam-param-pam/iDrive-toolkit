@@ -3,7 +3,7 @@ import time
 import logging
 
 from ...downloader.models import ThrottleState
-from ...utils.workers.AutoScalePolicy import AutoScalePolicy
+from ...utils.autoScaler.AutoScalePolicy import AutoScalePolicy
 
 logger = logging.getLogger("iDrive")
 

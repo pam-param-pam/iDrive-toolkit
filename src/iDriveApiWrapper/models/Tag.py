@@ -5,15 +5,12 @@ from ..utils.networker import make_request
 
 
 class Tag(Resource):
-    def __init__(self, id: str, name: str):
+    def __init__(self, id: str, name: str, file_id: str):
         super().__init__(id)
         self.name: str = name
-        self.file_id: Optional[str] = None
+        self.file_id: str = file_id
 
     def remove(self):
-        if not self.file_id:
-            raise KeyError("file_id is missing in tag.")
-
         make_request("DELETE", f"files/{self.file_id}/tags/{self._id}", headers=self._get_password_header())
 
     def __str__(self):

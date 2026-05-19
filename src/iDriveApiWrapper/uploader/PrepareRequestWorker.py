@@ -6,12 +6,11 @@ from collections import defaultdict
 from queue import Queue
 from typing import Iterator
 
-from .Extractor import extract_thumbnail_if_needed, get_file_extension, extract_video_metadata_if_needed, extract_subtitles_if_needed, _run_ffprobe, _is_type
-from .models import DiscordAttachment, DiscordRequest, UploadInput, UploadFileState, Crypto, ThumbnailAttachment, SubtitleAttachment, ChunkAttachment, FileUploadStatus, FileArtifacts, \
-    ResponsePayload
+from .models import DiscordAttachment, DiscordRequest, UploadInput, UploadFileState, Crypto, ThumbnailAttachment, ChunkAttachment, FileUploadStatus, FileArtifacts, \
+    ResponsePayload, SubtitleAttachment
+from .extractor import get_file_extension, _run_ffprobe, _is_type, extract_video_metadata_if_needed, extract_thumbnail_if_needed, extract_subtitles_if_needed
 from ..uploader.Encryptor import Encryptor
 from ..uploader.UploadContext import UploadContext
-
 
 class FileProfiler:
     def __init__(self, file_name: str):

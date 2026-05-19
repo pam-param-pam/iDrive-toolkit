@@ -1,5 +1,5 @@
 import logging
-from typing import Union, Optional, TYPE_CHECKING
+from typing import Union, Optional, TYPE_CHECKING, NamedTuple
 
 from overrides import overrides
 
@@ -13,6 +13,14 @@ logger = logging.getLogger("iDrive")
 if TYPE_CHECKING:
     from ..models.ItemsList import ItemsList
 
+class Breadcrumb(NamedTuple):
+    id: str
+    name: str
+    lockFrom: Optional[str]
+
+class FolderStats(NamedTuple):
+    total: int
+    used: int
 
 class Folder(Item):
     def __init__(self, folder_id):
@@ -21,12 +29,17 @@ class Folder(Item):
         self._folder_size: Optional[Folder] = None
         self._file_count: Optional[Folder] = None
         self._folder_count: Optional[Folder] = None
-        # todo set breadcrumbs
+        self._breadcrumbs: Optional[list[Breadcrumb]] = None
 
     @property
     @autoFetchProperty('_fetch_data')
     def children(self):
         return self._children
+
+    @property
+    @autoFetchProperty('_fetch_data')
+    def breadcrumbs(self):
+        return self._breadcrumbs
 
     @property
     @autoFetchProperty('_fetch_more_data')
@@ -56,6 +69,7 @@ class Folder(Item):
     def _fetch_data(self) -> None:
         data = make_request("GET", f"folders/{self.id}", headers=self._get_password_header())
         self._set_data(data['folder'])
+        self._set_breadcrumbs(data['breadcrumbs'])
         self._fetched = True
 
     def lock_with_password(self, new_password) -> None:
@@ -95,6 +109,15 @@ class Folder(Item):
 
         return ItemsList(children)
 
+    def _set_breadcrumbs(self, json_data: dict):
+        self._breadcrumbs = []
+        for breadcrumb in json_data:
+            self._breadcrumbs.append(Breadcrumb(
+                id=breadcrumb["id"],
+                name=breadcrumb["name"],
+                lockFrom=breadcrumb["lockFrom"])
+            )
+
     @overrides
     def _set_data(self, json_data: dict) -> None:
         json_data = super()._set_data(json_data)
@@ -111,9 +134,9 @@ class Folder(Item):
         data = make_request("GET", f"folders/{self.id}/usage", headers=self._get_password_header())
         return data
 
-    def get_stats(self) -> dict:
+    def get_stats(self) -> FolderStats:
         data = make_request("GET", f"folders/{self.id}/stats", headers=self._get_password_header())
-        return data
+        return FolderStats(total=data["total"], used=data["used"])
 
     def get_hash(self) -> str:
         data = make_request("GET", f"folders/{self.id}/hash", headers=self._get_password_header())

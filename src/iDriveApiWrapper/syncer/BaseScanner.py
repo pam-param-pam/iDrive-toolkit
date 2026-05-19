@@ -19,6 +19,7 @@ class NodeKind(Enum):
     def __repr__(self) -> str:
         return self.name
 
+# todo add remote folder here, cuz we lwk need it
 @dataclass
 class Node:
     uid: str | Path

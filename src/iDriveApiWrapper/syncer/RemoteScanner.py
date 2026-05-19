@@ -4,7 +4,6 @@ from ..models.Folder import Folder
 
 
 class RemoteScanner(BaseScanner):
-
     def __init__(self):
         self._items: dict[str, Folder | File] = {}
 

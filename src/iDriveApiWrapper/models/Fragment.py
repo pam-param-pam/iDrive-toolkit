@@ -11,10 +11,6 @@ class Fragment(Resource):
         self.crc = crc
         self._file_password = None
 
-    def get_url(self) -> str: #todo
-        response_data = make_request("GET", f"items/ultraDownload/attachments/{self.attachment_id}", headers=self._get_password_header())
-        return response_data["url"]
-
     def __str__(self) -> str:
         return f"Fragment(seq={self.sequence}, offset={self.offset}, size={self.size}, id={self.id})"
 

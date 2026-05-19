@@ -17,8 +17,8 @@ from .UploadContext import UploadContext
 from .UploadWorker import UploadWorker
 from .models import BackendFile, UploadInput, DiscordRequest, UploadFileState, ResponsePayload
 from ..utils.networker import make_request
-from ..utils.workers.AutoScalePolicy import AutoScalePolicy
-from ..utils.workers.AutoScaler import AutoScaler
+from ..utils.autoScaler.AutoScalePolicy import AutoScalePolicy
+from ..utils.autoScaler.AutoScaler import AutoScaler
 
 DOWNLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
     scale_up_step=1,
@@ -56,7 +56,7 @@ class UltraUploader:
 
         # Persistent queues
         self._input_queue: Queue[UploadInput] = Queue()
-        self._upload_queue: Queue[DiscordRequest] = Queue()
+        self._upload_queue: Queue[DiscordRequest] = Queue(maxsize=25)
         self._response_queue: Queue[ResponsePayload] = Queue()
 
         self._ready_files_queue: Queue[BackendFile] = Queue()
@@ -251,7 +251,7 @@ class UltraUploader:
         return path
 
     def _check_can_upload(self, parent: Folder) -> Optional[str]:
-        data = make_request("GET", f"user/canUpload/{parent.id}", headers=parent._get_password_header())
+        data = make_request("GET", f"user/can-upload/{parent.id}", headers=parent._get_password_header())
         self.ctx.configure(
             webhooks=[Webhook(**hook) for hook in data["webhooks"]],
             extensions=dict(data["extensions"]),

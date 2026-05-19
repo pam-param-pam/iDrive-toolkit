@@ -7,10 +7,9 @@ from overrides import overrides
 from .Enums import EncryptionMethod
 from .Fragment import Fragment
 from .Moment import Moment
-from .RawMetadata import RawMetadata, PhotoMetadata
+from .Metadata import RawMetadata, PhotoMetadata, VideoMetadata
 from .Subtitle import Subtitle
 from .Tag import Tag
-from .VideoMetadata import VideoMetadata
 from ..models.Item import Item
 from ..utils.decorators import autoFetchProperty
 from ..utils.networker import make_request
@@ -195,7 +194,7 @@ class File(Item):
         data = make_request("GET", f"files/{self.id}/tags", headers=self._get_password_header())
         self._tags = []
         for element in data:
-            tag = Tag(**element)
+            tag = Tag(**element, file_id=self.id)
             if self.get_password():
                 tag.set_password(self.get_password())
             tag.file_id = self.id
@@ -219,27 +218,27 @@ class File(Item):
                 subtitle.set_password(self.get_password())
             self._subtitles.append(subtitle)
 
-    def add_tag(self, timestamp):
+    def add_tag(self, name: str) -> Tag:
+        data = make_request("POST", f"files/{self.id}/tags", data={"tag_name": name}, headers=self._get_password_header())
+        return Tag(id=data["id"], name=data["name"], file_id=self.id)
+
+    def create_moment(self, timestamp) -> Moment:
         raise NotImplemented()
 
-    def create_moment(self, timestamp):
-        raise NotImplemented()
-
-    def create_subtitles(self, timestamp):
+    def create_subtitles(self, timestamp) -> Subtitle:
         raise NotImplemented()
 
     def _fetch_fragments(self):
         res_data = make_request("POST", f"items/ultraDownload/items/{self.id}", headers=self._get_password_header())
-        print(res_data)
         fragments = [Fragment(**frag) for frag in res_data[0]['fragments']]
         for frag in fragments:
             frag.set_password(self.get_password())
         self._fragments = fragments
 
     def play(self):
-        if self.type != "video":
+        if self.type != "Video":
             raise ValueError("File is not a video")
-        os.system(f"ffplay -i {self.download_url}")
+        os.system(f'ffplay -i "{self.download_url}"')
 
     def _fetch_secrets(self):
         data = make_request("GET", f"file/secrets/{self.id}", headers=self._get_password_header())

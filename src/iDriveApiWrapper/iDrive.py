@@ -10,9 +10,11 @@ from .models.File import File
 from .models.Folder import Folder
 from .models.Item import Item
 from .models.ItemsList import ItemsList
+from .models.Settings import Settings
 from .models.Share import Share
 from .models.UserProfile import UserProfile
 from .state.Storage import IdriveStorage, set_storage
+from .syncer.Syncer import Syncer
 from .uploader.UltraUploader import UltraUploader
 from .utils import common
 from .utils.AuthClient import AuthClient
@@ -45,6 +47,7 @@ class Client:
         APIConfig.device_id = device_id
         self._ultraDownloader = None
         self._ultra_uploader = None
+        self._syncer = None
         self.websocket = WebsocketManager()
 
     @classmethod
@@ -110,17 +113,20 @@ class Client:
         return cls(_internal=True, base_url=base_url, token=token, device_id=device_id)
 
     def logout(self):
+        # todo
         pass
 
     def get_root(self):
         return Folder(self.get_user_profile().user.root)
 
     def search(self, query: str, files: bool = True, folders: bool = True, type: str = "", extension: str = "", max_results: int = 50) -> ItemsList:
-        data = make_request("GET", "search", params={"query": query, "files": files, "folder": folders, "type": type, "extension": extension, "resultsLimit": max_results})
-        return Folder._parse_children(None, data)
+        # todo
+        pass
+        # data = make_request("GET", "user/search", params={"query": query, "files": files, "folder": folders, "type": type, "extension": extension, "resultsLimit": max_results})
+        # return Folder._parse_children(None, data)
 
     def get_trash(self) -> Union[List[Union[Folder, File]], None]:
-        data = make_request("GET", "trash")
+        data = make_request("GET", "user/trash")
         data = data['trash']
         return Folder._parse_children(None, data)
 
@@ -174,6 +180,7 @@ class Client:
         return shares
 
     def create_share(self) -> Share:
+        #todo
         data = make_request("GET", "shares")
 
     def get_user_profile(self) -> UserProfile:
@@ -181,6 +188,19 @@ class Client:
 
     def get_discord_settings(self) -> DiscordSettings:
         return DiscordSettings.fetch()
+
+    def set_debug_level(self, level):
+        logger.setLevel(level)
+
+    def get_token(self) -> str:
+        return APIConfig.token
+
+    def check_attachment(self, attachment_id: str) -> bool:
+        try:
+            make_request("GET", f"cleanup/{attachment_id}")
+            return True
+        except BackendResourceNotFoundError:
+            return False
 
     def get_downloader(self) -> UltraDownloader:
         if not self._ultraDownloader:
@@ -206,15 +226,8 @@ class Client:
 
         return self._ultra_uploader
 
-    def set_debug_level(self, level):
-        logger.setLevel(level)
+    def get_syncer(self) -> Syncer:
+        if not self._syncer:
+            self._syncer = Syncer(self.get_uploader, self.get_downloader)
 
-    def get_token(self) -> str:
-        return APIConfig.token
-
-    def check_attachment(self, attachment_id: str) -> bool:
-        try:
-            make_request("GET", f"cleanup/{attachment_id}")
-            return True
-        except BackendResourceNotFoundError:
-            return False
+        return self._syncer

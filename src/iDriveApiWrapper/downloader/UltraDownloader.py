@@ -15,8 +15,8 @@ from .models import ThrottleState, FragmentTask, FileState, onCompleteCallback
 from ..Config import APIConfig
 from ..models.Item import Item
 from ..state.Storage import get_storage, safe_rmtree
-from ..utils.workers.AutoScalePolicy import AutoScalePolicy
-from ..utils.workers.AutoScaler import AutoScaler
+from ..utils.autoScaler.AutoScalePolicy import AutoScalePolicy
+from ..utils.autoScaler.AutoScaler import AutoScaler
 # todo make this not break on empty files
 
 UPLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(

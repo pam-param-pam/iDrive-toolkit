@@ -30,7 +30,7 @@ class MetadataFetcher:
 
         resource_passwords = self._build_folder_passwords_payload(passwords)
 
-        res_data = make_request("POST", f"items/ultraDownload/items/{item.id}", data=resource_passwords)
+        res_data = make_request("POST", f"ultraDownload/items/{item.id}", data=resource_passwords)
 
         self._inject_passwords(res_data, passwords=passwords)
 
