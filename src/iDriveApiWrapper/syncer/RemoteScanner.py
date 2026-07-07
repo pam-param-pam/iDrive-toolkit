@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .BaseScanner import BaseScanner, Node, NodeKind, NodeOrigin
 from ..models.File import File
 from ..models.Folder import Folder
@@ -15,23 +17,50 @@ class RemoteScanner(BaseScanner):
         if isinstance(node_id, (Folder, File)):
             self._items[str(node_id.id)] = node_id
             return str(node_id.id)
-        return str(node_id)
+
+        elif isinstance(node_id, str):
+            return str(node_id)
+
+        else:
+            raise ValueError(f"Invalid type of node_id: {type(node_id)}")
 
     # -------------------------
     # Node creation
     # -------------------------
 
     def get_node(self, node_id: str) -> Node:
-        node_id = self.normalize_id(node_id)
+        item = self.get_item(node_id)
+        return self._node_from_item(item)
 
-        item = self._items.get(node_id)
+    def get_item(self, item_id: str | Folder | File) -> Folder | File:
+        item_id = self.normalize_id(item_id)
+        item = self._items.get(item_id)
 
         if item is None:
-            # lazy fetch root folder
-            item = Folder(node_id)
-            self._items[node_id] = item
+            item = Folder(item_id)
+            self._items[item_id] = item
 
-        return self._node_from_item(item)
+        return item
+
+    def require_cached_item(self, item_id: str) -> Folder | File:
+        item = self._items.get(str(item_id))
+        if item is None:
+            raise KeyError(f"Remote item is not loaded in scanner cache: {item_id}")
+        return item
+
+    def require_cached_folder(self, folder_id: str) -> Folder:
+        item = self.require_cached_item(folder_id)
+        if not isinstance(item, Folder):
+            raise TypeError(f"Remote item is not a folder: {folder_id}")
+        return item
+
+    def invalidate(self, item_id: str) -> None:
+        item = self._items.get(str(item_id))
+        if item is not None:
+            item.refresh()
+
+    def forget(self, item_id: str) -> None:
+        self._items.pop(str(item_id), None)
 
     def list_children(self, node_id: str):
         node_id = self.normalize_id(node_id)
@@ -70,4 +99,4 @@ class RemoteScanner(BaseScanner):
     def _get_hash(self, item: Folder | File):
         if item.is_dir:
             return item.get_hash()
-        return str(item.crc)
+        return item.crc

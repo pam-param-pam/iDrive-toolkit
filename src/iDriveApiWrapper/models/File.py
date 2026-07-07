@@ -42,10 +42,6 @@ class File(Item):
         self._videoMetadata: Optional[dict] = None
         self._photoMetadata: Optional[dict] = None
 
-        # _fetch_secrets
-        self._encryption_iv: Optional[str] = None
-        self._encryption_key: Optional[str] = None
-
         # _fetch_moments
         self._moments: Optional[list[Moment]] = None
 
@@ -149,16 +145,6 @@ class File(Item):
         return self._tags
 
     @property
-    @autoFetchProperty('_fetch_secrets')
-    def encryption_iv(self):
-        return self._encryption_iv
-
-    @property
-    @autoFetchProperty('_fetch_secrets')
-    def encryption_key(self):
-        return self._encryption_key
-
-    @property
     @autoFetchProperty('_fetch_moments')
     def moments(self):
         return self._moments
@@ -240,11 +226,6 @@ class File(Item):
             raise ValueError("File is not a video")
         os.system(f'ffplay -i "{self.download_url}"')
 
-    def _fetch_secrets(self):
-        data = make_request("GET", f"file/secrets/{self.id}", headers=self._get_password_header())
-        self._encryption_key = data['key']
-        self._encryption_iv = data['iv']
-
     @overrides
     def _set_data(self, json_data: dict) -> None:
         json_data = super()._set_data(json_data)
@@ -279,5 +260,9 @@ class File(Item):
                 self._media_position = value
             elif key == "crc":
                 self._crc = value
+            elif key == "key":
+                self._encryption_key = value
+            elif key == "iv":
+                self._encryption_iv =value
             else:
                 logger.warning(f"[FILE] Unexpected key: {key}")

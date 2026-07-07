@@ -10,6 +10,7 @@ from .Decryptor import Decryptor
 from .DownloadContext import DownloadContext
 from .models import FileDownloadStatus, FileRecord, FileInfo, FragmentInfo
 from ..exceptions import PathDoesntExistError
+from ..models.Enums import EncryptionMethod
 from ..state.Storage import safe_move_src_only, safe_rmtree, safe_open, safe_remove_file
 
 logger = logging.getLogger("iDrive")
@@ -25,24 +26,25 @@ class FinalizeWorker:
         while True:
             file_id = self.finalize_queue.get()
 
-            if file_id is None:
+            if file_id is None:  # Check for sentinel value
                 self.finalize_queue.task_done()
-                break
+                break  # Exit the loop for shutdown
 
             state = self.ctx.states[file_id]
             record = self.ctx.records[file_id]
 
             try:
-                self._finalize(record)
+                if record.file_info.size == 0:
+                    record.final_user_output_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(record.final_user_output_path, "wb"):
+                        pass
+                else:
+                    self._finalize(record)
 
-                output_dir = record.output_dir
-                if output_dir.is_dir():
-                    raise PathDoesntExistError(f"Target directory does not exist: {output_dir}")
+                    # todo make this safe under the download dir ensure within root
+                    os.makedirs(os.path.dirname(record.final_user_output_path), exist_ok=True)
 
-                # todo make this safe under the download dir ensure within root
-                os.makedirs(os.path.dirname(record.final_user_output_path), exist_ok=True)
-
-                safe_move_src_only(record.temp_file_path, record.final_user_output_path)
+                    safe_move_src_only(record.temp_file_path, record.final_user_output_path)
                 safe_rmtree(record.temp_file_dir)
 
                 with state.lock:
@@ -74,8 +76,12 @@ class FinalizeWorker:
         )
 
     def _decrypt_merge_and_verify(self, file_info: FileInfo, fragments: List[FragmentInfo], source_dir: Path, temp_file_path: Path):
-        key = base64.b64decode(file_info.key)
-        iv = base64.b64decode(file_info.iv)
+        if file_info.encryption_method == EncryptionMethod.Not_Encrypted:
+            key = None
+            iv = None
+        else:
+            key = base64.b64decode(file_info.key)
+            iv = base64.b64decode(file_info.iv)
         dec = Decryptor(file_info.encryption_method, key, iv)
 
         overall_crc = 0

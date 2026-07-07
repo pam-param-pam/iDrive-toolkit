@@ -2,7 +2,7 @@ import threading
 from enum import Enum, auto
 from typing import Dict
 
-from .models import FileState, FileRecord
+from .models import FileDownloadStatus, FileState, FileRecord
 
 
 class DownloadContextState(Enum):
@@ -19,6 +19,64 @@ class DownloadContext:
 
         self.global_pause = threading.Event()
         self.global_pause.set()
+        self.stop_requested = threading.Event()
+        self.expected_files = 0
+        self.expected_bytes = 0
+        self.downloaded_bytes = 0
+        self.download_requests = 0
+        self.reserved_file_ids = set()
+
+    def reserve_files(self, file_ids: list[str], total_size: int) -> None:
+        with self.lock:
+            seen = set()
+            duplicate_input_ids = set()
+            for file_id in file_ids:
+                if file_id in seen:
+                    duplicate_input_ids.add(file_id)
+                seen.add(file_id)
+
+            unique_file_ids = set(file_ids)
+            duplicate_existing_ids = unique_file_ids & self.reserved_file_ids
+            duplicates = duplicate_input_ids | duplicate_existing_ids
+
+            if duplicates:
+                raise RuntimeError(f"Attempted to enqueue already-existing file_ids: {sorted(duplicates)}")
+
+            self.reserved_file_ids.update(unique_file_ids)
+            self.expected_files += len(file_ids)
+            self.expected_bytes += total_size
+            self.download_requests += 1
+
+    def get_expected_bytes(self) -> int:
+        with self.lock:
+            return self.expected_bytes
+
+    def add_downloaded_bytes(self, byte_count: int) -> None:
+        if byte_count <= 0:
+            return
+
+        with self.lock:
+            self.downloaded_bytes += byte_count
+
+    def get_downloaded_bytes(self) -> int:
+        with self.lock:
+            return self.downloaded_bytes
+
+    def is_complete(self) -> bool:
+        with self.lock:
+            if self.download_requests == 0:
+                return False
+
+            if self.expected_files == 0:
+                return True
+
+            if len(self.states) < self.expected_files:
+                return False
+
+            return all(
+                state.status in (FileDownloadStatus.COMPLETED, FileDownloadStatus.FAILED)
+                for state in self.states.values()
+            )
 
     # ----------------------------
     # Registration (atomic)

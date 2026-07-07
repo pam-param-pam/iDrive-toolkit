@@ -339,34 +339,31 @@ def _get_video_duration(path: Path) -> Optional[float]:
 
 
 def _extract_frame(path: Path, timestamp: float) -> Optional[bytes]:
-    try:
-        cmd = [
-            "ffmpeg",
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-y",
-            "-i", str(path),
-            "-ss", str(timestamp),  # after -i (accurate)
-            "-an", "-sn", "-dn",
-            "-vf", "scale=720:720:force_original_aspect_ratio=decrease,format=yuv420p",
-            "-frames:v", "1",
-            "-c:v", "libwebp",
-            "-quality", "80",
-            "-compression_level", "6",
-            "-f", "webp",
-            "pipe:1",
-        ]
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-ss", str(timestamp),
+        "-i", str(path),
+        "-an", "-sn", "-dn",
+        "-vf", "scale=720:720:force_original_aspect_ratio=decrease,format=rgb24",
+        "-vframes", "1",
+        "-vsync", "vfr",
+        "-c:v", "libwebp",
+        "-quality", "80",
+        "-compression_level", "6",
+        "-f", "image2pipe",
+        "pipe:1",
+    ]
 
-        proc = _run_media(cmd, timeout=8)
+    proc = _run_media(cmd, timeout=8)
 
-        if not proc.stdout or len(proc.stdout) < 100:
-            return None
-
-        return proc.stdout
-
-    except Exception:
+    if not proc.stdout or len(proc.stdout) < 100:
         return None
+
+    return proc.stdout
 
 
 def _extract_video_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:

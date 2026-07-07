@@ -82,6 +82,7 @@ class Settings:
         keepCreationTimestamp: bool,
         popupPreview: bool,
         itemInfoShortcut: bool,
+        clientSideDecryption: bool,
     ):
         self.locale = locale
         self.hideLockedFolders = hideLockedFolders
@@ -96,6 +97,7 @@ class Settings:
         self.keepCreationTimestamp = keepCreationTimestamp
         self.popupPreview = popupPreview
         self.itemInfoShortcut = itemInfoShortcut
+        self.clientSideDecryption = clientSideDecryption
 
     def to_dict(self) -> dict:
         return {

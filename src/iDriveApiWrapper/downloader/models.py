@@ -105,6 +105,14 @@ class FileRecord:
     on_complete: onCompleteCallback
 
 
+@dataclass
+class FilePlanningTask:
+    raw_file: dict
+    target_dir: Path
+    folder_id: str
+    on_complete: onCompleteCallback
+
+
 class ThrottleState:
     def __init__(self, window: int = 10):
         self.lock = threading.Lock()

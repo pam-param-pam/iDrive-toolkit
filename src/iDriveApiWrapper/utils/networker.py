@@ -45,7 +45,7 @@ def make_request(method: str, endpoint: str, data: dict = None, headers: dict = 
         raise BackendServerTimeout("Server not responding") from e
 
     if response.status_code == 429 and retry:
-        wait_time = math.ceil(float(response.headers.get("x-ratelimit-reset-after")))
+        wait_time = _retry_after_seconds(response)
         logger.warning(f"Rate limited (429). Retrying after {wait_time} seconds...")
         time.sleep(wait_time)
         return make_request(method=method, endpoint=endpoint, data=data, headers=headers, params=params, files=files, retry=False)
@@ -56,6 +56,19 @@ def make_request(method: str, endpoint: str, data: dict = None, headers: dict = 
     if response.status_code == 204:
         return {}
     return response.json()
+
+def _retry_after_seconds(response) -> int:
+    for header in ("x-ratelimit-reset-after", "retry-after", "Retry-After"):
+        value = response.headers.get(header)
+        if value is None:
+            continue
+
+        try:
+            return max(1, math.ceil(float(value)))
+        except ValueError:
+            continue
+
+    return DEFAULT_RETRY_AFTER
 
 def _raise_for_status(response):
     status = response.status_code

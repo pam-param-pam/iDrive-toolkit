@@ -1,6 +1,8 @@
-import queue
-import threading
+import os
+import select
+import sys
 import time
+from typing import Optional
 
 from tqdm import tqdm
 
@@ -9,7 +11,14 @@ from ..downloader.UltraDownloader import UltraDownloader
 
 
 def watch_file_download(downloader: UltraDownloader, file_id: str, poll_interval: float = 0.5) -> None:
-    state = downloader.get_file_state(file_id)
+    while True:
+        try:
+            state = downloader.get_file_state(file_id)
+            break
+        except KeyError:
+            if downloader.is_finished():
+                raise
+            time.sleep(poll_interval)
 
     total = state.size_total
     initial = state.bytes_downloaded
@@ -45,27 +54,57 @@ def watch_file_download(downloader: UltraDownloader, file_id: str, poll_interval
 
 
 def _aggregate_download_progress(downloader: UltraDownloader):
-    total = 0
-    downloaded = 0
-    for state in downloader.get_all_states().values():
-        total += state.size_total
-        downloaded += state.bytes_downloaded
-    return downloaded, total
+    return downloader.get_progress()
 
 
-def _command_listener(cmd_queue: queue.Queue):
-    while True:
-        try:
-            cmd = input().strip().lower()
-            cmd_queue.put(cmd)
-        except EOFError:
-            break
+class _CommandReader:
+    def __init__(self):
+        self._buffer = []
+        self._is_windows = os.name == "nt"
+
+        if self._is_windows:
+            import msvcrt
+
+            self._msvcrt = msvcrt
+        else:
+            self._msvcrt = None
+
+    def poll(self) -> Optional[str]:
+        if self._is_windows:
+            return self._poll_windows()
+
+        readable, _, _ = select.select([sys.stdin], [], [], 0)
+        if not readable:
+            return None
+
+        line = sys.stdin.readline()
+        if not line:
+            return None
+
+        return line.strip().lower()
+
+    def _poll_windows(self) -> Optional[str]:
+        while self._msvcrt.kbhit():
+            char = self._msvcrt.getwch()
+
+            if char in ("\r", "\n"):
+                cmd = "".join(self._buffer).strip().lower()
+                self._buffer.clear()
+                return cmd
+
+            if char == "\b":
+                if self._buffer:
+                    self._buffer.pop()
+                continue
+
+            self._buffer.append(char)
+
+        return None
 
 def watch_all_downloads(downloader: UltraDownloader, poll_interval: float = 0.5) -> None:
     downloaded, total = _aggregate_download_progress(downloader)
 
-    cmd_queue = queue.Queue()
-    threading.Thread(target=_command_listener, args=(cmd_queue,), daemon=True).start()
+    command_reader = _CommandReader()
 
     print("Commands: pause | resume | state | quit")
 
@@ -83,8 +122,8 @@ def watch_all_downloads(downloader: UltraDownloader, poll_interval: float = 0.5)
             # ----------------------------
             # Handle commands (non-blocking)
             # ----------------------------
-            while not cmd_queue.empty():
-                cmd = cmd_queue.get()
+            cmd = command_reader.poll()
+            if cmd:
 
                 if cmd == "pause":
                     downloader.pause_all()
@@ -99,6 +138,7 @@ def watch_all_downloads(downloader: UltraDownloader, poll_interval: float = 0.5)
 
                 elif cmd in ("quit", "exit"):
                     print("[CMD] exiting watcher")
+                    downloader.shutdown(cancel_pending=True)
                     return
 
                 else:
@@ -120,14 +160,13 @@ def watch_all_downloads(downloader: UltraDownloader, poll_interval: float = 0.5)
             # ----------------------------
             # Completion condition
             # ----------------------------
-            states = downloader.get_all_states().values()
-            if states and all(s.status in (
-                FileDownloadStatus.COMPLETED,
-                FileDownloadStatus.FAILED,
-            ) for s in states):
+            if downloader.is_finished():
                 break
 
             time.sleep(poll_interval)
+
+    downloader.join()
+    downloader.shutdown()
 
 def _print_state(downloader: UltraDownloader):
     states = downloader.get_all_states()

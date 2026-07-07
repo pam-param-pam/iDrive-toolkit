@@ -14,7 +14,7 @@ class FileState:
     path: str
     size: int
     mtime: float
-    hash: str
+    hash: int
 
 class StateStore:
     FILE_NAME = "state.json"
@@ -24,6 +24,7 @@ class StateStore:
         self._path: Path = storage.get_config_file(self.FILE_NAME)
 
         self.files: Dict[str, FileState] = {}
+        self._dirty = False
 
     # -------------------------
     # Lifecycle
@@ -32,6 +33,7 @@ class StateStore:
     def load(self):
         if not self._path.exists():
             self.files = {}
+            self._dirty = False
             return
 
         try:
@@ -47,6 +49,7 @@ class StateStore:
 
             # reset in-memory state
             self.files = {}
+            self._dirty = False
 
             # overwrite broken file safely
             try:
@@ -65,8 +68,10 @@ class StateStore:
             k: FileState(**v)
             for k, v in raw.get("files", {}).items()
         }
+        self._dirty = False
 
     def save(self):
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "files": {
                 k: asdict(v) for k, v in self.files.items()
@@ -83,6 +88,11 @@ class StateStore:
 
         # 2. atomic replace
         os.replace(tmp_path, self._path)
+        self._dirty = False
+
+    def save_if_dirty(self):
+        if self._dirty:
+            self.save()
 
     def get_path(self) -> Path:
         return self._path
@@ -95,28 +105,37 @@ class StateStore:
         key = self._key(path)
         return self.files.get(key)
 
-    def put(self, path: Path, size: int, mtime: float, hash: str):
+    def put(self, path: Path, size: int, mtime: float, hash: int):
         key = self._key(path)
+        existing = self.files.get(key)
+        if existing and existing.size == size and existing.mtime == mtime and existing.hash == hash:
+            return
+
         self.files[key] = FileState(
             path=key,
             size=size,
             mtime=mtime,
             hash=hash
         )
+        self._dirty = True
 
     def invalidate(self, path: Path):
         key = self._key(path)
-        self.files.pop(key, None)
-        self.save()
+        if self.files.pop(key, None) is not None:
+            self._dirty = True
+            self.save()
 
     def invalidate_all(self):
-        self.files.clear()
-        self.save()
+        if self.files:
+            self.files.clear()
+            self._dirty = True
+            self.save()
 
     def cleanup_missing(self):
         to_delete = [k for k in self.files if not Path(k).exists()]
         for k in to_delete:
             del self.files[k]
+            self._dirty = True
 
     # -------------------------
     # Internal

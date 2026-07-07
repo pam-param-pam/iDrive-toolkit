@@ -1,8 +1,7 @@
 import threading
-import time
 import uuid
 from pathlib import Path
-from queue import Queue
+from queue import Queue, Full
 from typing import Optional, Union, Dict
 
 from .FileSaverWorker import FileSaverWorker
@@ -82,42 +81,43 @@ class UltraUploader:
     # ------------------------------------------------------------------
 
     def _start_queue_monitor(self, interval: float = 1.0):
-        def monitor():
-            last_uploaded = 0
-            last_time = time.perf_counter()
-
-            while True:
-                time.sleep(interval)
-
-                now = time.perf_counter()
-
-                input_q = self._input_queue.qsize()
-                upload_q = self._upload_queue.qsize()
-                response_q = self._response_queue.qsize()
-                ready_q = self._ready_files_queue.qsize()
-
-                # throughput (bytes)
-                total_uploaded = self.ctx.processed_size
-
-                delta_bytes = total_uploaded - last_uploaded
-                delta_time = now - last_time
-
-                speed = delta_bytes / delta_time if delta_time > 0 else 0
-
-                print(
-                    f"[MON] "
-                    f"in={input_q:4d} "
-                    f"up={upload_q:4d} "
-                    f"resp={response_q:4d} "
-                    f"ready={ready_q:4d} "
-                    f"| speed={speed / 1024 / 1024:.2f} MiB/s"
-                )
-
-                last_uploaded = total_uploaded
-                last_time = now
-
-        t = threading.Thread(target=monitor, daemon=True)
-        t.start()
+        # def monitor():
+        #     last_uploaded = 0
+        #     last_time = time.perf_counter()
+        #
+        #     while True:
+        #         time.sleep(interval)
+        #
+        #         now = time.perf_counter()
+        #
+        #         input_q = self._input_queue.qsize()
+        #         upload_q = self._upload_queue.qsize()
+        #         response_q = self._response_queue.qsize()
+        #         ready_q = self._ready_files_queue.qsize()
+        #
+        #         # throughput (bytes)
+        #         total_uploaded = self.ctx.processed_size
+        #
+        #         delta_bytes = total_uploaded - last_uploaded
+        #         delta_time = now - last_time
+        #
+        #         speed = delta_bytes / delta_time if delta_time > 0 else 0
+        #
+        #         print(
+        #             f"[MON] "
+        #             f"in={input_q:4d} "
+        #             f"up={upload_q:4d} "
+        #             f"resp={response_q:4d} "
+        #             f"ready={ready_q:4d} "
+        #             f"| speed={speed / 1024 / 1024:.2f} MiB/s"
+        #         )
+        #
+        #         last_uploaded = total_uploaded
+        #         last_time = now
+        #
+        # t = threading.Thread(target=monitor, daemon=True)
+        # t.start()
+        pass
 
     def _start_workers(self) -> None:
         # request prepare workers
@@ -157,7 +157,11 @@ class UltraUploader:
             self._upload_threads.append(t)
 
         def kill_one():
-            self._upload_queue.put(None)
+            try:
+                self._upload_queue.put(None, timeout=0.25)
+            except Full:
+                return False
+            return True
 
         for _ in range(self.policy.min_workers):
             spawn_one()
@@ -204,6 +208,8 @@ class UltraUploader:
         self._input_queue.put(UploadInput(path=path, parent=parent, lock_from_id=lock_from))
 
     def join(self) -> None:
+        # todo this blocks forever cuz we never end these queues
+
         self._input_queue.join()
         self._upload_queue.join()
 

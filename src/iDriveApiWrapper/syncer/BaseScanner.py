@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,7 +21,6 @@ class NodeKind(Enum):
     def __repr__(self) -> str:
         return self.name
 
-# todo add remote folder here, cuz we lwk need it
 @dataclass
 class Node:
     uid: str | Path
@@ -35,10 +36,10 @@ class Node:
     source: NodeOrigin
 
     def __str__(self) -> str:
-        return f"{self.kind}({self.name})"
+        return f"NODE[{self.kind}({self.name})]"
 
     def __repr__(self) -> str:
-        return f"{self.kind}({self.name})"
+        return f"NODE[{self.kind}({self.name})]"
 
 
 class BaseScanner(ABC):
@@ -50,7 +51,7 @@ class BaseScanner(ABC):
 
         yield node
 
-        if node.kind != "folder":
+        if node.kind != NodeKind.FOLDER:
             return
 
         for child in self.list_children(node_id):

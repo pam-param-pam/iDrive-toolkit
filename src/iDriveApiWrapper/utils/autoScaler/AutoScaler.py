@@ -1,28 +1,33 @@
 import threading
 import time
 import logging
+from typing import Any, Callable, Optional
 
-from ...downloader.models import ThrottleState
 from ...utils.autoScaler.AutoScalePolicy import AutoScalePolicy
 
 logger = logging.getLogger("iDrive")
 
-# todo needs refactoring
-# very much actually...
-
 
 class AutoScaler:
-    def __init__(self, throttle_state: ThrottleState, policy: AutoScalePolicy):
+    _SAMPLE_INTERVAL = 1.5
+
+    def __init__(self, throttle_state: Any, policy: AutoScalePolicy):
         self.throttle_state = throttle_state
         self.policy = policy
 
         self.current = policy.min_workers
         self.lock = threading.Lock()
         self.stop_flag = False
+        self._stop_event = threading.Event()
 
         # throughput tracking
         self._last_rate = 0.0
-        self._no_improve_steps = 0
+        self._best_rate = 0.0
+        self._best_rate_since_scale = 0.0
+        self._healthy_steps = 0
+        self._low_rate_steps = 0
+        self._samples_since_scale = 0
+        self._probe_reference_rate: Optional[float] = None
 
         # cooldown tracking
         self._last_scale_up_time = 0.0
@@ -31,15 +36,9 @@ class AutoScaler:
         self._scale_up_cooldown = policy.scale_up_cooldown
         self._scale_down_cooldown = policy.scale_down_cooldown
 
-        # -------------------------------
-        # NEW: hard error backoff
-        # -------------------------------
         self._backoff_until = 0.0
-        self._backoff_duration = policy.hard_error_backoff  # e.g. 5–10s
+        self._backoff_duration = policy.hard_error_backoff
 
-        # -------------------------------
-        # NEW: pause control
-        # -------------------------------
         self._pause_event = threading.Event()
         self._pause_event.set()  # running by default
 
@@ -47,29 +46,59 @@ class AutoScaler:
     # Worker count management
     # -------------------------------
 
-    def _increase_workers(self, spawn_func):
+    def _increase_workers(self, spawn_func: Callable[[], object]) -> int:
         step = self.policy.scale_up_step
+        added = 0
         for _ in range(step):
             if self.current >= self.policy.max_workers:
                 logger.info(f"[AutoScaler] Wanted scale UP but already at max={self.policy.max_workers}")
                 break
-            spawn_func()
+
+            try:
+                result = spawn_func()
+            except Exception:
+                logger.exception("[AutoScaler] Failed to spawn worker")
+                break
+
+            if result is False:
+                logger.info("[AutoScaler] Spawn callback declined scale UP")
+                break
+
             self.current += 1
+            added += 1
 
-        self._last_scale_up_time = time.time()
-        logger.info(f"[AutoScaler] Scaled UP → workers={self.current}")
+        if added:
+            self._last_scale_up_time = time.time()
+            logger.info(f"[AutoScaler] Scaled UP -> workers={self.current}")
 
-    def _decrease_workers(self, kill_func):
+        return added
+
+    def _decrease_workers(self, kill_func: Callable[[], object]) -> int:
         step = self.policy.scale_down_step
+        removed = 0
         for _ in range(step):
             if self.current <= self.policy.min_workers:
                 logger.info(f"[AutoScaler] Wanted scale DOWN but already at min={self.policy.min_workers}")
                 break
-            kill_func()
-            self.current -= 1
 
-        self._last_scale_down_time = time.time()
-        logger.info(f"[AutoScaler] Scaled DOWN → workers={self.current}")
+            try:
+                result = kill_func()
+            except Exception:
+                logger.exception("[AutoScaler] Failed to stop worker")
+                break
+
+            if result is False:
+                logger.info("[AutoScaler] Stop callback declined scale DOWN")
+                break
+
+            self.current -= 1
+            removed += 1
+
+        if removed:
+            self._last_scale_down_time = time.time()
+            logger.info(f"[AutoScaler] Scaled DOWN -> workers={self.current}")
+
+        return removed
 
     # -------------------------------
     # Autoscaling loop
@@ -83,20 +112,16 @@ class AutoScaler:
     def _loop(self, spawn_func, kill_func):
         logger.info("[AutoScaler] Started autoscaling loop")
 
-        while not self.stop_flag:
-            # -----------------------
-            # PAUSE GATE
-            # -----------------------
-            self._pause_event.wait()
-
-            time.sleep(1.5)
-            now = time.time()
-
-            # -----------------------
-            # BACKOFF GATE
-            # -----------------------
-            if now < self._backoff_until:
+        while not self._stop_event.is_set():
+            if not self._pause_event.wait(timeout=0.5):
                 continue
+
+            if self._stop_event.wait(self._SAMPLE_INTERVAL):
+                break
+            if not self._pause_event.is_set():
+                continue
+
+            now = time.time()
 
             hard_errors = self.throttle_state.error_rate()
             rate = self.throttle_state.bytes_rate()
@@ -105,54 +130,136 @@ class AutoScaler:
             can_scale_down = (now - self._last_scale_down_time) >= self._scale_down_cooldown
 
             with self.lock:
-                # -----------------------
-                # 1. HARD THROTTLING
-                # -----------------------
+                if now < self._backoff_until:
+                    self._last_rate = rate
+                    continue
+
                 if self.policy.should_react_to_hard_errors(hard_errors):
-                    logger.warning(f"[AutoScaler] Hard throttling ({hard_errors}) → entering backoff")
+                    logger.warning(f"[AutoScaler] Hard throttling ({hard_errors}) -> entering backoff")
 
                     if can_scale_down:
                         self._decrease_workers(kill_func)
 
-                    # activate backoff window
                     self._backoff_until = now + self._backoff_duration
-
-                    # reset trend tracking
-                    self._no_improve_steps = 0
-                    self._last_rate = rate
+                    self._reset_trend(rate)
                     continue
 
-                # -----------------------
-                # 2. THROUGHPUT TREND
-                # -----------------------
-                if rate <= self._last_rate * self.policy.plateau_factor:
-                    self._no_improve_steps += 1
-                else:
-                    self._no_improve_steps = 0
+                self._observe_rate(rate)
+
+                if self._should_roll_back_probe() and can_scale_down:
+                    logger.info(
+                        "[AutoScaler] Scale-up probe did not improve throughput enough "
+                        f"(reference={self._probe_reference_rate:.1f}, best={self._best_rate_since_scale:.1f})"
+                    )
+                    if self._decrease_workers(kill_func):
+                        self._reset_trend(rate)
+                    continue
 
                 if (
-                    self._no_improve_steps >= self.policy.scale_down_window
+                    self._probe_reference_rate is None
+                    and self._low_rate_steps >= self.policy.scale_down_window
                     and self.current > self.policy.min_workers
                     and can_scale_down
                 ):
                     logger.info(
-                        f"[AutoScaler] Plateau detected → scale DOWN "
-                        f"(rate={rate:.1f}, prev={self._last_rate:.1f})"
+                        f"[AutoScaler] Throughput fell below best rate -> scale DOWN "
+                        f"(rate={rate:.1f}, best={self._best_rate:.1f})"
                     )
-                    self._decrease_workers(kill_func)
-                    self._last_rate = rate
+                    if self._decrease_workers(kill_func):
+                        self._reset_trend(rate)
                     continue
 
-                # -----------------------
-                # 3. SCALE UP
-                # -----------------------
-                if rate > self._last_rate * self.policy.up_improvement_factor and can_scale_up:
-                    logger.info("[AutoScaler] Throughput improving → scale UP")
-                    self._increase_workers(spawn_func)
+                if self._should_accept_probe():
+                    logger.info(
+                        "[AutoScaler] Scale-up probe accepted "
+                        f"(reference={self._probe_reference_rate:.1f}, best={self._best_rate_since_scale:.1f})"
+                    )
+                    self._best_rate = max(self._best_rate, self._best_rate_since_scale)
+                    self._probe_reference_rate = None
+                    self._best_rate_since_scale = 0.0
+                    self._samples_since_scale = 0
+                    self._healthy_steps = 0
+
+                if (
+                    self._probe_reference_rate is None
+                    and self._healthy_steps >= self.policy.scale_up_window
+                    and rate > 0
+                    and self.current < self.policy.max_workers
+                    and can_scale_up
+                ):
+                    reference_rate = max(rate, self._best_rate)
+                    logger.info(
+                        f"[AutoScaler] Throughput is healthy -> probing scale UP "
+                        f"(rate={rate:.1f}, best={self._best_rate:.1f})"
+                    )
+                    if self._increase_workers(spawn_func):
+                        self._start_probe(reference_rate)
+                    continue
 
                 self._last_rate = rate
 
         logger.info("[AutoScaler] Exiting autoscaling loop")
+
+    def _observe_rate(self, rate: float) -> None:
+        if self._probe_reference_rate is not None:
+            self._samples_since_scale += 1
+            self._best_rate_since_scale = max(self._best_rate_since_scale, rate)
+
+        if rate <= 0:
+            self._healthy_steps = 0
+            self._low_rate_steps += 1
+            self._last_rate = rate
+            return
+
+        if self._best_rate <= 0:
+            self._best_rate = rate
+            self._healthy_steps = 1
+            self._low_rate_steps = 0
+            self._last_rate = rate
+            return
+
+        low_threshold = self._best_rate * (1.0 - self.policy.plateau_factor)
+        if rate >= low_threshold:
+            self._healthy_steps += 1
+            self._low_rate_steps = 0
+        else:
+            self._healthy_steps = 0
+            self._low_rate_steps += 1
+
+        if self._probe_reference_rate is None:
+            self._best_rate = max(self._best_rate, rate)
+
+        self._last_rate = rate
+
+    def _start_probe(self, reference_rate: float) -> None:
+        self._probe_reference_rate = reference_rate
+        self._best_rate_since_scale = 0.0
+        self._samples_since_scale = 0
+        self._healthy_steps = 0
+        self._low_rate_steps = 0
+
+    def _should_accept_probe(self) -> bool:
+        if self._probe_reference_rate is None:
+            return False
+        return self._best_rate_since_scale >= self._probe_reference_rate * (
+            1.0 + self.policy.up_improvement_factor
+        )
+
+    def _should_roll_back_probe(self) -> bool:
+        if self._probe_reference_rate is None:
+            return False
+        if self._samples_since_scale < self.policy.scale_down_window:
+            return False
+        return not self._should_accept_probe()
+
+    def _reset_trend(self, rate: float) -> None:
+        self._last_rate = rate
+        self._best_rate = max(rate, 0.0)
+        self._best_rate_since_scale = 0.0
+        self._healthy_steps = 0
+        self._low_rate_steps = 0
+        self._samples_since_scale = 0
+        self._probe_reference_rate = None
 
     # -------------------------------
     # Control API
@@ -175,4 +282,5 @@ class AutoScaler:
     def stop(self):
         logger.info("[AutoScaler] Stop requested")
         self.stop_flag = True
+        self._stop_event.set()
         self._pause_event.set()  # ensure loop can exit
