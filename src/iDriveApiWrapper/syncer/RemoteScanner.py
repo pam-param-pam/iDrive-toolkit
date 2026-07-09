@@ -8,6 +8,7 @@ from ..models.Folder import Folder
 class RemoteScanner(BaseScanner):
     def __init__(self):
         self._items: dict[str, Folder | File] = {}
+        self._passwords_by_lock_from: dict[str, str] = {}
 
     # -------------------------
     # ID handling
@@ -15,7 +16,7 @@ class RemoteScanner(BaseScanner):
 
     def normalize_id(self, node_id):
         if isinstance(node_id, (Folder, File)):
-            self._items[str(node_id.id)] = node_id
+            self._cache_item(node_id)
             return str(node_id.id)
 
         elif isinstance(node_id, str):
@@ -38,6 +39,7 @@ class RemoteScanner(BaseScanner):
 
         if item is None:
             item = Folder(item_id)
+            self._apply_password(item)
             self._items[item_id] = item
 
         return item
@@ -72,10 +74,32 @@ class RemoteScanner(BaseScanner):
 
         for child in folder.children:
             cid = str(child.id)
-            self._items[cid] = child
+            self._cache_item(child)
             yield self._node_from_item(child)
 
         return None
+
+    def _cache_item(self, item: Folder | File) -> None:
+        self._remember_password(item)
+        self._apply_password(item)
+        self._items[str(item.id)] = item
+
+    def _remember_password(self, item: Folder | File) -> None:
+        password = item.get_password()
+        if not password:
+            return
+
+        lock_from = item.lock_from or str(item.id)
+        self._passwords_by_lock_from[str(lock_from)] = password
+
+    def _apply_password(self, item: Folder | File) -> None:
+        lock_from = item.lock_from
+        if not lock_from:
+            return
+
+        password = self._passwords_by_lock_from.get(str(lock_from))
+        if password:
+            item.set_password(password)
 
     # -------------------------
     # Single source of truth
@@ -98,5 +122,5 @@ class RemoteScanner(BaseScanner):
 
     def _get_hash(self, item: Folder | File):
         if item.is_dir:
-            return item.get_hash()
+            return item.hash
         return item.crc

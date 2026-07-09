@@ -41,7 +41,12 @@ class FileSaverWorker:
             file = self._ready_files_queue.get()
             try:
                 if file is None:
+                    self._flush_finished_files()
                     break
+
+                state = self.ctx.states.get(file.frontend_id)
+                if state and state.status == FileUploadStatus.FAILED:
+                    continue
 
                 self.finished_files.append(file)
                 self._save_files_if_needed()
@@ -65,9 +70,15 @@ class FileSaverWorker:
         total_size = sum(f.size for f in self.finished_files)
 
         if len(self.finished_files) > 20 or total_size > 100 * 1024 * 1024 or self._should_save_files() or self.ctx.is_upload_fully_finished():
-            batch = self.finished_files
-            self.finished_files = []
-            self._save_files(batch)
+            self._flush_finished_files()
+
+    def _flush_finished_files(self) -> None:
+        if not self.finished_files:
+            return
+
+        batch = self.finished_files
+        self.finished_files = []
+        self._save_files(batch)
 
     # ---------------- backend interaction ----------------
 

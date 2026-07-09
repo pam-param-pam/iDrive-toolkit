@@ -62,3 +62,4 @@ class Perms(NamedTuple):
     delete: bool
     share: bool
     download: bool
+    resetLock: bool

@@ -25,11 +25,16 @@ class FolderStats(NamedTuple):
 class Folder(Item):
     def __init__(self, folder_id):
         super().__init__(folder_id)
+        # _fetch_data
         self._children: Optional[ItemsList] = None
+        self._breadcrumbs: Optional[list[Breadcrumb]] = None
+
+        # _fetch_more_data
         self._folder_size: Optional[Folder] = None
         self._file_count: Optional[Folder] = None
         self._folder_count: Optional[Folder] = None
-        self._breadcrumbs: Optional[list[Breadcrumb]] = None
+
+        self._hash: Optional[str] = None
 
     @property
     @autoFetchProperty('_fetch_data')
@@ -56,6 +61,11 @@ class Folder(Item):
     def folder_count(self):
         return self._folder_count
 
+    @property
+    @autoFetchProperty('_fetch_hash')
+    def hash(self):
+        return self._hash
+
     def __str__(self):
         return f"Folder({self.name})"
 
@@ -72,6 +82,10 @@ class Folder(Item):
         self._set_breadcrumbs(data['breadcrumbs'])
         self._fetched = True
 
+    def _fetch_hash(self):
+        data = make_request("GET", f"folders/{self.id}/hash", headers=self._get_password_header())
+        self._hash = data['hash']
+
     def lock_with_password(self, new_password) -> None:
         make_request("POST", f"folders/{self.id}/password", headers=self._get_password_header(), data={"new_password": new_password})
         self.set_password(new_password)
@@ -85,6 +99,9 @@ class Folder(Item):
         data = make_request("POST", "folders", headers=parent._get_password_header(), data={"parent_id": parent.id, "name": name})
         folder = Folder(data['id'])
         folder._set_data(data)
+        # todo fix ths
+        if parent._password and folder._lock_from == parent._lock_from:
+            folder.set_password(parent._password)
         return folder
 
     def create_subfolder(self, name: str) -> 'Folder':
@@ -103,7 +120,7 @@ class Folder(Item):
 
             item._set_data(element)
 
-            if parent and parent._password:
+            if parent and parent._password and item._lock_from == parent._lock_from:
                 item.set_password(parent._password)
             children.append(item)
 
@@ -137,7 +154,3 @@ class Folder(Item):
     def get_stats(self) -> FolderStats:
         data = make_request("GET", f"folders/{self.id}/stats", headers=self._get_password_header())
         return FolderStats(total=data["total"], used=data["used"])
-
-    def get_hash(self) -> str:
-        data = make_request("GET", f"folders/{self.id}/hash", headers=self._get_password_header())
-        return data['hash']

@@ -117,12 +117,17 @@ class FilePlanningWorker:
             ):
                 return
 
-    def _build_file_info(self, raw_file: dict, folder_id: str) -> FileInfo:
+    def _build_file_info(self, raw_file: dict, folder_id: str | None) -> FileInfo:
         password = raw_file["password"]
+        params = {}
+        if folder_id:
+            params["folder_id"] = folder_id
+
         fragments_metadata = self._request_with_retries(
             "GET",
-            f"ultraDownload/file/{folder_id}/{raw_file['id']}",
+            f"ultraDownload/files/{raw_file['id']}",
             headers={"x-resource-password": password},
+            params=params,
         )
         fragments = [FragmentInfo(**fragment) for fragment in fragments_metadata["fragments"]]
         return FileInfo(
@@ -138,12 +143,12 @@ class FilePlanningWorker:
             fragments=fragments,
         )
 
-    def _request_with_retries(self, method: str, endpoint: str, headers: dict = None) -> dict:
+    def _request_with_retries(self, method: str, endpoint: str, headers: dict = None, params: dict = None) -> dict:
         for attempt in range(self._max_retries + 1):
             if self._ctx.stop_requested.is_set():
                 raise RuntimeError("Download cancelled")
             try:
-                return make_request(method, endpoint, headers=headers)
+                return make_request(method, endpoint, headers=headers, params=params)
             except (BackendRateLimitError, BackendServerTimeout, BackendServiceUnavailableError, BackendInternalServerError, BackendHttpError) as e:
                 if not self._is_retryable(e) or attempt >= self._max_retries:
                     raise

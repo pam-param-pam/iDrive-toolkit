@@ -60,14 +60,37 @@ class Syncer:
         if result.conflicts:
             raise SyncConflictError(self._format_conflict_summary(result.conflicts))
 
+        only_local_uploads = []
+        only_local_parent_ids = []
         for entry in result.only_local:
-            self._handle_only_local(entry)
+            local_path, remote_parent, remote_parent_id = self._plan_only_local_upload(entry)
+            only_local_uploads.append((local_path, remote_parent))
+            only_local_parent_ids.append(remote_parent_id)
+        self._upload_many(only_local_uploads)
+        for remote_parent_id in only_local_parent_ids:
+            self.remote.invalidate(remote_parent_id)
 
+        only_remote_downloads = []
         for entry in result.only_remote:
-            self._handle_only_remote(entry)
+            only_remote_downloads.append(self._plan_only_remote_download(entry))
+        self._download_many(only_remote_downloads)
 
+        changed_uploads = []
+        changed_upload_parent_ids = []
+        changed_downloads = []
         for entry in result.changed:
-            self._handle_changed(entry, changed_files=strategy)
+            upload_task, upload_parent_id, download_task = self._plan_changed_transfer(entry, changed_files=strategy)
+            if upload_task is not None:
+                changed_uploads.append(upload_task)
+                changed_upload_parent_ids.append(upload_parent_id)
+            if download_task is not None:
+                changed_downloads.append(download_task)
+
+        self._upload_many(changed_uploads)
+        for remote_parent_id in changed_upload_parent_ids:
+            self.remote.invalidate(remote_parent_id)
+
+        self._download_many(changed_downloads)
 
         return result
 
@@ -82,26 +105,12 @@ class Syncer:
     # -------------------------
 
     def _handle_only_local(self, entry: DiffEntry) -> None:
-        self._require_status(entry, NodeStatus.ONLY_LOCAL)
-
-        local_path = self._require_local_path(entry)
-        remote_parent_id = self._require_parent_remote_id(entry)
-        remote_parent = self.remote.require_cached_folder(remote_parent_id)
-
+        local_path, remote_parent, remote_parent_id = self._plan_only_local_upload(entry)
         self._upload(local_path, remote_parent)
         self.remote.invalidate(remote_parent_id)
 
     def _handle_only_remote(self, entry: DiffEntry) -> None:
-        self._require_status(entry, NodeStatus.ONLY_REMOTE)
-
-        remote_id = self._require_remote_id(entry)
-        remote_item = self.remote.require_cached_item(remote_id)
-
-        if entry.is_folder:
-            target_dir = self._require_local_path(entry)
-        else:
-            target_dir = self._require_parent_local_path(entry)
-
+        remote_item, target_dir = self._plan_only_remote_download(entry)
         self._download(remote_item, target_dir)
 
     def _handle_changed(self, entry: DiffEntry, *, changed_files: ChangedFileStrategy | str = ChangedFileStrategy.ERROR) -> None:
@@ -115,9 +124,7 @@ class Syncer:
             return
 
         if strategy == ChangedFileStrategy.ERROR:
-            raise SyncConflictError(
-                f"Changed file requires an explicit strategy: {self._require_local_path(entry)}"
-            )
+            raise SyncConflictError(f"Changed file requires an explicit strategy: {self._require_local_path(entry)}")
 
         if strategy == ChangedFileStrategy.SKIP:
             return
@@ -140,22 +147,91 @@ class Syncer:
     # -------------------------
 
     def _upload(self, local_path: Path, remote_parent: Folder) -> None:
+        self._upload_many([(local_path, remote_parent)])
+
+    def _upload_many(self, uploads: list[tuple[Path, Folder]]) -> None:
+        if not uploads:
+            return
+
         uploader = self._uploader_factory()
         try:
-            uploader.upload(local_path, parent=remote_parent)
+            for local_path, remote_parent in uploads:
+                uploader.upload(local_path, parent=remote_parent)
             uploader.join()
         finally:
             uploader.shutdown()
 
     def _download(self, remote_item: Folder | File, target_dir: Path) -> None:
+        self._download_many([(remote_item, target_dir)])
+
+    def _download_many(self, downloads: list[tuple[Folder | File, Path]]) -> None:
+        if not downloads:
+            return
+
         downloader = self._downloader_factory()
         try:
-            downloader.download(data=remote_item, target_dir=target_dir)
+            for remote_item, target_dir in downloads:
+                downloader.download(data=remote_item, target_dir=target_dir)
             downloader.join()
         finally:
             downloader.shutdown()
 
-    def _replace_remote_with_local(self, entry: DiffEntry) -> None:
+    def _plan_only_local_upload(self, entry: DiffEntry) -> tuple[Path, Folder, str]:
+        self._require_status(entry, NodeStatus.ONLY_LOCAL)
+
+        local_path = self._require_local_path(entry)
+        remote_parent_id = self._require_parent_remote_id(entry)
+        remote_parent = self.remote.require_cached_folder(remote_parent_id)
+
+        return local_path, remote_parent, remote_parent_id
+
+    def _plan_only_remote_download(self, entry: DiffEntry) -> tuple[Folder | File, Path]:
+        self._require_status(entry, NodeStatus.ONLY_REMOTE)
+
+        remote_id = self._require_remote_id(entry)
+        remote_item = self.remote.require_cached_item(remote_id)
+
+        if entry.is_folder:
+            target_dir = self._require_local_path(entry)
+        else:
+            target_dir = self._require_parent_local_path(entry)
+
+        return remote_item, target_dir
+
+    def _plan_changed_transfer(
+        self,
+        entry: DiffEntry,
+        *,
+        changed_files: ChangedFileStrategy | str = ChangedFileStrategy.ERROR,
+    ) -> tuple[tuple[Path, Folder] | None, str | None, tuple[Folder | File, Path] | None]:
+        self._require_status(entry, NodeStatus.CHANGED)
+        strategy = self._coerce_changed_file_strategy(changed_files)
+
+        if entry.is_folder:
+            local_path = self._require_local_path(entry)
+            remote_id = self._require_remote_id(entry)
+            self.sync_one_level(local_path, remote_id, changed_files=strategy)
+            return None, None, None
+
+        if strategy == ChangedFileStrategy.ERROR:
+            raise SyncConflictError(f"Changed file requires an explicit strategy: {self._require_local_path(entry)}")
+
+        if strategy == ChangedFileStrategy.SKIP:
+            return None, None, None
+
+        if strategy == ChangedFileStrategy.NEWER:
+            strategy = self._newer_file_strategy(entry)
+
+        if strategy == ChangedFileStrategy.UPLOAD_LOCAL:
+            upload_task, remote_parent_id = self._plan_replace_remote_with_local(entry)
+            return upload_task, remote_parent_id, None
+
+        if strategy == ChangedFileStrategy.DOWNLOAD_REMOTE:
+            return None, None, self._plan_replace_local_with_remote(entry)
+
+        raise ValueError(f"Unsupported changed file strategy: {strategy}")
+
+    def _plan_replace_remote_with_local(self, entry: DiffEntry) -> tuple[tuple[Path, Folder], str]:
         local_path = self._require_local_path(entry)
         remote_id = self._require_remote_id(entry)
         remote_parent_id = self._require_parent_remote_id(entry)
@@ -168,10 +244,9 @@ class Syncer:
         remote_item.delete()
         self.remote.forget(remote_id)
         self.remote.invalidate(remote_parent_id)
-        self._upload(local_path, remote_parent)
-        self.remote.invalidate(remote_parent_id)
+        return (local_path, remote_parent), remote_parent_id
 
-    def _replace_local_with_remote(self, entry: DiffEntry) -> None:
+    def _plan_replace_local_with_remote(self, entry: DiffEntry) -> tuple[Folder | File, Path]:
         local_path = self._require_local_path(entry)
         parent_local_path = self._require_parent_local_path(entry)
         remote_id = self._require_remote_id(entry)
@@ -184,6 +259,16 @@ class Syncer:
             raise FileNotFoundError(f"Changed local file does not exist: {local_path}")
 
         local_path.unlink()
+        return remote_item, parent_local_path
+
+    def _replace_remote_with_local(self, entry: DiffEntry) -> None:
+        upload, remote_parent_id = self._plan_replace_remote_with_local(entry)
+        local_path, remote_parent = upload
+        self._upload(local_path, remote_parent)
+        self.remote.invalidate(remote_parent_id)
+
+    def _replace_local_with_remote(self, entry: DiffEntry) -> None:
+        remote_item, parent_local_path = self._plan_replace_local_with_remote(entry)
         self._download(remote_item, parent_local_path)
 
     # -------------------------

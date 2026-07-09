@@ -1,8 +1,9 @@
 import logging
-from typing import Union, List
+from typing import Union, List, Optional
 from urllib.parse import urlparse, urlunparse
 
 from .Config import APIConfig
+from .deduplicater import Deduplicater
 from .downloader.UltraDownloader import UltraDownloader
 from .exceptions import BackendUnauthorizedError, BackendResourceNotFoundError
 from .models.DiscordSettings import DiscordSettings
@@ -10,7 +11,6 @@ from .models.File import File
 from .models.Folder import Folder
 from .models.Item import Item
 from .models.ItemsList import ItemsList
-from .models.Settings import Settings
 from .models.Share import Share
 from .models.UserProfile import UserProfile
 from .state.Storage import IdriveStorage, set_storage
@@ -48,6 +48,7 @@ class Client:
         self._ultraDownloader = None
         self._ultra_uploader = None
         self._syncer = None
+        self._deduplicater = None
         self.websocket = WebsocketManager()
 
     @classmethod
@@ -203,15 +204,15 @@ class Client:
             return False
 
     def get_downloader(self) -> UltraDownloader:
-        if not self._ultraDownloader:
+        if not self._ultraDownloader or self._ultraDownloader.is_shutdown():
             discord_settings = self.get_discord_settings()
             max_workers = len(discord_settings.bots)*3
             self._ultraDownloader = UltraDownloader(min_workers=1, max_workers=max_workers)
 
         return self._ultraDownloader
 
-    def get_uploader(self) -> UltraUploader:
-        if not self._ultra_uploader:
+    def get_uploader(self, initial_workers: Optional[int] = None) -> UltraUploader:
+        if not self._ultra_uploader or self._ultra_uploader.is_shutdown():
             user_settings = self.get_user_profile()
             discord_settings = self.get_discord_settings()
 
@@ -219,6 +220,7 @@ class Client:
             self._ultra_uploader = UltraUploader(
                 min_workers=1,
                 max_workers=max_workers,
+                initial_workers=initial_workers,
                 max_message_size=user_settings.user.maxDiscordMessageSize,
                 max_attachments=user_settings.user.maxAttachmentsPerMessage,
                 encryption_method=user_settings.settings.encryptionMethod
@@ -232,4 +234,8 @@ class Client:
 
         return self._syncer
 
+    def get_deduplicater(self) -> Deduplicater:
+        if not self._deduplicater:
+            self._deduplicater = Deduplicater()
 
+        return self._deduplicater

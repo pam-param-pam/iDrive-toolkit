@@ -1,6 +1,6 @@
 from typing import Literal
 
-from ..models.Enums import EncryptionMethod
+from ..models.Enums import EncryptionMethod, ClientsideDecryptionMethod
 from ..utils.networker import make_request
 
 
@@ -82,7 +82,7 @@ class Settings:
         keepCreationTimestamp: bool,
         popupPreview: bool,
         itemInfoShortcut: bool,
-        clientSideDecryption: bool,
+        clientsideDecryptionMethod: int,
     ):
         self.locale = locale
         self.hideLockedFolders = hideLockedFolders
@@ -97,7 +97,7 @@ class Settings:
         self.keepCreationTimestamp = keepCreationTimestamp
         self.popupPreview = popupPreview
         self.itemInfoShortcut = itemInfoShortcut
-        self.clientSideDecryption = clientSideDecryption
+        self.clientsideDecryptionMethod = ClientsideDecryptionMethod(clientsideDecryptionMethod)
 
     def to_dict(self) -> dict:
         return {
@@ -111,6 +111,7 @@ class Settings:
             "subfoldersInShares": self.subfoldersInShares,
             "concurrentUploadRequests": self.concurrentUploadRequests,
             "encryptionMethod": self.encryptionMethod.value,
+            "clientsideDecryptionMethod": self.clientsideDecryptionMethod.value,
             "keepCreationTimestamp": self.keepCreationTimestamp,
             "popupPreview": self.popupPreview,
             "itemInfoShortcut": self.itemInfoShortcut,

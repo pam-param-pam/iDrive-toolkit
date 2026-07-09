@@ -1,5 +1,6 @@
 import time
 from dataclasses import dataclass, replace
+from typing import Optional
 
 
 @dataclass
@@ -28,13 +29,39 @@ class AutoScalePolicy:
 
     min_workers: int = 1
     max_workers: int = 1
+    initial_workers: Optional[int] = None
 
     # ---- internals (stateful) ----
     _hard_error_ticks: int = 0
     _last_hard_react: float = 0.0
 
-    def with_bounds(self, *, min_workers: int, max_workers: int) -> "AutoScalePolicy":
-        return replace(self, min_workers=min_workers, max_workers=max_workers)
+    def with_bounds(
+        self,
+        *,
+        min_workers: int,
+        max_workers: int,
+        initial_workers: Optional[int] = None,
+    ) -> "AutoScalePolicy":
+        if max_workers < min_workers:
+            max_workers = min_workers
+
+        if initial_workers is None:
+            initial_workers = self.initial_workers
+
+        if initial_workers is not None:
+            initial_workers = max(min_workers, min(initial_workers, max_workers))
+
+        return replace(
+            self,
+            min_workers=min_workers,
+            max_workers=max_workers,
+            initial_workers=initial_workers,
+        )
+
+    def get_initial_workers(self) -> int:
+        if self.initial_workers is None:
+            return self.min_workers
+        return max(self.min_workers, min(self.initial_workers, self.max_workers))
 
     def should_react_to_hard_errors(self, hard_errors: int) -> bool:
         if hard_errors <= 0:

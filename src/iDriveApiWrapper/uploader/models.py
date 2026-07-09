@@ -206,7 +206,11 @@ class UploadFileState:
         return result
 
     def is_terminal(self) -> bool:
-        return self.status in (FileUploadStatus.COMPLETED, FileUploadStatus.FAILED)
+        return self.status in (
+            FileUploadStatus.COMPLETED,
+            FileUploadStatus.FAILED,
+            FileUploadStatus.SAVE_FAILED,
+        )
 
 
 @dataclass

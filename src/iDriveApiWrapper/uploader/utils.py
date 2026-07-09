@@ -44,6 +44,7 @@ def _print_state(uploader: UltraUploader):
 
 def watch_total_upload(uploader: UltraUploader, poll_interval: float = 1) -> None:
     last_bytes = 0
+    shutdown_called = False
 
     cmd_queue = queue.Queue()
     stop_event = threading.Event()
@@ -51,6 +52,7 @@ def watch_total_upload(uploader: UltraUploader, poll_interval: float = 1) -> Non
     cmd_thread = threading.Thread(
         target=_command_listener,
         args=(cmd_queue, stop_event),
+        daemon=True,
     )
     cmd_thread.start()
 
@@ -85,6 +87,8 @@ def watch_total_upload(uploader: UltraUploader, poll_interval: float = 1) -> Non
 
                     elif cmd in ("quit", "exit"):
                         print("[CMD] exiting watcher")
+                        uploader.shutdown(cancel_pending=True)
+                        shutdown_called = True
                         return
 
                     else:
@@ -118,10 +122,16 @@ def watch_total_upload(uploader: UltraUploader, poll_interval: float = 1) -> Non
         states = uploader.ctx.get_all_states()
         failed = [s for s in states.values() if s.status == FileUploadStatus.FAILED]
 
+        uploader.shutdown()
+        shutdown_called = True
+
         if failed:
             raise RuntimeError(f"{len(failed)} uploads failed")
 
     finally:
+        if not shutdown_called:
+            uploader.shutdown(cancel_pending=True)
+
         # ---- clean shutdown ----
         stop_event.set()
 
@@ -132,4 +142,5 @@ def watch_total_upload(uploader: UltraUploader, poll_interval: float = 1) -> Non
         except Exception:
             pass
 
-        cmd_thread.join(timeout=1)
+        if cmd_thread.is_alive():
+            cmd_thread.join(timeout=1)

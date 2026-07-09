@@ -3,7 +3,7 @@ import traceback
 import uuid
 import zlib
 from collections import defaultdict
-from queue import Queue
+from queue import Full, Queue
 from typing import Iterator
 
 from .models import DiscordAttachment, DiscordRequest, UploadInput, UploadFileState, Crypto, ThumbnailAttachment, ChunkAttachment, FileUploadStatus, FileArtifacts, \
@@ -86,22 +86,28 @@ class PrepareRequestWorker:
                 break
 
             try:
+                initial_state_ids = set(self.ctx.get_all_states())
                 for request in self.prepare_upload(item):
-                    self._upload_queue.put(request)
+                    if not self._put_until_stopped(self._upload_queue, request):
+                        break
 
             except Exception as e:
+                self._fail_new_request_states(initial_state_ids, e)
                 print(f"[PrepareRequestWorker] FAILED on {item.path}: {e!r}")
                 traceback.print_exc()
 
             finally:
+                self.ctx.complete_upload_request()
                 self._input_queue.task_done()
 
-        print("Prepare request worker is done")
         req = self._builder.flush()
         if req:
-            self._upload_queue.put(req)
+            self._put_until_stopped(self._upload_queue, req)
 
     def prepare_upload(self, input_item: UploadInput) -> Iterator[DiscordRequest]:
+        if self.ctx.stop_requested.is_set():
+            return
+
         path = input_item.path
         parent = input_item.parent
         lock_from_id = input_item.lock_from_id
@@ -110,6 +116,8 @@ class PrepareRequestWorker:
         if path.is_dir():
             new_parent = parent.create_subfolder(path.name)
             for child in path.iterdir():
+                if self.ctx.stop_requested.is_set():
+                    return
                 yield from self.prepare_upload(UploadInput(path=child, parent=new_parent, lock_from_id=lock_from_id))
             return
 
@@ -158,12 +166,15 @@ class PrepareRequestWorker:
         ))
 
         if file_size == 0:
-            self.response_queue.put(ResponsePayload(
-                response=None,
-                request=None,
-                frontend_id=frontend_id,
-                is_empty=True,
-            ))
+            self._put_until_stopped(
+                self.response_queue,
+                ResponsePayload(
+                    response=None,
+                    request=None,
+                    frontend_id=frontend_id,
+                    is_empty=True,
+                )
+            )
             return
 
         with prof.measure("thumbnail"):
@@ -208,6 +219,9 @@ class PrepareRequestWorker:
 
         with open(path, "rb") as f:
             while offset < file_size:
+                if self.ctx.stop_requested.is_set():
+                    return
+
                 remaining_request = self._builder.remaining_size()
                 remaining_file = file_size - offset
 
@@ -274,8 +288,28 @@ class PrepareRequestWorker:
 
         self.ctx.set_crc(frontend_id, overall_crc)
 
-        prof.report()
+        # prof.report()
 
         req = self._builder.flush()
         if req:
             yield req
+
+    def _put_until_stopped(self, queue: Queue, item) -> bool:
+        while not self.ctx.stop_requested.is_set():
+            try:
+                queue.put(item, timeout=0.5)
+                return True
+            except Full:
+                continue
+        return False
+
+    def _fail_new_request_states(self, initial_state_ids: set[str], error: Exception) -> None:
+        for file_id, state in self.ctx.get_all_states().items():
+            if file_id in initial_state_ids:
+                continue
+
+            with state.lock:
+                if state.is_terminal():
+                    continue
+                state.error = error
+                state.status = FileUploadStatus.FAILED

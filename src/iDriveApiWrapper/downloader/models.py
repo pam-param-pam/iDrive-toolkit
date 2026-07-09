@@ -109,7 +109,7 @@ class FileRecord:
 class FilePlanningTask:
     raw_file: dict
     target_dir: Path
-    folder_id: str
+    folder_id: Optional[str]
     on_complete: onCompleteCallback
 
 

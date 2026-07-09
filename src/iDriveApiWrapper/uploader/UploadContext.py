@@ -26,10 +26,13 @@ class UploadContext:
 
         self.global_pause = threading.Event()
         self.global_pause.set()
+        self.stop_requested = threading.Event()
 
         self.total_size: int = 0
         self.processed_size: int = 0
         self._size_lock = threading.Lock()
+        self.upload_requests = 0
+        self.completed_upload_requests = 0
 
         self._webhook_idx = 0
 
@@ -45,6 +48,18 @@ class UploadContext:
     # -------------------------------------------------
     # Registration (atomic)
     # -------------------------------------------------
+    def reserve_upload_request(self) -> None:
+        with self.lock:
+            self.upload_requests += 1
+
+    def complete_upload_request(self) -> None:
+        with self.lock:
+            self.completed_upload_requests += 1
+
+    def finish_pending_upload_requests(self) -> None:
+        with self.lock:
+            self.completed_upload_requests = self.upload_requests
+
     def register(self, file_id: str, state: UploadFileState) -> None:
         with self.lock:
             if file_id in self.states:
@@ -80,10 +95,20 @@ class UploadContext:
     # State querying
     # -------------------------------------------------
     def is_upload_fully_finished(self) -> bool:
-        return all(
-            state.is_terminal() or state.status == FileUploadStatus.COMPLETED
-            for state in self.states.values()
-        )
+        with self.lock:
+            if self.upload_requests == 0:
+                return False
+
+            if self.completed_upload_requests < self.upload_requests:
+                return False
+
+            if not self.states:
+                return True
+
+            return all(
+                state.is_terminal()
+                for state in self.states.values()
+            )
 
     def get_state(self, file_id: str) -> UploadFileState:
         with self.lock:

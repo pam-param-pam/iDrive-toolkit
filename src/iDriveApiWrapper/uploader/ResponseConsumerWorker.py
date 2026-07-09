@@ -34,6 +34,9 @@ class ResponseConsumerWorker:
         # Handle empty files
         if payload.is_empty:
             state = self.ctx.get_state(payload.frontend_id)
+            if state.is_terminal():
+                return
+
             backend_file = self._get_or_create_backend_file(state)
 
             with state.lock:
@@ -84,6 +87,9 @@ class ResponseConsumerWorker:
 
     def _fill_attachment_info(self, attachment: ChunkAttachment | ThumbnailAttachment | SubtitleAttachment | DiscordAttachment, discord_response: dict, discord_attachment: dict) -> None:
         state: UploadFileState = self.ctx.get_state(attachment.frontend_id)
+        if state.is_terminal():
+            return
+
         backend_file = self._get_or_create_backend_file(state)
 
         if isinstance(attachment, ChunkAttachment):

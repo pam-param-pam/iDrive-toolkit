@@ -22,7 +22,7 @@ from ..utils.autoScaler.AutoScaler import AutoScaler
 
 UPLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
     scale_up_step=1,
-    scale_down_step=5,
+    scale_down_step=2,
 
     scale_up_window=5,
     scale_down_window=10,
@@ -35,6 +35,8 @@ UPLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
 
     scale_up_cooldown=6.0,
     scale_down_cooldown=10.0,
+
+    initial_workers=6,
 )
 
 
@@ -77,7 +79,8 @@ class UltraDownloader:
         self._finalize_threads: List[threading.Thread] = []
         self._scaler_thread: Optional[threading.Thread] = None
 
-        self._start_workers()
+        self._started = False
+        self._shutdown = False
 
     # ------------------------------------------------------------------
     # Worker startup (ONCE)
@@ -103,6 +106,9 @@ class UltraDownloader:
         # t.start()
 
     def _start_workers(self) -> None:
+        if self._started:
+            return
+
         def spawn_one():
             t = self._start_download_thread()
             self._download_threads.append(t)
@@ -114,7 +120,7 @@ class UltraDownloader:
             t = self._start_planner_thread()
             self._planner_threads.append(t)
 
-        for _ in range(self.policy.min_workers):
+        for _ in range(self.policy.get_initial_workers()):
             spawn_one()
 
         self._scaler_thread = self.scaler.start(spawn_one, kill_one)
@@ -124,15 +130,21 @@ class UltraDownloader:
             self._finalize_threads.append(t)
 
         self._start_queue_monitor()
+        self._started = True
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def download(self, data: Item, target_dir: Path = APIConfig.download_folder, on_complete: onCompleteCallback = None, passwords: dict = None) -> None:
+        if self._shutdown:
+            raise RuntimeError("Downloader has been shut down")
+
+        self._start_workers()
+
         files = self.metadata_fetcher.fetch_files(data, passwords)
         target_dir = Path(target_dir)
-        folder_id = data.id if data.is_dir else data.parent_id
+        folder_id = data.id if data.is_dir else None
         size_estimated = sum(file["size"] for file in files)
 
         self.check_target_dir(target_dir, size_estimated)
@@ -247,6 +259,13 @@ class UltraDownloader:
     # ------------------------------------------------------------------
 
     def shutdown(self, cancel_pending: bool = False) -> None:
+        if self._shutdown:
+            return
+
+        if not self._started:
+            self._shutdown = True
+            return
+
         if cancel_pending:
             self.ctx.stop_requested.set()
 
@@ -284,6 +303,10 @@ class UltraDownloader:
             t.join()
 
         self.scaler.stop()
+        self._shutdown = True
+
+    def is_shutdown(self) -> bool:
+        return self._shutdown
 
     def _put_file_task(self, task: FilePlanningTask) -> None:
         while not self.ctx.stop_requested.is_set():

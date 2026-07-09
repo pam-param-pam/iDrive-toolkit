@@ -6,6 +6,11 @@ class EncryptionMethod(Enum):
     AES_CTR = 1
     CHA_CHA_20 = 2
 
+class ClientsideDecryptionMethod(Enum):
+    ALWAYS = 0
+    DESKTOP_ONLY = 1
+    DOWNLOADS_ONLY = 2
+    NO_DECRYPTION = 3
 
 class EventType(Enum):
     WEBSOCKET_ERROR = 0
