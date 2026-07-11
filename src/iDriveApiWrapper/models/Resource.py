@@ -19,7 +19,7 @@ class Resource(ABC, EnforceOverrides):
     def set_password(self, password: Union[str, None]) -> None:
         self._password = password
 
-    def get_password(self) -> str:
+    def get_password(self) -> Optional[str]:
         return self._password
 
     def refresh(self):

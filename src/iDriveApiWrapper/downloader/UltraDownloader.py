@@ -21,8 +21,8 @@ from ..utils.autoScaler.AutoScaler import AutoScaler
 # todo make this not break on empty files
 
 UPLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
-    scale_up_step=1,
-    scale_down_step=2,
+    scale_up_step=3,
+    scale_down_step=1,
 
     scale_up_window=5,
     scale_down_window=10,
@@ -36,7 +36,7 @@ UPLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
     scale_up_cooldown=6.0,
     scale_down_cooldown=10.0,
 
-    initial_workers=6,
+    initial_workers=20,
 )
 
 

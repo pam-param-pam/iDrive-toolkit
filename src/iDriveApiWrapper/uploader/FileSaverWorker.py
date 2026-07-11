@@ -17,7 +17,6 @@ class FileSaverWorker:
 
         self.finished_files: List[BackendFile] = []
         self.failed_files: List[BackendFile] = []
-        self.database_errors = 0
         self.running = False
 
     # ---------------- control ----------------
@@ -113,7 +112,6 @@ class FileSaverWorker:
             state.status = FileUploadStatus.COMPLETED
             # self.ctx.mark_file_saved(file.frontend_id)
 
-        self.database_errors = max(self.database_errors - 1, 0)
 
     def _on_backend_save_error(self, files: List[BackendFile], error: Exception) -> None:
         for file in files:
@@ -121,14 +119,6 @@ class FileSaverWorker:
             state.status = FileUploadStatus.SAVE_FAILED
             state.error = error
             self.failed_files.append(file)
-
-        status = getattr(error, "status", None)
-        if status and status >= 500:
-            self.database_errors += 1
-
-        if self.database_errors > 2:
-            self.ctx.pause_all()
-            self.database_errors = 0
 
     # ---------------- retry ----------------
 

@@ -9,6 +9,7 @@ from typing import Optional, TYPE_CHECKING
 
 from .BaseScanner import Node, BaseScanner, NodeKind, NodeOrigin
 from .name_utils import remote_resource_name
+from .progress import DiffProgressCallback, DiffProgressPhase, emit_progress
 
 if TYPE_CHECKING:
     from ..models.Folder import Folder
@@ -132,15 +133,35 @@ class DiffEngine:
         self.local_scanner = local_scanner
         self.remote_scanner = remote_scanner
 
-    def diff_one_level(self, local_root_id: Path, remote_root_id: Folder | str) -> DiffResult:
+    def diff_one_level(
+        self,
+        local_root_id: Path,
+        remote_root_id: Folder | str,
+        progress: DiffProgressCallback | None = None,
+    ) -> DiffResult:
+        emit_progress(progress, DiffProgressPhase.PREPARING, "Preparing diff")
         local_root_id = self.local_scanner.normalize_id(local_root_id)
         remote_root_id = self.remote_scanner.normalize_id(remote_root_id)
 
+        emit_progress(progress, DiffProgressPhase.LOCAL_ROOT, "Reading local root")
         local_parent = self.local_scanner.get_node(local_root_id)
+        emit_progress(progress, DiffProgressPhase.REMOTE_ROOT, "Reading remote root")
         remote_parent = self.remote_scanner.get_node(remote_root_id)
 
-        l_files, l_dirs = self._index_children(self.local_scanner, local_root_id)
-        r_files, r_dirs = self._index_children(self.remote_scanner, remote_root_id)
+        l_files, l_dirs = self._index_children(
+            self.local_scanner,
+            local_root_id,
+            progress,
+            DiffProgressPhase.LOCAL_SCAN,
+            "Scanning local entries",
+        )
+        r_files, r_dirs = self._index_children(
+            self.remote_scanner,
+            remote_root_id,
+            progress,
+            DiffProgressPhase.REMOTE_SCAN,
+            "Scanning remote entries",
+        )
 
         result = DiffResult()
 
@@ -149,7 +170,15 @@ class DiffEngine:
         # -------------------------
         all_dir_names = sorted(set(l_dirs.keys()) | set(r_dirs.keys()))
 
-        for name in all_dir_names:
+        emit_progress(
+            progress,
+            DiffProgressPhase.COMPARE_FOLDERS,
+            "Comparing folders",
+            current=0,
+            total=len(all_dir_names),
+            unit="folders",
+        )
+        for index, name in enumerate(all_dir_names, start=1):
             self._append_named_group_result(
                 result,
                 name,
@@ -158,13 +187,29 @@ class DiffEngine:
                 local_parent,
                 remote_parent,
             )
+            emit_progress(
+                progress,
+                DiffProgressPhase.COMPARE_FOLDERS,
+                "Comparing folders",
+                current=index,
+                total=len(all_dir_names),
+                unit="folders",
+            )
 
         # -------------------------
         # FILES (by name)
         # -------------------------
         all_file_names = sorted(set(l_files.keys()) | set(r_files.keys()))
 
-        for name in all_file_names:
+        emit_progress(
+            progress,
+            DiffProgressPhase.COMPARE_FILES,
+            "Comparing files",
+            current=0,
+            total=len(all_file_names),
+            unit="files",
+        )
+        for index, name in enumerate(all_file_names, start=1):
             self._append_named_group_result(
                 result,
                 name,
@@ -173,10 +218,19 @@ class DiffEngine:
                 local_parent,
                 remote_parent,
             )
+            emit_progress(
+                progress,
+                DiffProgressPhase.COMPARE_FILES,
+                "Comparing files",
+                current=index,
+                total=len(all_file_names),
+                unit="files",
+            )
 
         # -------------------------
         # FINAL SORT (deterministic)
         # -------------------------
+        emit_progress(progress, DiffProgressPhase.SORT, "Sorting diff results")
         def _sort_key(e: DiffEntry):
             n = e._node()
             return n.kind.value, n.name, str(n.uid)
@@ -187,27 +241,36 @@ class DiffEngine:
         result.changed.sort(key=_sort_key)
         result.conflicts.sort(key=_sort_key)
 
+        emit_progress(progress, DiffProgressPhase.COMPLETE, "Diff complete")
         return result
 
-    def _index_children(self, scanner: BaseScanner, root_id):
+    def _index_children(
+        self,
+        scanner: BaseScanner,
+        root_id,
+        progress: DiffProgressCallback | None,
+        phase: DiffProgressPhase,
+        message: str,
+    ):
         files_by_name = defaultdict(list)
         folders_by_name = defaultdict(list)
 
         children = list(scanner.list_children(root_id))
         children.sort(key=lambda n: (n.kind.value, n.name, str(n.uid)))
 
-        for child in children:
+        emit_progress(progress, phase, message, current=0, total=len(children), unit="items")
+        for index, child in enumerate(children, start=1):
             if child.kind == NodeKind.FILE:
                 name = remote_resource_name(child.name) if child.source == NodeOrigin.LOCAL else child.name
                 files_by_name[name].append(child)
             else:
                 name = remote_resource_name(child.name) if child.source == NodeOrigin.LOCAL else child.name
                 folders_by_name[name].append(child)
+            emit_progress(progress, phase, message, current=index, total=len(children), unit="items")
 
         return files_by_name, folders_by_name
 
-    def _append_named_group_result(
-        self,
+    def _append_named_group_result(self,
         result: DiffResult,
         name: str,
         local_nodes: list[Node],
@@ -215,6 +278,7 @@ class DiffEngine:
         local_parent: Node,
         remote_parent: Node,
     ) -> None:
+
         if len(local_nodes) <= 1 and len(remote_nodes) <= 1:
             local_node = local_nodes[0] if local_nodes else None
             remote_node = remote_nodes[0] if remote_nodes else None
@@ -353,7 +417,4 @@ class DiffEngine:
         if local.kind == NodeKind.FOLDER:
             return local.hash == remote.hash
 
-        return (
-            local.size == remote.size
-            and local.hash == remote.hash
-        )
+        return local.size == remote.size and local.hash == remote.hash

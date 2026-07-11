@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .BaseScanner import BaseScanner, Node, NodeKind, NodeOrigin
 from .name_utils import remote_resource_name
+from .progress import DiffProgressCallback, DiffProgressPhase, emit_progress
 
 logger = logging.getLogger("iDrive")
 
@@ -17,9 +18,17 @@ class LocalScanner(BaseScanner):
         self.state = state
         self._folder_hash_cache: dict[Path, str] = {}
         self._hash_trace_dir: Path | None = self._get_hash_trace_dir()
+        self._progress_callback: DiffProgressCallback | None = None
+        self._hash_progress: dict[str, int] | None = None
 
     def set_hash_trace_dir(self, output_dir: Path | str | None) -> None:
         self._hash_trace_dir = Path(output_dir).resolve() if output_dir else None
+
+    def set_progress_callback(self, callback: DiffProgressCallback | None) -> None:
+        self._progress_callback = callback
+
+    def clear_memory_cache(self) -> None:
+        self._folder_hash_cache.clear()
 
     # -------------------------
     # ID handling
@@ -40,6 +49,8 @@ class LocalScanner(BaseScanner):
 
     def list_children(self, node_id: Path):
         root = self.normalize_id(node_id)
+        if not root.exists():
+            return
 
         for entry in os.scandir(root):
             if entry.is_symlink():
@@ -51,6 +62,19 @@ class LocalScanner(BaseScanner):
     # -------------------------
 
     def _node_from_path(self, path: Path) -> Node:
+        if not path.exists():
+            return Node(
+                uid=path,
+                parent_uid=self._get_parent_uid(path),
+                name=path.name,
+                kind=NodeKind.FOLDER,
+                created_at=datetime.fromtimestamp(0, tz=timezone.utc),
+                modified_at=None,
+                size=None,
+                hash=None,
+                source=NodeOrigin.LOCAL,
+            )
+
         stat = path.stat()
         is_dir = path.is_dir()
 
@@ -76,6 +100,7 @@ class LocalScanner(BaseScanner):
         cached = self.state.get(path)
 
         if cached and cached.size == stat.st_size and cached.mtime == stat.st_mtime:
+            self._increment_file_hash_progress(path)
             return int(cached.hash)
 
         crc = self._crc32(path)
@@ -87,6 +112,7 @@ class LocalScanner(BaseScanner):
             hash=crc,
         )
 
+        self._increment_file_hash_progress(path)
         return crc
 
     def _get_folder_hash(self, root: Path) -> str:
@@ -115,7 +141,35 @@ class LocalScanner(BaseScanner):
 
             tree[dirpath.resolve()] = (dirs, files)
 
-        return self._cache_folder_tree_hash(root, tree)[0]
+        total_files = sum(len(files) for _, files in tree.values())
+        previous_progress = self._hash_progress
+        self._hash_progress = {
+            "files": 0,
+            "total_files": total_files,
+            "folders": 0,
+            "total_folders": len(tree),
+            "seen_files": set(),
+        }
+        emit_progress(
+            self._progress_callback,
+            DiffProgressPhase.LOCAL_CRC_HASH,
+            "Hashing local CRC",
+            current=0,
+            total=total_files,
+            unit="files",
+        )
+        emit_progress(
+            self._progress_callback,
+            DiffProgressPhase.LOCAL_FOLDER_HASH,
+            "Hashing local folders",
+            current=0,
+            total=len(tree),
+            unit="folders",
+        )
+        try:
+            return self._cache_folder_tree_hash(root, tree)[0]
+        finally:
+            self._hash_progress = previous_progress
 
     def _cache_folder_tree_hash(self, root: Path, tree: dict[Path, tuple[list[Path], list[Path]]]) -> tuple[str, list[Path], list[Path]]:
         child_dirs, files = tree.get(root, ([], []))
@@ -152,11 +206,42 @@ class LocalScanner(BaseScanner):
         digest = h.hexdigest()
         self._folder_hash_cache[root] = digest
         self._write_folder_hash_trace(root, digest, file_entries, folder_entries)
+        self._increment_folder_hash_progress()
         return digest, all_files, all_dirs
 
     # -------------------------
     # Helpers
     # -------------------------
+
+    def _increment_file_hash_progress(self, path: Path) -> None:
+        if self._hash_progress is None:
+            return
+        seen_files = self._hash_progress["seen_files"]
+        if path in seen_files:
+            return
+        seen_files.add(path)
+        self._hash_progress["files"] += 1
+        emit_progress(
+            self._progress_callback,
+            DiffProgressPhase.LOCAL_CRC_HASH,
+            "Hashing local CRC",
+            current=self._hash_progress["files"],
+            total=self._hash_progress["total_files"],
+            unit="files",
+        )
+
+    def _increment_folder_hash_progress(self) -> None:
+        if self._hash_progress is None:
+            return
+        self._hash_progress["folders"] += 1
+        emit_progress(
+            self._progress_callback,
+            DiffProgressPhase.LOCAL_FOLDER_HASH,
+            "Hashing local folders",
+            current=self._hash_progress["folders"],
+            total=self._hash_progress["total_folders"],
+            unit="folders",
+        )
 
     def _get_parent_uid(self, path: Path):
         parent = path.parent

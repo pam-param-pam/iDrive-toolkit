@@ -56,7 +56,7 @@ class File(Item):
 
     @property
     def view_url(self):
-        return self.download_url + "?inline=True"
+        return self.download_url + "&inline=True"
 
     @property
     @autoFetchProperty('_fetch_data')
@@ -265,4 +265,4 @@ class File(Item):
             elif key == "iv":
                 self._encryption_iv =value
             else:
-                logger.warning(f"[FILE] Unexpected key: {key}")
+                logger.warning(f"[FILE] Unexpected key: {key}\n{value}")

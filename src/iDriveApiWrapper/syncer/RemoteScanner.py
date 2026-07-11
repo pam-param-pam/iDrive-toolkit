@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from .BaseScanner import BaseScanner, Node, NodeKind, NodeOrigin
 from ..models.File import File
 from ..models.Folder import Folder
 
 
 class RemoteScanner(BaseScanner):
+    MISSING_FOLDER_PREFIX = "__missing_remote_folder__:"
+
     def __init__(self):
         self._items: dict[str, Folder | File] = {}
         self._passwords_by_lock_from: dict[str, str] = {}
+        self._hidden_ids: set[str] = set()
+
+    def clear_memory_cache(self) -> None:
+        self._hidden_ids.clear()
+        for item in self._items.values():
+            item.refresh()
 
     # -------------------------
     # ID handling
@@ -30,6 +40,10 @@ class RemoteScanner(BaseScanner):
     # -------------------------
 
     def get_node(self, node_id: str) -> Node:
+        node_id = self.normalize_id(node_id)
+        if node_id.startswith(self.MISSING_FOLDER_PREFIX):
+            return self._missing_folder_node(node_id)
+
         item = self.get_item(node_id)
         return self._node_from_item(item)
 
@@ -62,10 +76,33 @@ class RemoteScanner(BaseScanner):
             item.refresh()
 
     def forget(self, item_id: str) -> None:
-        self._items.pop(str(item_id), None)
+        item_id = str(item_id)
+        self._hidden_ids.add(item_id)
+        self._items.pop(item_id, None)
+
+    def forget_tree(self, item_id: str) -> None:
+        removed_ids = {str(item_id)}
+
+        while True:
+            child_ids = {
+                cached_id
+                for cached_id, item in self._items.items()
+                if str(getattr(item, "_parent_id", "")) in removed_ids
+            }
+            new_child_ids = child_ids - removed_ids
+            if not new_child_ids:
+                break
+            removed_ids.update(new_child_ids)
+
+        for removed_id in removed_ids:
+            self._items.pop(removed_id, None)
+
+        self._hidden_ids.update(removed_ids)
 
     def list_children(self, node_id: str):
         node_id = self.normalize_id(node_id)
+        if node_id.startswith(self.MISSING_FOLDER_PREFIX):
+            return
 
         folder = self._items.get(node_id)
 
@@ -74,26 +111,45 @@ class RemoteScanner(BaseScanner):
 
         for child in folder.children:
             cid = str(child.id)
+            if cid in self._hidden_ids:
+                continue
             self._cache_item(child)
             yield self._node_from_item(child)
 
         return None
 
     def _cache_item(self, item: Folder | File) -> None:
-        self._remember_password(item)
         self._apply_password(item)
+        self._remember_password(item)
         self._items[str(item.id)] = item
+
+    def missing_folder_id(self, local_path) -> str:
+        return f"{self.MISSING_FOLDER_PREFIX}{local_path}"
+
+    def _missing_folder_node(self, node_id: str) -> Node:
+        name = node_id[len(self.MISSING_FOLDER_PREFIX):].replace("\\", "/").rstrip("/").split("/")[-1]
+        return Node(
+            uid=node_id,
+            parent_uid=None,
+            name=name,
+            kind=NodeKind.FOLDER,
+            created_at=datetime.fromtimestamp(0, tz=timezone.utc),
+            modified_at=None,
+            size=None,
+            hash=None,
+            source=NodeOrigin.REMOTE,
+        )
 
     def _remember_password(self, item: Folder | File) -> None:
         password = item.get_password()
         if not password:
             return
 
-        lock_from = item.lock_from or str(item.id)
+        lock_from = getattr(item, "_lock_from", None) or str(item.id)
         self._passwords_by_lock_from[str(lock_from)] = password
 
     def _apply_password(self, item: Folder | File) -> None:
-        lock_from = item.lock_from
+        lock_from = getattr(item, "_lock_from", None)
         if not lock_from:
             return
 
