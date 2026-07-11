@@ -78,6 +78,8 @@ class UltraDownloader:
         self._download_threads: List[threading.Thread] = []
         self._finalize_threads: List[threading.Thread] = []
         self._scaler_thread: Optional[threading.Thread] = None
+        self._spawn_download_worker = None
+        self._kill_download_worker = None
 
         self._started = False
         self._shutdown = False
@@ -107,6 +109,7 @@ class UltraDownloader:
 
     def _start_workers(self) -> None:
         if self._started:
+            self._start_scaler()
             return
 
         def spawn_one():
@@ -123,7 +126,9 @@ class UltraDownloader:
         for _ in range(self.policy.get_initial_workers()):
             spawn_one()
 
-        self._scaler_thread = self.scaler.start(spawn_one, kill_one)
+        self._spawn_download_worker = spawn_one
+        self._kill_download_worker = kill_one
+        self._start_scaler()
 
         for _ in range(self.post_workers):
             t = self._start_finalize_thread()
@@ -131,6 +136,25 @@ class UltraDownloader:
 
         self._start_queue_monitor()
         self._started = True
+
+    def _start_scaler(self) -> None:
+        if self._scaler_thread is not None and self._scaler_thread.is_alive():
+            return
+
+        spawn_one = getattr(self, "_spawn_download_worker", None)
+        kill_one = getattr(self, "_kill_download_worker", None)
+        if spawn_one is None or kill_one is None:
+            return
+
+        self.scaler.stop_flag = False
+        self.scaler._stop_event.clear()
+        self.scaler.resume()
+        self._scaler_thread = self.scaler.start(spawn_one, kill_one)
+
+    def _stop_scaler(self) -> None:
+        self.scaler.stop()
+        if self._scaler_thread is not None and self._scaler_thread.is_alive():
+            self._scaler_thread.join()
 
     # ------------------------------------------------------------------
     # Public API
@@ -250,9 +274,12 @@ class UltraDownloader:
         return t
 
     def join(self) -> None:
-        self._file_queue.join()
-        self._fragment_queue.join()
-        self._finalize_queue.join()
+        try:
+            self._file_queue.join()
+            self._fragment_queue.join()
+            self._finalize_queue.join()
+        finally:
+            self._stop_scaler()
 
     # ------------------------------------------------------------------
     # Optional: graceful shutdown
@@ -270,9 +297,7 @@ class UltraDownloader:
             self.ctx.stop_requested.set()
 
         self.ctx.global_pause.set()
-        self.scaler.stop()
-        if self._scaler_thread:
-            self._scaler_thread.join()
+        self._stop_scaler()
 
         if not cancel_pending:
             self.join()
@@ -302,7 +327,6 @@ class UltraDownloader:
         for t in live_finalize_threads:
             t.join()
 
-        self.scaler.stop()
         self._shutdown = True
 
     def is_shutdown(self) -> bool:

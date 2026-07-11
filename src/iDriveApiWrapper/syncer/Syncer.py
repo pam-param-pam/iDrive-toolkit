@@ -25,7 +25,7 @@ from ..models.Folder import Folder
 
 
 UploadTask = tuple[Path, Folder]
-DownloadTask = tuple[Folder | File, Path]
+DownloadTask = tuple[Folder | File, Path, Path | None]
 ChangedTransferPlan = tuple[list[UploadTask], list[str], list[DownloadTask]]
 
 
@@ -42,6 +42,10 @@ class SyncConflictError(RuntimeError):
 
 
 class SyncTransferCancelled(RuntimeError):
+    pass
+
+
+class SyncBoundaryError(RuntimeError):
     pass
 
 
@@ -63,6 +67,8 @@ class Syncer:
         self._active_transfer_cancel_thread: threading.Thread | None = None
         self._active_transfer_lock = threading.Lock()
         self._transfer_cancel_requested = threading.Event()
+        self._boundary_local_root: Path | None = None
+        self._boundary_remote_root_id: str | None = None
 
     # -------------------------
     # Public API
@@ -82,14 +88,18 @@ class Syncer:
     def set_transfer_progress_callback(self, callback: TransferProgressCallback | None) -> None:
         self._transfer_progress_callback = callback
 
-    def cancel_current_transfer(self) -> None:
+    def set_sync_boundary(self, local_root: Path, remote_root: Folder | str) -> None:
+        self._boundary_local_root = Path(local_root).resolve()
+        self._boundary_remote_root_id = self.remote.normalize_id(remote_root)
+
+    def clear_sync_boundary(self) -> None:
+        self._boundary_local_root = None
+        self._boundary_remote_root_id = None
+
+    def abort_current_transfer(self) -> None:
         self._transfer_cancel_requested.set()
         with self._active_transfer_lock:
             active_transfer = self._active_transfer
-        ctx = getattr(active_transfer, "ctx", None)
-        stop_requested = getattr(ctx, "stop_requested", None)
-        if stop_requested is not None:
-            stop_requested.set()
         if active_transfer is not None:
             cancel_thread = threading.Thread(
                 target=lambda: active_transfer.shutdown(cancel_pending=True),
@@ -101,45 +111,46 @@ class Syncer:
                     cancel_thread.start()
 
     def diff(self, local_root: Path, remote_root: Folder | str, progress: DiffProgressCallback | None = None) -> DiffResult:
+        temporary_boundary = self._ensure_sync_boundary(local_root, remote_root)
         self.local.set_progress_callback(progress)
         try:
             return self.diff_engine.diff_one_level(Path(local_root), remote_root, progress=progress)
         finally:
             self.local.set_progress_callback(None)
             self.state.save_if_dirty()
+            if temporary_boundary:
+                self.clear_sync_boundary()
 
     def sync_one_level(self, local_root: Path, remote_root: Folder | str, strategy: ChangedFileStrategy) -> DiffResult:
-        result = self.diff(local_root, remote_root)
+        temporary_boundary = self._ensure_sync_boundary(local_root, remote_root)
+        try:
+            result = self.diff(local_root, remote_root)
 
-        if result.conflicts:
-            raise SyncConflictError(conflict_summary(result.conflicts))
+            if result.conflicts:
+                raise SyncConflictError(conflict_summary(result.conflicts))
 
-        only_local_uploads, only_local_parent_ids = self._plan_only_local_uploads(result.only_local)
-        self._upload_many_and_invalidate(only_local_uploads, only_local_parent_ids)
+            only_local_uploads, only_local_parent_ids = self._plan_only_local_uploads(result.only_local)
+            changed_uploads, changed_upload_parent_ids, changed_downloads = self._plan_changed_transfers(
+                result.changed,
+                strategy=strategy,
+            )
+            self._upload_many_and_invalidate(
+                only_local_uploads + changed_uploads,
+                only_local_parent_ids + changed_upload_parent_ids,
+            )
 
-        self._download_many(self._plan_only_remote_downloads(result.only_remote))
+            only_remote_downloads = self._plan_only_remote_downloads(result.only_remote)
+            self._download_many(only_remote_downloads + changed_downloads)
 
-        changed_uploads, changed_upload_parent_ids, changed_downloads = self._plan_changed_transfers(
-            result.changed,
-            strategy=strategy,
-        )
-        self._upload_many_and_invalidate(changed_uploads, changed_upload_parent_ids)
-        self._download_many(changed_downloads)
-
-        return result
+            return result
+        finally:
+            if temporary_boundary:
+                self.clear_sync_boundary()
 
     def sync_gui(self, local_root: Path, remote_root: Folder | str) -> None:
-        from .InteractiveGui import SyncInteractiveGui
+        from ..gui.SyncGui import SyncGui
+        SyncGui(self, local_root, remote_root).run()
 
-        SyncInteractiveGui(self, local_root, remote_root).run()
-
-    def sync_interactive_gui(self, local_root: Path, remote_root: Folder | str) -> None:
-        self.sync_gui(local_root, remote_root)
-
-    def sync_interactive(self, local_root: Path, remote_root: Folder | str) -> None:
-        from .InteractiveConsole import SyncInteractiveConsole
-
-        SyncInteractiveConsole(self).run(local_root, remote_root)
 
     # -------------------------
     # Diff handlers
@@ -206,7 +217,7 @@ class Syncer:
             self.remote.invalidate(remote_parent_id)
 
     def _download(self, remote_item: Folder | File, target_dir: Path) -> None:
-        self._download_many([(remote_item, target_dir)])
+        self._download_many([(remote_item, target_dir, None)])
 
     def _download_many(self, downloads: list[DownloadTask]) -> None:
         if not downloads:
@@ -214,7 +225,9 @@ class Syncer:
 
         downloader = self._downloader_factory()
         try:
-            for remote_item, target_dir in downloads:
+            for remote_item, target_dir, replace_local_path in downloads:
+                if replace_local_path is not None and replace_local_path.exists():
+                    replace_local_path.unlink()
                 downloader.download(data=remote_item, target_dir=target_dir)
             self._join_transfer_with_progress(downloader, TransferProgressDirection.DOWNLOAD)
         finally:
@@ -278,7 +291,7 @@ class Syncer:
             if cancelled:
                 self._wait_for_cancel_shutdown_thread()
                 self._emit_transfer_progress(transfer, direction, TransferProgressPhase.CANCELLED)
-                raise SyncTransferCancelled(f"{direction.value.capitalize()} cancelled")
+                raise SyncTransferCancelled(f"{direction.value.capitalize()} aborted")
 
             self._emit_transfer_progress(transfer, direction, TransferProgressPhase.COMPLETE)
         finally:
@@ -302,7 +315,7 @@ class Syncer:
         current_bytes: int | None = None,
         bytes_per_second: float = 0.0,
     ) -> None:
-        callback = self._transfer_progress_callback
+        callback: Callable[[TransferProgress], None] | None = self._transfer_progress_callback
         if callback is None:
             return
 
@@ -314,9 +327,9 @@ class Syncer:
         verb = "Uploading" if direction == TransferProgressDirection.UPLOAD else "Downloading"
         message = f"{verb} files"
         if phase == TransferProgressPhase.CANCELLING:
-            message = f"Cancelling {direction.value}"
+            message = f"Aborting {direction.value}"
         if phase == TransferProgressPhase.CANCELLED:
-            message = f"{direction.value.capitalize()} cancelled"
+            message = f"{direction.value.capitalize()} aborted"
         if phase == TransferProgressPhase.COMPLETE:
             message = f"{verb} complete"
 
@@ -417,7 +430,7 @@ class Syncer:
 
         target_dir = self._require_parent_local_path(entry)
 
-        return remote_item, target_dir
+        return remote_item, target_dir, None
 
     def _plan_changed_transfers(self, entries: list[DiffEntry], strategy: ChangedFileStrategy) -> ChangedTransferPlan:
         uploads: list[UploadTask] = []
@@ -488,8 +501,7 @@ class Syncer:
         if not local_path.is_file():
             raise FileNotFoundError(f"Changed local file does not exist: {local_path}")
 
-        local_path.unlink()
-        return remote_item, parent_local_path
+        return remote_item, parent_local_path, local_path
 
     def _replace_remote_with_local(self, entry: DiffEntry) -> None:
         upload, remote_parent_id = self._plan_replace_remote_with_local(entry)
@@ -498,7 +510,9 @@ class Syncer:
         self.remote.invalidate(remote_parent_id)
 
     def _replace_local_with_remote(self, entry: DiffEntry) -> None:
-        remote_item, parent_local_path = self._plan_replace_local_with_remote(entry)
+        remote_item, parent_local_path, replace_local_path = self._plan_replace_local_with_remote(entry)
+        if replace_local_path is not None and replace_local_path.exists():
+            replace_local_path.unlink()
         self._download(remote_item, parent_local_path)
 
     def _delete_local_entry(self, entry: DiffEntry) -> None:
@@ -521,6 +535,47 @@ class Syncer:
     # -------------------------
     # Strict contract helpers
     # -------------------------
+
+    def _ensure_sync_boundary(self, local_root: Path, remote_root: Folder | str) -> bool:
+        if self._boundary_local_root is None or self._boundary_remote_root_id is None:
+            self.set_sync_boundary(local_root, remote_root)
+            return True
+
+        self._assert_local_within_boundary(Path(local_root))
+        self._assert_remote_within_boundary(self.remote.normalize_id(remote_root))
+        return False
+
+    def _assert_local_within_boundary(self, path: Path) -> None:
+        if self._boundary_local_root is None:
+            return
+
+        resolved = Path(path).resolve()
+        root = self._boundary_local_root
+        if resolved == root or root in resolved.parents:
+            return
+
+        raise SyncBoundaryError(f"Local path escaped sync root: path={resolved} root={root}")
+
+    def _assert_remote_within_boundary(self, remote_id: str) -> None:
+        if self._boundary_remote_root_id is None:
+            return
+
+        remote_id = str(remote_id)
+        root_id = str(self._boundary_remote_root_id)
+        if remote_id == root_id:
+            return
+
+        current_id = remote_id
+        seen: set[str] = set()
+        while current_id and current_id not in seen:
+            seen.add(current_id)
+            item = self.remote.get_item(current_id)
+            parent_id = str(item.parent_id) if item.parent_id else None
+            if parent_id == root_id:
+                return
+            current_id = parent_id
+
+        raise SyncBoundaryError(f"Remote id escaped sync root: id={remote_id} root={root_id}")
 
     def _newer_file_strategy(self, entry: DiffEntry) -> ChangedFileStrategy:
         local = self._require_local_node(entry)
@@ -551,22 +606,28 @@ class Syncer:
         local_path = entry.local_path
         if local_path is None:
             raise ValueError(f"{entry.status.value} entry requires a local path")
-        return Path(local_path)
+        path = Path(local_path)
+        self._assert_local_within_boundary(path)
+        return path
 
     def _require_parent_local_path(self, entry: DiffEntry) -> Path:
         parent_local_path = entry.parent_local_path
         if parent_local_path is None:
             raise ValueError(f"{entry.status.value} entry requires a local parent path")
-        return Path(parent_local_path)
+        path = Path(parent_local_path)
+        self._assert_local_within_boundary(path)
+        return path
 
     def _require_remote_id(self, entry: DiffEntry) -> str:
         remote_id = entry.remote_id
         if remote_id is None:
             raise ValueError(f"{entry.status.value} entry requires a remote id")
+        self._assert_remote_within_boundary(remote_id)
         return remote_id
 
     def _require_parent_remote_id(self, entry: DiffEntry) -> str:
         parent_remote_id = entry.parent_remote_id
         if parent_remote_id is None:
             raise ValueError(f"{entry.status.value} entry requires a remote parent id")
+        self._assert_remote_within_boundary(parent_remote_id)
         return parent_remote_id

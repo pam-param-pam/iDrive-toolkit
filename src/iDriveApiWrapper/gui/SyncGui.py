@@ -5,37 +5,44 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import traceback
 import webbrowser
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
-from .BaseScanner import Node
-from .DiffEngine import DiffEntry, DiffResult, NodeStatus
-from .InteractiveConsole import SyncInteractiveConsole
-from .Syncer import ChangedFileStrategy, SyncConflictError, SyncTransferCancelled
-from .formatting import conflict_summary, entry_local_label, entry_name, entry_remote_label, remote_label
-from .progress import DiffProgress, DiffProgressPhase, TransferProgress, TransferProgressPhase
+from ..exceptions import BackendMissingOrIncorrectResourcePasswordError
+from ..syncer.BaseScanner import Node, NodeKind, NodeOrigin
+from ..syncer.DiffEngine import DiffEntry, DiffResult, NodeStatus
+from ..syncer.Syncer import ChangedFileStrategy, SyncConflictError, SyncTransferCancelled
+from ..syncer.formatting import conflict_summary, entry_local_label, entry_name, entry_remote_label, remote_label
+from ..syncer.progress import DiffProgress, DiffProgressPhase, TransferProgress
+from ..models.Item import Item
 from ..models.Folder import Folder
+from .BreadcrumbsBar import BreadcrumbsBar
+from .GuiUtils import file_icon_key, needs_resource_password, password_prompt_item, prompt_resource_password
+from .TransferStatusBar import TransferStatusBar
 
 
 TK_STOP_EVENT = "break"
 
 
-class SyncInteractiveGui:
-    def __init__(self, syncer, local_root: Path, remote_root: Folder | str):
+class SyncGui:
+    def __init__(self, syncer, local_root: Path, remote_root: Folder | str, parent: tk.Misc | None = None):
         self.syncer = syncer
         self.initial_local_root = Path(local_root).resolve()
         self.initial_remote_id = self.syncer.remote.normalize_id(remote_root)
+        self.syncer.set_sync_boundary(self.initial_local_root, self.initial_remote_id)
         self.stack: list[tuple[Path, Folder | str]] = [(Path(local_root), remote_root)]
         self.show_same = False
         self.result = DiffResult()
         self.entries: list[DiffEntry] = []
         self._busy = False
+        self._owns_root = parent is None
 
-        self.root = tk.Tk()
+        self.root = tk.Tk() if self._owns_root else tk.Toplevel(parent)
+        self.root.report_callback_exception = self._show_callback_exception
         self.root.title("iDrive Interactive Sync")
         self.root.geometry("1300x760")
         self.root.minsize(1300, 560)
@@ -44,14 +51,27 @@ class SyncInteractiveGui:
         self._build_widgets()
         self.syncer.set_transfer_progress_callback(self._queue_transfer_progress)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        root_item = self._current_remote_folder()
+        if root_item is not None and needs_resource_password(root_item):
+            if not self._prompt_resource_password(root_item):
+                self.status_var.set("Password required")
+                return
         self.refresh()
 
     def run(self) -> None:
-        self.root.mainloop()
+        if self._owns_root:
+            self.root.mainloop()
+        else:
+            self.root.wait_window()
 
     def _on_close(self) -> None:
         self.syncer.set_transfer_progress_callback(None)
+        self.syncer.clear_sync_boundary()
         self.root.destroy()
+
+    def _show_callback_exception(self, exc_type, exc, tb) -> None:
+        traceback.print_exception(exc_type, exc, tb)
+        messagebox.showerror("Unhandled error inside the application", "".join(traceback.format_exception_only(exc_type, exc)).strip(), parent=self.root)
 
     def _build_widgets(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -67,7 +87,8 @@ class SyncInteractiveGui:
 
         ttk.Label(top, text="Remote").grid(row=1, column=0, sticky="w", padx=(0, 8))
         self.remote_var = tk.StringVar()
-        ttk.Label(top, textvariable=self.remote_var).grid(row=1, column=1, sticky="ew")
+        self.breadcrumbs = BreadcrumbsBar(top, self._navigate_breadcrumb)
+        self.breadcrumbs.grid(row=1, column=1, sticky="ew")
 
         self.summary_var = tk.StringVar()
         ttk.Label(top, textvariable=self.summary_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -90,15 +111,6 @@ class SyncInteractiveGui:
         self._selection_button(actions, "details", "Details", self.show_selected_details, "action_details").pack(side="left", padx=(0, 14))
         self._selection_button(actions, "delete_local", "Delete Local", self.delete_local, "action_delete").pack(side="left", padx=(0, 6))
         self._selection_button(actions, "trash_remote", "Trash Remote", self.trash_remote, "action_trash").pack(side="left", padx=(0, 6))
-        self.cancel_button = ttk.Button(
-            actions,
-            text="Cancel",
-            image=self.icons["action_cancel"],
-            compound="left",
-            command=self.cancel_transfer,
-            state="disabled",
-        )
-        self.cancel_button.pack(side="left", padx=(14, 0))
 
         table_frame = ttk.Frame(self.root, padding=(10, 4))
         table_frame.grid(row=2, column=0, sticky="nsew")
@@ -106,7 +118,7 @@ class SyncInteractiveGui:
         table_frame.rowconfigure(0, weight=1)
 
         columns = ("name", "status", "local", "remote")
-        ttk.Style(self.root).configure("Treeview", rowheight=28)
+        ttk.Style(self.root).configure("Treeview", rowheight=34)
         self.table = ttk.Treeview(table_frame, columns=columns, show="tree headings", selectmode="extended")
         self.table.heading("#0", text="")
         self.table.heading("name", text="Name")
@@ -114,14 +126,16 @@ class SyncInteractiveGui:
         self.table.heading("local", text="Local")
         self.table.heading("remote", text="Remote")
 
-        self.table.column("#0", width=48, minwidth=48, stretch=False, anchor="center")
+        self.table.column("#0", width=56, minwidth=56, stretch=False, anchor="center")
         self.table.column("name", width=260)
         self.table.column("status", width=110, stretch=False)
         self.table.column("local", width=430)
         self.table.column("remote", width=260)
         self.table.grid(row=0, column=0, sticky="nsew")
+        self.table.bind("<Button-1>", self._clear_selection_on_empty_click, add="+")
         self.table.bind("<Double-1>", self._on_double_click)
         self.table.bind("<Button-3>", self._show_context_menu)
+        self.table.bind("<Escape>", self._clear_selection)
         self.table.bind("<<TreeviewSelect>>", lambda _event: self._update_selection_actions())
         self.table.tag_configure("disabled", foreground="#8a8f98", background="#f1f3f5")
 
@@ -132,8 +146,9 @@ class SyncInteractiveGui:
         bottom = ttk.Frame(self.root, padding=(10, 4, 10, 10))
         bottom.grid(row=3, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
-        self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(bottom, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
+        self.transfer_status = TransferStatusBar(bottom, abort_icon=self.icons["action_cancel"], abort_command=self.abort_transfer)
+        self.status_var = self.transfer_status.status_var
+        self.progress_var = self.transfer_status.progress_var
 
     def _button(self, parent, text: str, command, icon_key: str | None = None) -> ttk.Button:
         image = self.icons.get(icon_key) if icon_key else None
@@ -177,25 +192,25 @@ class SyncInteractiveGui:
         return icons
 
     def _create_file_icon(self, accent: str, label: str) -> tk.PhotoImage:
-        image = Image.new("RGBA", (24, 24), (0, 0, 0, 0))
+        image = Image.new("RGBA", (28, 28), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        draw.rounded_rectangle((5, 2, 18, 22), radius=2, fill="#ffffff", outline="#9aa7b4")
-        draw.polygon([(14, 2), (18, 6), (14, 6)], fill="#dfe8f2", outline="#9aa7b4")
-        draw.rounded_rectangle((5, 15, 18, 22), radius=2, fill=accent)
+        draw.rounded_rectangle((6, 3, 22, 25), radius=2, fill="#ffffff", outline="#9aa7b4")
+        draw.polygon([(16, 3), (22, 9), (16, 9)], fill="#dfe8f2", outline="#9aa7b4")
+        draw.rounded_rectangle((6, 17, 22, 25), radius=2, fill=accent)
         if label:
-            font = self._icon_font(7)
+            font = self._icon_font(8)
             bbox = draw.textbbox((0, 0), label, font=font)
-            x = 12 - (bbox[2] - bbox[0]) // 2
-            draw.text((x, 15), label, fill="#ffffff", font=font)
+            x = 14 - (bbox[2] - bbox[0]) // 2
+            draw.text((x, 17), label, fill="#ffffff", font=font)
         return ImageTk.PhotoImage(image)
 
     def _create_folder_icon(self) -> tk.PhotoImage:
-        image = Image.new("RGBA", (24, 24), (0, 0, 0, 0))
+        image = Image.new("RGBA", (28, 28), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        draw.rounded_rectangle((3, 7, 21, 20), radius=2, fill="#d9a928", outline="#9b7418")
-        draw.rounded_rectangle((3, 5, 11, 10), radius=2, fill="#efc85a", outline="#b0831e")
-        draw.rounded_rectangle((4, 9, 22, 21), radius=2, fill="#f4c542", outline="#b0831e")
-        draw.rectangle((5, 10, 21, 12), fill="#ffd86b")
+        draw.rounded_rectangle((3, 8, 24, 24), radius=2, fill="#d9a928", outline="#9b7418")
+        draw.rounded_rectangle((3, 5, 13, 11), radius=2, fill="#efc85a", outline="#b0831e")
+        draw.rounded_rectangle((4, 10, 25, 25), radius=2, fill="#f4c542", outline="#b0831e")
+        draw.rectangle((5, 11, 24, 14), fill="#ffd86b")
         return ImageTk.PhotoImage(image)
 
     def _create_action_icon(self, kind: str) -> tk.PhotoImage:
@@ -261,7 +276,7 @@ class SyncInteractiveGui:
     def refresh(self) -> None:
         self._load_current_level(clear_cache=True)
 
-    def _load_current_level(self, *, clear_cache: bool) -> None:
+    def _load_current_level(self, *, clear_cache: bool, password_items: list[Item] | None = None) -> None:
         local_root, remote_root = self.stack[-1]
 
         def work():
@@ -275,10 +290,16 @@ class SyncInteractiveGui:
             self._render()
 
         status = "Refreshing diff..." if clear_cache else "Scanning diff..."
-        self._run_worker(status, work, done)
+        if password_items is None:
+            password_items = [item] if (item := self._current_remote_folder()) is not None else None
+        self._run_worker(status, work, done, password_items=password_items)
 
     def _queue_diff_progress(self, progress: DiffProgress) -> None:
-        self.root.after(0, lambda progress=progress: self.status_var.set(self._format_diff_progress(progress)))
+        self.root.after(0, lambda progress=progress: self._apply_diff_progress(progress))
+
+    def _apply_diff_progress(self, progress: DiffProgress) -> None:
+        self.status_var.set(self._format_diff_progress(progress))
+        self.transfer_status.set_progress(progress.current, progress.total)
 
     def _format_diff_progress(self, progress: DiffProgress) -> str:
         if progress.current is None or progress.total is None:
@@ -296,42 +317,10 @@ class SyncInteractiveGui:
         self.root.after(0, lambda progress=progress: self._apply_transfer_progress(progress))
 
     def _apply_transfer_progress(self, progress: TransferProgress) -> None:
-        self.status_var.set(self._format_transfer_progress(progress))
-        can_cancel = progress.phase == TransferProgressPhase.RUNNING
-        self.cancel_button.configure(state="normal" if can_cancel else "disabled")
-
-    def _format_transfer_progress(self, progress: TransferProgress) -> str:
-        byte_part = f"{self._format_bytes(progress.current_bytes)}/{self._format_bytes(progress.total_bytes)}"
-        speed_part = f"{self._format_bytes(int(progress.bytes_per_second))}/s"
-        eta_part = self._format_eta(progress.eta_seconds)
-        transfer_part = f"{byte_part}, {speed_part}"
-        if eta_part:
-            transfer_part = f"{transfer_part}, ETA {eta_part}"
-        if progress.total_items:
-            file_part = f"{progress.completed_items} files/{progress.total_items}"
-            if progress.failed_items:
-                file_part = f"{file_part}, failed={progress.failed_items}"
-            return f"{progress.message} ({transfer_part}, {file_part})"
-        return f"{progress.message} ({transfer_part})"
+        self.transfer_status.apply_sync_progress(progress)
 
     def _format_bytes(self, value: int) -> str:
-        size = float(value)
-        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-            if size < 1024 or unit == "TiB":
-                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
-            size /= 1024
-        return f"{size:.1f} PiB"
-
-    def _format_eta(self, seconds: float | None) -> str:
-        if seconds is None:
-            return ""
-
-        seconds = max(0, int(seconds))
-        hours, remainder = divmod(seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        if hours:
-            return f"{hours:d}:{minutes:02d}:{seconds:02d}"
-        return f"{minutes:d}:{seconds:02d}"
+        return TransferStatusBar.format_bytes(value)
 
     def back(self) -> None:
         if self._busy:
@@ -346,6 +335,28 @@ class SyncInteractiveGui:
         self.stack.append((parent_local_root, parent_remote_root))
         self._load_current_level(clear_cache=False)
 
+    def _navigate_breadcrumb(self, folder_id: str) -> None:
+        if self._busy:
+            return
+
+        local_root, remote_root = self.stack[-1]
+        breadcrumbs = self._current_sync_breadcrumbs(remote_root)
+        target_index = next((index for index, breadcrumb in enumerate(breadcrumbs) if str(breadcrumb.id) == str(folder_id)), None)
+        if target_index is None:
+            return
+
+        distance = len(breadcrumbs) - 1 - target_index
+        target_local_root = Path(local_root) if distance == 0 else Path(local_root).parents[distance - 1]
+        if not (target_local_root.resolve() == self.initial_local_root or self.initial_local_root in target_local_root.resolve().parents):
+            return
+
+        target_item = self._remote_item_by_id(folder_id)
+        if target_item is not None and needs_resource_password(target_item) and not self._prompt_resource_password(target_item):
+            return
+
+        self.stack.append((target_local_root, folder_id))
+        self._load_current_level(clear_cache=False, password_items=[target_item] if target_item is not None else None)
+
     def toggle_same(self) -> None:
         if self._busy:
             return
@@ -355,31 +366,38 @@ class SyncInteractiveGui:
         self._render()
 
     def _display_entries(self, result: DiffResult) -> list[DiffEntry]:
-        entries = SyncInteractiveConsole.interactive_entries(result, show_same=self.show_same)
+        entries = []
+        entries.extend(result.only_local)
+        entries.extend(result.only_remote)
+        entries.extend(result.changed)
+        entries.extend(result.conflicts)
+        if self.show_same:
+            entries.extend(result.same)
+
         return sorted(entries, key=lambda entry: (not entry.is_folder, entry_name(entry).lower(), entry.status.value))
 
     def open_selected_entry(self) -> None:
         selected = self._selected_entries()
         if len(selected) != 1:
-            messagebox.showinfo("Selection", "Select one row to open.")
+            messagebox.showinfo("Selection", "Select one row to open.", parent=self.root)
             return
         self._open_entry(selected[0])
 
     def show_selected_details(self) -> None:
         selected = self._selected_entries()
         if len(selected) != 1:
-            messagebox.showinfo("Selection", "Select one row to inspect.")
+            messagebox.showinfo("Selection", "Select one row to inspect.", parent=self.root)
             return
         self._show_entry_details(selected[0])
 
     def sync_all(self) -> None:
         if self.result.conflicts:
-            messagebox.showwarning("Conflicts", conflict_summary(self.result.conflicts))
+            messagebox.showwarning("Conflicts", conflict_summary(self.result.conflicts), parent=self.root)
             return
         strategy = self._ask_changed_strategy()
         if strategy is None:
             return
-        if not messagebox.askyesno("Sync All", "Apply all changes at this level and recurse into changed folders?"):
+        if not messagebox.askyesno("Sync All", "Apply all changes at this level and recurse into changed folders?", parent=self.root):
             return
         local_root, remote_root = self.stack[-1]
         self._run_action(
@@ -397,7 +415,7 @@ class SyncInteractiveGui:
 
     def resolve_changed(self) -> None:
         if not self.result.changed:
-            messagebox.showinfo("Changed", "No changed entries. Conflict entries require manual rename/delete/move resolution.")
+            messagebox.showinfo("Changed", "No changed entries. Conflict entries require manual rename/delete/move resolution.", parent=self.root)
             return
         strategy = self._ask_changed_strategy()
         if strategy is None:
@@ -413,9 +431,9 @@ class SyncInteractiveGui:
         entries = self._selected_entries() or self.entries
         local_entries = [entry for entry in entries if entry.local is not None]
         if not local_entries:
-            messagebox.showinfo("Delete Local", "No selected or visible local entries to delete.")
+            messagebox.showinfo("Delete Local", "No selected or visible local entries to delete.", parent=self.root)
             return
-        if not messagebox.askyesno("Delete Local", f"Delete {len(local_entries)} local entr{'y' if len(local_entries) == 1 else 'ies'}?"):
+        if not messagebox.askyesno("Delete Local", f"Delete {len(local_entries)} local entr{'y' if len(local_entries) == 1 else 'ies'}?", parent=self.root):
             return
         self._run_action("Deleting local entries...", lambda: [self.syncer._delete_local_entry(entry) for entry in local_entries])
 
@@ -423,29 +441,33 @@ class SyncInteractiveGui:
         entries = self._selected_entries() or self.entries
         remote_entries = [entry for entry in entries if entry.remote is not None]
         if not remote_entries:
-            messagebox.showinfo("Trash Remote", "No selected or visible remote entries to move to trash.")
+            messagebox.showinfo("Trash Remote", "No selected or visible remote entries to move to trash.", parent=self.root)
             return
-        if not messagebox.askyesno("Trash Remote", f"Move {len(remote_entries)} remote entr{'y' if len(remote_entries) == 1 else 'ies'} to trash?"):
+        if not messagebox.askyesno("Trash Remote", f"Move {len(remote_entries)} remote entr{'y' if len(remote_entries) == 1 else 'ies'} to trash?", parent=self.root):
             return
-        self._run_action("Moving remote entries to trash...", lambda: [self.syncer._delete_remote_entry(entry) for entry in remote_entries])
+        self._run_action(
+            "Moving remote entries to trash...",
+            lambda: [self.syncer._delete_remote_entry(entry) for entry in remote_entries],
+            password_items=self._remote_items_for_entries(remote_entries),
+        )
 
-    def cancel_transfer(self) -> None:
-        self.cancel_button.configure(state="disabled")
-        self.status_var.set("Cancelling transfer...")
-        self.syncer.cancel_current_transfer()
+    def abort_transfer(self) -> None:
+        self.transfer_status.set_abort_enabled(False)
+        self.transfer_status.set_status("Aborting transfer...")
+        self.syncer.abort_current_transfer()
 
     def _apply_entries(self, entries: list[DiffEntry], handler, prompt: str) -> None:
         if not entries:
-            messagebox.showinfo("Nothing", "Nothing to apply.")
+            messagebox.showinfo("Nothing", "Nothing to apply.", parent=self.root)
             return
-        if not messagebox.askyesno("Confirm", prompt):
+        if not messagebox.askyesno("Confirm", prompt, parent=self.root):
             return
 
         def work():
             for entry in entries:
                 handler(entry)
 
-        self._run_action("Applying entries...", work)
+        self._run_action("Applying entries...", work, password_items=self._remote_items_for_entries(entries, include_parent=True))
 
     def _selected_entries(self) -> list[DiffEntry]:
         selected = []
@@ -456,6 +478,18 @@ class SyncInteractiveGui:
             selected.append(self.entries[int(item_id)])
         return selected
 
+    def _clear_selection_on_empty_click(self, event) -> None:
+        if self.table.identify_row(event.y):
+            return
+        self._clear_selection()
+
+    def _clear_selection(self, _event=None) -> str:
+        selection = self.table.selection()
+        if selection:
+            self.table.selection_remove(selection)
+        self._update_selection_actions()
+        return TK_STOP_EVENT
+
     def _entry_from_item_id(self, item_id: str) -> DiffEntry | None:
         if not item_id:
             return None
@@ -463,6 +497,27 @@ class SyncInteractiveGui:
             return self.entries[int(item_id)]
         except (ValueError, IndexError):
             return None
+
+    def _remote_items_for_entries(self, entries: list[DiffEntry], *, include_parent: bool = False) -> list[Item]:
+        items: list[Item] = []
+        seen: set[str] = set()
+        for entry in entries:
+            remote_ids = []
+            if entry.remote_id is not None:
+                remote_ids.append(entry.remote_id)
+            if include_parent and entry.parent_remote_id is not None:
+                remote_ids.append(entry.parent_remote_id)
+            for remote_id in remote_ids:
+                remote_id = str(remote_id)
+                if remote_id in seen:
+                    continue
+                seen.add(remote_id)
+                try:
+                    item = self.syncer.remote.require_cached_item(remote_id)
+                except KeyError:
+                    item = self.syncer.remote.get_item(remote_id)
+                items.append(item)
+        return items
 
     def _on_double_click(self, event) -> str | None:
         if self._busy:
@@ -547,25 +602,29 @@ class SyncInteractiveGui:
         return "normal" if enabled and not self._busy else "disabled"
 
     def _confirm_single_upload(self, entry: DiffEntry) -> None:
-        if messagebox.askyesno("Upload", f"Upload {entry_name(entry)}?"):
+        if messagebox.askyesno("Upload", f"Upload {entry_name(entry)}?", parent=self.root):
             self._run_action("Uploading selected entry...", lambda: self.syncer._handle_only_local(entry))
 
     def _confirm_single_download(self, entry: DiffEntry) -> None:
-        if messagebox.askyesno("Download", f"Download {entry_name(entry)}?"):
+        if messagebox.askyesno("Download", f"Download {entry_name(entry)}?", parent=self.root):
             self._run_action("Downloading selected entry...", lambda: self.syncer._handle_only_remote(entry))
 
     def _confirm_single_resolve(self, entry: DiffEntry) -> None:
         strategy = self._ask_changed_strategy()
-        if strategy and messagebox.askyesno("Resolve", f"Resolve {entry_name(entry)} with {strategy.value}?"):
+        if strategy and messagebox.askyesno("Resolve", f"Resolve {entry_name(entry)} with {strategy.value}?", parent=self.root):
             self._run_action("Resolving selected entry...", lambda: self.syncer._handle_changed(entry, strategy=strategy))
 
     def _confirm_single_delete_local(self, entry: DiffEntry) -> None:
-        if messagebox.askyesno("Delete Local", f"Delete local {entry_name(entry)}?"):
+        if messagebox.askyesno("Delete Local", f"Delete local {entry_name(entry)}?", parent=self.root):
             self._run_action("Deleting local entry...", lambda: self.syncer._delete_local_entry(entry))
 
     def _confirm_single_trash_remote(self, entry: DiffEntry) -> None:
-        if messagebox.askyesno("Trash Remote", f"Move remote {entry_name(entry)} to trash?"):
-            self._run_action("Moving remote entry to trash...", lambda: self.syncer._delete_remote_entry(entry))
+        if messagebox.askyesno("Trash Remote", f"Move remote {entry_name(entry)} to trash?", parent=self.root):
+            self._run_action(
+                "Moving remote entry to trash...",
+                lambda: self.syncer._delete_remote_entry(entry),
+                password_items=self._remote_items_for_entries([entry]),
+            )
 
     def _can_open_entry(self, entry: DiffEntry) -> bool:
         if entry.is_folder:
@@ -582,20 +641,23 @@ class SyncInteractiveGui:
     def _open_folder_entry(self, entry: DiffEntry) -> None:
         local_path = entry.local_path
         if local_path is None:
-            messagebox.showinfo("Open", "This folder has no local path projection.")
+            messagebox.showinfo("Open", "This folder has no local path projection.", parent=self.root)
             return
 
         remote_id = entry.remote_id
+        password_items = self._remote_items_for_entries([entry])
+        target_item = password_items[0] if password_items else None
+        if target_item is not None and needs_resource_password(target_item) and not self._prompt_resource_password(target_item):
+            return
+
         if remote_id is None:
             remote_id = self.syncer.remote.missing_folder_id(local_path)
 
         self.stack.append((Path(local_path), remote_id))
-        self._load_current_level(clear_cache=False)
+        self._load_current_level(clear_cache=False, password_items=password_items or None)
 
     def _parent_remote_root(self, remote_root: Folder | str, parent_local_root: Path) -> Folder | str:
         remote_id = self.syncer.remote.normalize_id(remote_root)
-        if remote_id.startswith(self.syncer.remote.MISSING_FOLDER_PREFIX):
-            return self.syncer.remote.missing_folder_id(parent_local_root)
 
         try:
             remote_item = self.syncer.remote.require_cached_item(remote_id)
@@ -616,9 +678,6 @@ class SyncInteractiveGui:
         if local_root.parent == local_root:
             return False
 
-        if remote_id.startswith(self.syncer.remote.MISSING_FOLDER_PREFIX):
-            return True
-
         try:
             remote_item = self.syncer.remote.require_cached_item(remote_id)
         except KeyError:
@@ -637,13 +696,13 @@ class SyncInteractiveGui:
 
         path = Path(local_path)
         if not path.exists():
-            messagebox.showwarning("Open", f"Local path does not exist:\n{path}")
+            messagebox.showwarning("Open", f"Local path does not exist:\n{path}", parent=self.root)
             return
 
         try:
             self._open_path_native(path)
         except Exception as exc:
-            messagebox.showerror("Open", str(exc))
+            messagebox.showerror("Open", str(exc), parent=self.root)
 
     def _open_remote_file(self, entry: DiffEntry) -> None:
         remote_id = entry.remote_id
@@ -682,7 +741,48 @@ class SyncInteractiveGui:
         details.extend(("", "Local:", *self._node_details(entry.local, entry.local_path)))
         details.extend(("", "Remote:", *self._node_details(entry.remote, entry.remote_id)))
 
-        messagebox.showinfo("Details", "\n".join(details))
+        self._show_copyable_details("Details", "\n".join(details))
+
+    def _show_copyable_details(self, title: str, text: str) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.geometry("720x460")
+        dialog.minsize(480, 300)
+        dialog.transient(self.root)
+
+        frame = ttk.Frame(dialog, padding=10)
+        frame.grid(row=0, column=0, sticky="nsew")
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        details_text = tk.Text(frame, wrap="word", font=("Consolas", 10), undo=False)
+        details_text.grid(row=0, column=0, sticky="nsew")
+        details_scroll = ttk.Scrollbar(frame, orient="vertical", command=details_text.yview)
+        details_scroll.grid(row=0, column=1, sticky="ns")
+        details_text.configure(yscrollcommand=details_scroll.set)
+        details_text.insert("1.0", text)
+        details_text.configure(state="disabled")
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Copy All", command=lambda: self._copy_text_to_clipboard(text)).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Close", command=dialog.destroy).pack(side="left")
+
+        details_text.bind("<Control-a>", lambda _event: self._select_all_text(details_text))
+        details_text.bind("<Control-A>", lambda _event: self._select_all_text(details_text))
+        details_text.focus_set()
+
+    def _copy_text_to_clipboard(self, text: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    def _select_all_text(self, widget: tk.Text) -> str:
+        widget.tag_add("sel", "1.0", "end-1c")
+        widget.mark_set("insert", "1.0")
+        widget.see("insert")
+        return TK_STOP_EVENT
 
     def _node_details(self, node: Node | None, display_id) -> list[str]:
         if node is None:
@@ -693,14 +793,34 @@ class SyncInteractiveGui:
             f"Parent: {node.parent_uid if node.parent_uid is not None else '-'}",
             f"Created: {node.created_at}",
             f"Modified: {node.modified_at if node.modified_at is not None else '-'}",
-            f"Size: {node.size if node.size is not None else '-'}",
+            f"Size: {self._node_size_label(node)}",
             f"Hash: {node.hash if node.hash is not None else '-'}",
         ]
+
+    def _node_size_label(self, node: Node) -> str:
+        if node.kind != NodeKind.FOLDER:
+            return self._format_bytes(node.size) if node.size is not None else "-"
+
+        size = self._node_size(node)
+        return self._format_bytes(size)
+
+    def _node_size(self, node: Node) -> int:
+        if node.source == NodeOrigin.LOCAL:
+            return self.syncer.local.get_folder_size(node.uid)
+
+        node_id = str(node.uid)
+        return self.syncer.remote.get_folder_size(node_id)
+
 
     def _render(self) -> None:
         local_root, remote_root = self.stack[-1]
         self.local_var.set(str(local_root))
         self.remote_var.set(remote_label(remote_root))
+        breadcrumbs = self._current_sync_breadcrumbs(remote_root)
+        if breadcrumbs:
+            self.breadcrumbs.set_items(breadcrumbs)
+        else:
+            self.breadcrumbs.set_items([(self.syncer.remote.normalize_id(remote_root), remote_label(remote_root))])
         self.back_button.configure(state="normal" if self._can_go_back(local_root, remote_root) else "disabled")
         self.summary_var.set(
             f"local={len(self.result.only_local)}  "
@@ -768,28 +888,26 @@ class SyncInteractiveGui:
         local_root, remote_root = self.stack[-1]
         self.back_button.configure(state="normal" if self._can_go_back(local_root, remote_root) else "disabled")
 
+    def _current_sync_breadcrumbs(self, remote_root: Folder | str):
+        remote_id = self.syncer.remote.normalize_id(remote_root)
+
+        try:
+            remote_item = self.syncer.remote.require_cached_item(remote_id)
+        except KeyError:
+            remote_item = self.syncer.remote.get_item(remote_id)
+        if not isinstance(remote_item, Folder):
+            return []
+
+        breadcrumbs = list(remote_item.breadcrumbs or [])
+        root_index = next((index for index, breadcrumb in enumerate(breadcrumbs) if str(breadcrumb.id) == self.initial_remote_id), None)
+        if root_index is None:
+            return [(remote_item.id, remote_item.name)]
+        return breadcrumbs[root_index:]
+
     def _entry_icon(self, entry: DiffEntry) -> tk.PhotoImage:
         if entry.is_folder:
             return self.icons["folder"]
-        return self.icons[self._file_icon_key(entry_name(entry))]
-
-    def _file_icon_key(self, name: str) -> str:
-        extension = Path(name).suffix.lower().lstrip(".")
-        if extension in {"jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff", "heic", "raw"}:
-            return "file_image"
-        if extension in {"mp4", "mkv", "mov", "avi", "webm", "wmv", "m4v"}:
-            return "file_video"
-        if extension in {"mp3", "wav", "flac", "aac", "ogg", "m4a", "opus"}:
-            return "file_audio"
-        if extension in {"txt", "md", "rtf", "doc", "docx", "odt"}:
-            return "file_text"
-        if extension in {"zip", "rar", "7z", "tar", "gz", "bz2", "xz"}:
-            return "file_archive"
-        if extension in {"py", "js", "ts", "html", "css", "json", "xml", "yaml", "yml", "java", "c", "cpp", "h", "cs", "go", "rs", "php"}:
-            return "file_code"
-        if extension == "pdf":
-            return "file_pdf"
-        return "file"
+        return self.icons[file_icon_key(entry_name(entry))]
 
     def _ask_changed_strategy(self) -> ChangedFileStrategy | None:
         choices = {
@@ -806,14 +924,14 @@ class SyncInteractiveGui:
 
         strategy = choices.get(value.strip().lower())
         if strategy is None:
-            messagebox.showerror("Changed Strategy", f"Invalid strategy: {value}")
+            messagebox.showerror("Changed Strategy", f"Invalid strategy: {value}", parent=self.root)
             return None
         return strategy
 
-    def _run_action(self, status: str, work) -> None:
-        self._run_worker(status, work, lambda _result: self._load_current_level(clear_cache=False))
+    def _run_action(self, status: str, work, *, password_items: list[Item] | None = None) -> None:
+        self._run_worker(status, work, lambda _result: self._load_current_level(clear_cache=False), password_items=password_items)
 
-    def _run_worker(self, status: str, work, done) -> None:
+    def _run_worker(self, status: str, work, done, *, password_items: list[Item] | None = None) -> None:
         if self._busy:
             return
         self._set_busy(True, status)
@@ -825,6 +943,8 @@ class SyncInteractiveGui:
                 self.root.after(0, lambda exc=exc: self._worker_failed("Sync conflict", exc))
             except SyncTransferCancelled as exc:
                 self.root.after(0, lambda exc=exc: self._worker_cancelled(exc))
+            except BackendMissingOrIncorrectResourcePasswordError:
+                self.root.after(0, lambda: self._worker_password_required(status, work, done, password_items))
             except Exception as exc:
                 self.root.after(0, lambda exc=exc: self._worker_failed("Error", exc))
             else:
@@ -838,15 +958,43 @@ class SyncInteractiveGui:
 
     def _worker_failed(self, title: str, exc: Exception) -> None:
         self._set_busy(False, "Ready")
-        messagebox.showerror(title, str(exc))
+        messagebox.showerror(title, str(exc), parent=self.root)
 
     def _worker_cancelled(self, exc: SyncTransferCancelled) -> None:
         self._set_busy(False, str(exc))
 
+    def _worker_password_required(self, status: str, work, done, password_items: list[Item] | None = None) -> None:
+        self._set_busy(False, "Password required")
+        item = password_prompt_item(password_items or [], self._current_remote_folder())
+        if item is None:
+            messagebox.showerror("Folder Password", "Password is required, but the current remote folder is not available.", parent=self.root)
+            return
+
+        if self._prompt_resource_password(item):
+            self._run_worker(status, work, done, password_items=password_items)
+
+    def _current_remote_folder(self) -> Folder | None:
+        _local_root, remote_root = self.stack[-1]
+        remote_id = self.syncer.remote.normalize_id(remote_root)
+
+        item = self._remote_item_by_id(remote_id)
+        return item if isinstance(item, Folder) else None
+
+    def _remote_item_by_id(self, remote_id: str) -> Item | None:
+        try:
+            return self.syncer.remote.require_cached_item(remote_id)
+        except KeyError:
+            return self.syncer.remote.get_item(remote_id)
+
+    def _prompt_resource_password(self, item: Item) -> bool:
+        return prompt_resource_password(self.root, item, self.syncer.remote.set_item_password)
+
     def _set_busy(self, busy: bool, status: str) -> None:
         self._busy = busy
         self.status_var.set(status)
-        self.cancel_button.configure(state="disabled")
+        self.transfer_status.set_abort_enabled(False)
+        if not busy:
+            self.transfer_status.set_progress(0, 0)
         state = "disabled" if busy else "normal"
         for button in self.buttons:
             button.configure(state=state)
