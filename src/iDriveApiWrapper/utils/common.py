@@ -16,8 +16,8 @@ def _extract_ids_and_passwords(items: List[Item]) -> dict:
     ids = []
     resourcePasswords = {}
     for item in items:
-        if item.is_locked and item.get_password():
-            resourcePasswords[item.lock_from] = item.get_password()
+        if item.is_locked and item.password:
+            resourcePasswords[item.lock_from] = item.password
         ids.append(item.id)
 
     return {'ids': ids, 'resourcePasswords': resourcePasswords}

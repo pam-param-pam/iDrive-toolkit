@@ -92,6 +92,7 @@ class PrepareRequestWorker:
                         break
 
             except Exception as e:
+                self.ctx.add_error(e)
                 self._fail_new_request_states(initial_state_ids, e)
                 print(f"[PrepareRequestWorker] FAILED on {item.path}: {e!r}")
                 traceback.print_exc()
@@ -158,7 +159,7 @@ class PrepareRequestWorker:
             size=file_size,
             parent_id=parent.id,
             lock_from_id=lock_from_id,
-            parent_password=parent.get_password(),
+            parent_password=parent.password if parent.is_locked else None,
             encryption_method=encryption_method,
             file_crypto=file_crypto,
             duration=duration,

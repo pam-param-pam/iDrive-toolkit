@@ -32,13 +32,13 @@ def safe_item_label(item: Item) -> str:
 
 
 def needs_resource_password(item: Item) -> bool:
-    return bool(getattr(item, "_is_locked", None) or getattr(item, "_lock_from", None)) and not item.get_password()
+    return item.is_locked and not item.password
 
 
 def password_prompt_item(items: Iterable[Item | None], fallback: Item | None = None) -> Item | None:
     present = [item for item in items if item is not None]
     for item in present:
-        if getattr(item, "_is_locked", None) or getattr(item, "_lock_from", None):
+        if item.is_locked:
             return item
     return present[0] if present else fallback
 

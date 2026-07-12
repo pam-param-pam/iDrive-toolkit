@@ -98,7 +98,7 @@ class Client:
 
         cls._validate_and_set_base(base_url)
 
-        data = make_request("POST", "auth/token/login", data={"username": username, "password": password})
+        data = make_request("POST", "auth/token/login", data={"username": username, "password": password}, auth=False)
         token = data["auth_token"]
         device_id = data["device_id"]
 

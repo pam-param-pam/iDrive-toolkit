@@ -22,6 +22,7 @@ from .progress import (
 from .state import StateStore
 from ..models.File import File
 from ..models.Folder import Folder
+from src.iDriveApiWrapper.gui.transfer_errors import raise_transfer_errors
 
 
 UploadTask = tuple[Path, Folder]
@@ -80,10 +81,10 @@ class Syncer:
     def enable_hash_trace(self, output_dir: Path | str | None) -> None:
         self.local.set_hash_trace_dir(output_dir)
 
-    def clear_memory_cache(self) -> None:
+    def clear_memory_cache(self, remote_root: Folder | str | None = None) -> None:
         self.state.load()
         self.local.clear_memory_cache()
-        self.remote.clear_memory_cache()
+        self.remote.clear_memory_cache(remote_root)
 
     def set_transfer_progress_callback(self, callback: TransferProgressCallback | None) -> None:
         self._transfer_progress_callback = callback
@@ -293,6 +294,7 @@ class Syncer:
                 self._emit_transfer_progress(transfer, direction, TransferProgressPhase.CANCELLED)
                 raise SyncTransferCancelled(f"{direction.value.capitalize()} aborted")
 
+            raise_transfer_errors(transfer, direction.value.capitalize())
             self._emit_transfer_progress(transfer, direction, TransferProgressPhase.COMPLETE)
         finally:
             with self._active_transfer_lock:
@@ -569,6 +571,13 @@ class Syncer:
         seen: set[str] = set()
         while current_id and current_id not in seen:
             seen.add(current_id)
+            if self.remote.is_missing_folder_id(current_id):
+                _local_path, parent_id = self.remote.missing_folder_info(current_id)
+                if parent_id == root_id:
+                    return
+                current_id = parent_id
+                continue
+
             item = self.remote.get_item(current_id)
             parent_id = str(item.parent_id) if item.parent_id else None
             if parent_id == root_id:

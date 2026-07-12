@@ -16,11 +16,15 @@ class Resource(ABC, EnforceOverrides):
     def _get_password_header(self):
         return {"x-resource-password": self._password} if self._password else {}
 
+    @property
+    def password(self) -> Optional[str]:
+        return self._password
+
     def set_password(self, password: Union[str, None]) -> None:
         self._password = password
 
     def get_password(self) -> Optional[str]:
-        return self._password
+        return self.password
 
     def refresh(self):
         setattr(self, '__refresh', True)

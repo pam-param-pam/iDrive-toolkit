@@ -341,7 +341,7 @@ class UltraUploader:
         return path
 
     def _check_can_upload(self, parent: Folder) -> Optional[str]:
-        cache_key = (str(parent.id), parent.get_password())
+        cache_key = (str(parent.id), parent.password if parent.is_locked else None)
         if cache_key in self._can_upload_cache:
             return self._can_upload_cache[cache_key]
 

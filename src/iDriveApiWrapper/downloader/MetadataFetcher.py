@@ -30,8 +30,8 @@ class MetadataFetcher:
         if passwords is None:
             passwords = {}
 
-        if item.get_password():
-            passwords[item.lock_from] = item.get_password()
+        if item.is_locked and item.password:
+            passwords[item.lock_from] = item.password
 
         resource_passwords = self._build_folder_passwords_payload(passwords)
         res_data = self._request_with_retries("GET", f"ultraDownload/items/{item.id}", data=resource_passwords)

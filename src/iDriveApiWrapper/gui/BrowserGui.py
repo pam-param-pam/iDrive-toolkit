@@ -19,6 +19,7 @@ from ..models.Folder import Folder
 from ..models.Item import Item
 from ..state.Storage import IdriveStorage
 from ..syncer.Syncer import Syncer
+from src.iDriveApiWrapper.gui.transfer_errors import raise_transfer_errors
 from .BreadcrumbsBar import BreadcrumbsBar
 from .GuiUtils import file_icon_key, needs_resource_password, password_prompt_item, prompt_resource_password, safe_item_label
 from .SyncGui import SyncGui
@@ -366,6 +367,7 @@ class BrowserGuiApp:
                 for item in items:
                     downloader.download(data=item, target_dir=Path(target_dir))
                 downloader.join()
+                raise_transfer_errors(downloader, "Download")
             finally:
                 self._clear_active_transfer()
 
@@ -431,6 +433,7 @@ class BrowserGuiApp:
             try:
                 uploader.upload(path, parent=self.current_folder)
                 uploader.join()
+                raise_transfer_errors(uploader, "Upload")
             finally:
                 self._clear_active_transfer()
 

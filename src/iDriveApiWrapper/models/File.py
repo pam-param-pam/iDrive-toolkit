@@ -181,8 +181,8 @@ class File(Item):
         self._tags = []
         for element in data:
             tag = Tag(**element, file_id=self.id)
-            if self.get_password():
-                tag.set_password(self.get_password())
+            if self.is_locked and self.password:
+                tag.set_password(self.password)
             tag.file_id = self.id
             self._tags.append(tag)
 
@@ -191,17 +191,17 @@ class File(Item):
         self._moments = []
         for element in data:
             moment = Moment(**element)
-            if self.get_password():
-                moment.set_password(self.get_password())
-            self._moments.append(Moment(**element))
+            if self.is_locked and self.password:
+                moment.set_password(self.password)
+            self._moments.append(moment)
 
     def _fetch_subtitles(self):
         data = make_request("GET", f"files/{self.id}/subtitles", headers=self._get_password_header())
         self._subtitles = []
         for element in data:
             subtitle = Subtitle(**element)
-            if self.get_password():
-                subtitle.set_password(self.get_password())
+            if self.is_locked and self.password:
+                subtitle.set_password(self.password)
             self._subtitles.append(subtitle)
 
     def add_tag(self, name: str) -> Tag:
@@ -217,8 +217,9 @@ class File(Item):
     def _fetch_fragments(self):
         res_data = make_request("POST", f"items/ultraDownload/items/{self.id}", headers=self._get_password_header())
         fragments = [Fragment(**frag) for frag in res_data[0]['fragments']]
-        for frag in fragments:
-            frag.set_password(self.get_password())
+        if self.is_locked:
+            for frag in fragments:
+                frag.set_password(self.password)
         self._fragments = fragments
 
     def play(self):

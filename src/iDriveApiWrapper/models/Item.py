@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Union
+
+from overrides import overrides
 
 from ..models.Resource import Resource
 from ..utils.decorators import autoFetchProperty
@@ -68,6 +70,17 @@ class Item(Resource, ABC):
 
         return unmatched_keys
 
+    def inherit_password_from(self, parent: Folder) -> None:
+        if not parent.is_locked:
+            return
+
+        parent_lock_from = parent.lock_from
+        own_lock_from = self.lock_from
+        if own_lock_from == parent_lock_from:
+            self.set_password(parent.password)
+            self._lock_from = parent.lock_from
+            self._is_locked = True
+
     @property
     @autoFetchProperty('_fetch_data')
     def name(self):
@@ -96,7 +109,7 @@ class Item(Resource, ABC):
     @property
     @autoFetchProperty('_fetch_data')
     def is_locked(self):
-        return self._is_locked
+        return bool(self._is_locked)
 
     @property
     @autoFetchProperty('_fetch_data')
@@ -110,7 +123,7 @@ class Item(Resource, ABC):
             raise ValueError("Root folder has no parent!")
 
         self._parent = Folder(self.parent_id)
-        self._parent.set_password(self.get_password())
+        self._parent.inherit_password_from(self)
         return self._parent
 
     def check_password(self, password: str):

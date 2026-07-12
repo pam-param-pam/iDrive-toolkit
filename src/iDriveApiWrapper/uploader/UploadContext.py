@@ -21,6 +21,7 @@ class UploadContext:
 
         self.lock = threading.RLock()
         self.states: Dict[str, UploadFileState] = {}
+        self.errors: list[Exception] = []
 
         self.state = UploadContextState.RUNNING
 
@@ -121,6 +122,10 @@ class UploadContext:
     def get_failed_states(self) -> Dict[str, UploadFileState]:
         with self.lock:
             return {fid: st for fid, st in self.states.items() if st.error}
+
+    def add_error(self, error: Exception) -> None:
+        with self.lock:
+            self.errors.append(error)
 
     # -------------------------------------------------
     # Global pause / resume

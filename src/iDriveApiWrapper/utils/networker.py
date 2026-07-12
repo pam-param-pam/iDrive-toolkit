@@ -17,16 +17,16 @@ DEFAULT_RETRY_AFTER = 5
 def _mask_preserving_spaces(value: str) -> str:
     return "".join("*" if ch != " " else " " for ch in value)
 
-def _get_headers() -> dict:
+def _get_headers(auth: bool) -> dict:
     headers = {"Content-Type": "application/json"}
-    if APIConfig.token:
+    if APIConfig.token and auth:
         headers['Authorization'] = f"Token {APIConfig.token}"
     return headers
 
 
-def make_request(method: str, endpoint: str, data: dict = None, headers: dict = None, params: dict = None, files: dict = None, retry=True) -> dict:
+def make_request(method: str, endpoint: str, data: dict = None, headers: dict = None, params: dict = None, files: dict = None, retry= True, auth: bool = True) -> dict:
     headers = {k: v for k, v in (headers or {}).items() if v is not None}
-    headers.update(_get_headers())
+    headers.update(_get_headers(auth=auth))
 
     SENSITIVE_HEADERS = {"authorization", "x-resource-password"}
     safe_headers = {

@@ -99,9 +99,8 @@ class Folder(Item):
         data = make_request("POST", "folders", headers=parent._get_password_header(), data={"parent_id": parent.id, "name": name})
         folder = Folder(data['id'])
         folder._set_data(data)
-        # todo fix ths
-        if parent._password and folder._lock_from == parent._lock_from:
-            folder.set_password(parent._password)
+        # folder.inherit_password_from(parent)
+
         return folder
 
     def create_subfolder(self, name: str) -> 'Folder':
@@ -120,8 +119,9 @@ class Folder(Item):
 
             item._set_data(element)
 
-            if parent and parent._password and item._lock_from == parent._lock_from:
-                item.set_password(parent._password)
+            if parent:
+                item.inherit_password_from(parent)
+
             children.append(item)
 
         return ItemsList(children)

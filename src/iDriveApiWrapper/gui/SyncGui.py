@@ -98,19 +98,28 @@ class SyncGui:
 
         self.buttons: list[ttk.Button] = []
         self.selection_buttons: dict[str, ttk.Button] = {}
-        self.back_button = self._button(actions, "Back", self.back, "action_back")
-        self.back_button.pack(side="left", padx=(0, 6))
-        self._button(actions, "Refresh", self.refresh, "action_refresh").pack(side="left", padx=(0, 6))
-        self.same_button = self._button(actions, "Show same", self.toggle_same, "action_same")
-        self.same_button.pack(side="left", padx=(0, 14))
 
-        self._selection_button(actions, "sync_all", "Sync All", self.sync_all, "action_sync").pack(side="left", padx=(0, 6))
-        self._selection_button(actions, "upload", "Upload Local", self.upload_local, "action_upload").pack(side="left", padx=(0, 6))
-        self._selection_button(actions, "download", "Download Remote", self.download_remote, "action_download").pack(side="left", padx=(0, 6))
-        self._selection_button(actions, "resolve", "Resolve Changed", self.resolve_changed, "action_resolve").pack(side="left", padx=(0, 14))
-        self._selection_button(actions, "details", "Details", self.show_selected_details, "action_details").pack(side="left", padx=(0, 14))
-        self._selection_button(actions, "delete_local", "Delete Local", self.delete_local, "action_delete").pack(side="left", padx=(0, 6))
-        self._selection_button(actions, "trash_remote", "Trash Remote", self.trash_remote, "action_trash").pack(side="left", padx=(0, 6))
+        view_actions = ttk.LabelFrame(actions, text="View", padding=(6, 4))
+        view_actions.pack(side="left", padx=(0, 8))
+        self.back_button = self._button(view_actions, "Back", self.back, "action_back")
+        self.back_button.pack(side="left", padx=(0, 6))
+        self._button(view_actions, "Refresh", self.refresh, "action_refresh").pack(side="left", padx=(0, 6))
+        self.same_button = self._button(view_actions, "Show same", self.toggle_same, "action_same")
+        self.same_button.pack(side="left")
+
+        sync_actions = ttk.LabelFrame(actions, text="Sync", padding=(6, 4))
+        sync_actions.pack(side="left", padx=(0, 8))
+        self._selection_button(sync_actions, "sync_all", "Sync All", self.sync_all, "action_sync").pack(side="left", padx=(0, 6))
+        self._selection_button(sync_actions, "upload", "Upload Local", self.upload_local, "action_upload").pack(side="left", padx=(0, 6))
+        self._selection_button(sync_actions, "create_remote_folder", "Create Remote Folder", self.create_selected_remote_folder, "action_create_folder").pack(side="left", padx=(0, 6))
+        self._selection_button(sync_actions, "download", "Download Remote", self.download_remote, "action_download").pack(side="left", padx=(0, 6))
+        self._selection_button(sync_actions, "resolve", "Resolve Changed", self.resolve_changed, "action_resolve").pack(side="left")
+
+        item_actions = ttk.LabelFrame(actions, text="Item", padding=(6, 4))
+        item_actions.pack(side="left")
+        self._selection_button(item_actions, "details", "Details", self.show_selected_details, "action_details").pack(side="left", padx=(0, 6))
+        self._selection_button(item_actions, "delete_local", "Delete Local", self.delete_local, "action_delete").pack(side="left", padx=(0, 6))
+        self._selection_button(item_actions, "trash_remote", "Trash Remote", self.trash_remote, "action_trash").pack(side="left")
 
         table_frame = ttk.Frame(self.root, padding=(10, 4))
         table_frame.grid(row=2, column=0, sticky="nsew")
@@ -169,6 +178,7 @@ class SyncGui:
             "action_same": self._create_action_icon("same"),
             "action_sync": self._create_action_icon("sync"),
             "action_upload": self._create_action_icon("upload"),
+            "action_create_folder": self._create_action_icon("create_folder"),
             "action_download": self._create_action_icon("download"),
             "action_resolve": self._create_action_icon("resolve"),
             "action_details": self._create_action_icon("details"),
@@ -238,6 +248,11 @@ class SyncGui:
             draw.line((9, 14, 9, 4), fill=green, width=3)
             draw.polygon([(4, 8), (9, 3), (14, 8)], fill=green)
             draw.line((4, 15, 14, 15), fill=gray, width=2)
+        elif kind == "create_folder":
+            draw.rounded_rectangle((2, 7, 14, 15), radius=2, fill="#f4c542", outline="#b0831e")
+            draw.rounded_rectangle((2, 5, 8, 9), radius=1, fill="#efc85a", outline="#b0831e")
+            draw.line((13, 4, 13, 12), fill=green, width=2)
+            draw.line((9, 8, 17, 8), fill=green, width=2)
         elif kind == "download":
             draw.line((9, 4, 9, 14), fill=blue, width=3)
             draw.polygon([(4, 10), (9, 15), (14, 10)], fill=blue)
@@ -281,7 +296,7 @@ class SyncGui:
 
         def work():
             if clear_cache:
-                self.syncer.clear_memory_cache()
+                self.syncer.clear_memory_cache(remote_root)
             return self.syncer.diff(local_root, remote_root, progress=self._queue_diff_progress)
 
         def done(result: DiffResult):
@@ -409,6 +424,14 @@ class SyncGui:
         entries = self._selected_entries() or self.result.only_local
         self._apply_entries(entries, self.syncer._handle_only_local, "Upload selected local-only entries?")
 
+    def create_selected_remote_folder(self) -> None:
+        selected = self._selected_entries()
+        if len(selected) != 1 or not self._can_create_remote_folder(selected[0]):
+            messagebox.showinfo("Create Remote Folder", "Select one local-only folder with an existing remote parent.", parent=self.root)
+            return
+
+        self._confirm_create_remote_folder(selected[0])
+
     def download_remote(self) -> None:
         entries = self._selected_entries() or self.result.only_remote
         self._apply_entries(entries, self.syncer._handle_only_remote, "Download selected remote-only entries?")
@@ -509,6 +532,8 @@ class SyncGui:
                 remote_ids.append(entry.parent_remote_id)
             for remote_id in remote_ids:
                 remote_id = str(remote_id)
+                if self.syncer.remote.is_missing_folder_id(remote_id):
+                    continue
                 if remote_id in seen:
                     continue
                 seen.add(remote_id)
@@ -605,6 +630,33 @@ class SyncGui:
         if messagebox.askyesno("Upload", f"Upload {entry_name(entry)}?", parent=self.root):
             self._run_action("Uploading selected entry...", lambda: self.syncer._handle_only_local(entry))
 
+    def _confirm_create_remote_folder(self, entry: DiffEntry) -> None:
+        if messagebox.askyesno("Create Remote Folder", f"Create remote folder {entry_name(entry)}?", parent=self.root):
+            self._run_action(
+                "Creating remote folder...",
+                lambda: self._create_remote_folder(entry),
+                password_items=self._remote_items_for_entries([entry], include_parent=True),
+            )
+
+    def _create_remote_folder(self, entry: DiffEntry) -> Folder:
+        if not self._can_create_remote_folder(entry):
+            raise ValueError(f"Cannot create remote folder for {entry_name(entry)}")
+
+        local_path = Path(entry.local_path)
+        parent_remote_id = str(entry.parent_remote_id)
+        parent = self.syncer.remote.require_cached_folder(parent_remote_id)
+        created = parent.create_subfolder(local_path.name)
+        self.syncer.remote.invalidate(parent_remote_id)
+        self.syncer.remote._cache_item(created)
+        return created
+
+    def _can_create_remote_folder(self, entry: DiffEntry) -> bool:
+        if entry.status != NodeStatus.ONLY_LOCAL or not entry.is_folder:
+            return False
+        if entry.local_path is None or entry.parent_remote_id is None:
+            return False
+        return not self.syncer.remote.is_missing_folder_id(str(entry.parent_remote_id))
+
     def _confirm_single_download(self, entry: DiffEntry) -> None:
         if messagebox.askyesno("Download", f"Download {entry_name(entry)}?", parent=self.root):
             self._run_action("Downloading selected entry...", lambda: self.syncer._handle_only_remote(entry))
@@ -628,7 +680,13 @@ class SyncGui:
 
     def _can_open_entry(self, entry: DiffEntry) -> bool:
         if entry.is_folder:
-            return entry.remote_id is not None or entry.local_path is not None
+            if entry.remote_id is not None:
+                return True
+            if entry.local_path is None:
+                return False
+
+            _local_root, remote_root = self.stack[-1]
+            return not self.syncer.remote.is_missing_folder_id(self.syncer.remote.normalize_id(remote_root))
         return entry.local is not None or entry.remote is not None
 
     def _open_entry(self, entry: DiffEntry) -> None:
@@ -651,13 +709,22 @@ class SyncGui:
             return
 
         if remote_id is None:
-            remote_id = self.syncer.remote.missing_folder_id(local_path)
+            _current_local_root, current_remote_root = self.stack[-1]
+            current_remote_id = self.syncer.remote.normalize_id(current_remote_root)
+            if self.syncer.remote.is_missing_folder_id(current_remote_id):
+                messagebox.showinfo("Open", "Create the parent remote folder before opening deeper local-only folders.", parent=self.root)
+                return
+
+            remote_id = self.syncer.remote.missing_folder_id(local_path, entry.parent_remote_id)
 
         self.stack.append((Path(local_path), remote_id))
         self._load_current_level(clear_cache=False, password_items=password_items or None)
 
     def _parent_remote_root(self, remote_root: Folder | str, parent_local_root: Path) -> Folder | str:
         remote_id = self.syncer.remote.normalize_id(remote_root)
+        if self.syncer.remote.is_missing_folder_id(remote_id):
+            _local_path, parent_remote_id = self.syncer.remote.missing_folder_info(remote_id)
+            return parent_remote_id if parent_remote_id is not None else remote_root
 
         try:
             remote_item = self.syncer.remote.require_cached_item(remote_id)
@@ -677,6 +744,10 @@ class SyncGui:
 
         if local_root.parent == local_root:
             return False
+
+        if self.syncer.remote.is_missing_folder_id(remote_id):
+            _local_path, parent_remote_id = self.syncer.remote.missing_folder_info(remote_id)
+            return parent_remote_id is not None
 
         try:
             remote_item = self.syncer.remote.require_cached_item(remote_id)
@@ -871,6 +942,7 @@ class SyncGui:
         states = {
             "sync_all": not selected,
             "upload": bool(local_only_selected) and len(local_only_selected) == len(selected),
+            "create_remote_folder": len(selected) == 1 and self._can_create_remote_folder(selected[0]),
             "download": bool(remote_only_selected) and len(remote_only_selected) == len(selected),
             "resolve": bool(changed_file_selected) and len(changed_file_selected) == len(selected),
             "details": len(selected) == 1,
@@ -890,6 +962,11 @@ class SyncGui:
 
     def _current_sync_breadcrumbs(self, remote_root: Folder | str):
         remote_id = self.syncer.remote.normalize_id(remote_root)
+        if self.syncer.remote.is_missing_folder_id(remote_id):
+            local_path, parent_remote_id = self.syncer.remote.missing_folder_info(remote_id)
+            if parent_remote_id is None:
+                return [(remote_id, local_path.name)]
+            return [*self._current_sync_breadcrumbs(parent_remote_id), (remote_id, local_path.name)]
 
         try:
             remote_item = self.syncer.remote.require_cached_item(remote_id)
@@ -981,6 +1058,9 @@ class SyncGui:
         return item if isinstance(item, Folder) else None
 
     def _remote_item_by_id(self, remote_id: str) -> Item | None:
+        if self.syncer.remote.is_missing_folder_id(str(remote_id)):
+            return None
+
         try:
             return self.syncer.remote.require_cached_item(remote_id)
         except KeyError:
