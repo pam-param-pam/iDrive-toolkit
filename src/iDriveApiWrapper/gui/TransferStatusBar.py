@@ -9,7 +9,7 @@ from ..syncer.progress import TransferProgress, TransferProgressPhase
 
 
 class TransferStatusBar:
-    SPEED_SMOOTHING = 0.3
+    SPEED_SMOOTHING = 0.12
     POLL_MS = 500
 
     def __init__(self, parent: tk.Misc, *, abort_icon: tk.PhotoImage | None, abort_command: Callable[[], None]):

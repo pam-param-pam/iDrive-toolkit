@@ -4,6 +4,7 @@
 /xbruteforce.py
 /downloads/
 /auth_token.json
+/dev_clients.json
 /bot.py
 /cleaner.py
 /websocket-teset.py

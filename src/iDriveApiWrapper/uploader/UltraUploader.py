@@ -20,7 +20,7 @@ from ..utils.autoScaler.AutoScalePolicy import AutoScalePolicy
 from ..utils.autoScaler.AutoScaler import AutoScaler
 
 DOWNLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
-    scale_up_step=2,
+    scale_up_step=1,
     scale_down_step=1,
 
     scale_up_window=4,

@@ -50,7 +50,7 @@ class SyncBoundaryError(RuntimeError):
 
 
 class Syncer:
-    TRANSFER_SPEED_SMOOTHING = 0.3
+    TRANSFER_SPEED_SMOOTHING = 0.12
 
     def __init__(self, get_uploader: Callable[[], object], get_downloader: Callable[[], object]):
         self._uploader_factory = get_uploader

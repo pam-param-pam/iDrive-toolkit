@@ -11,6 +11,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
+from ..Config import APIConfig
 from ..iDrive import Client
 from ..exceptions import BackendMissingOrIncorrectResourcePasswordError
 from ..models.File import File
@@ -38,16 +39,20 @@ class BrowserGuiApp:
         self.folder_stack: list[Folder] = []
         self.items: dict[str, Item] = {}
         self.icons: dict[str, tk.PhotoImage] = {}
-        self.config_path = IdriveStorage().get_config_file("remote-browser.json")
+        self.storage = IdriveStorage()
+        self.config_path = self.storage.get_config_file("remote-browser.json")
+        self.auth_path = self.storage.get_auth_file("remote-browser.json")
         self.config = self._load_config()
+        self.auth = self._load_auth()
         self._busy = False
         self._active_transfer = None
         self._active_transfer_lock = threading.Lock()
         self._transfer_cancelled = False
         self._ui_queue: queue.Queue[tuple] = queue.Queue()
 
-        self._build_login()
         self._poll_ui_queue()
+        if not self._try_cached_login():
+            self._build_login()
 
     def run(self) -> None:
         self.root.mainloop()
@@ -75,14 +80,18 @@ class BrowserGuiApp:
         password_entry.grid(row=2, column=1, sticky="ew", pady=6)
         password_entry.bind("<Return>", lambda _event: self.login())
 
-        self.force_login_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(panel, text="Force login", variable=self.force_login_var).grid(row=3, column=1, sticky="w", pady=(4, 12))
-
         self.login_button = ttk.Button(panel, text="Login", command=self.login)
-        self.login_button.grid(row=4, column=1, sticky="e")
+        self.login_button.grid(row=3, column=1, sticky="e", pady=(4, 0))
 
         self.login_status_var = tk.StringVar(value="")
-        ttk.Label(panel, textvariable=self.login_status_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Label(panel, textvariable=self.login_status_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+    def _build_startup(self, status: str) -> None:
+        self._clear_root()
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        self.login_status_var = tk.StringVar(value=status)
+        ttk.Label(self.root, textvariable=self.login_status_var, padding=24).grid(row=0, column=0)
 
     def _build_browser(self) -> None:
         self._clear_root()
@@ -110,6 +119,8 @@ class BrowserGuiApp:
         self.rename_button.pack(side="left", padx=(0, 6))
         self.trash_button = self._button(actions, "Move to Trash", self.trash_selected, "action_trash")
         self.trash_button.pack(side="left", padx=(0, 6))
+        self.logout_button = self._button(actions, "Logout", self.logout, "action_logout")
+        self.logout_button.pack(side="right")
 
         self.breadcrumbs = BreadcrumbsBar(self.root, self._navigate_breadcrumb)
         self.breadcrumbs.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 0))
@@ -157,7 +168,6 @@ class BrowserGuiApp:
         base_url = self.base_url_var.get().strip()
         username = self.username_var.get().strip()
         password = self.password_var.get()
-        force_login = self.force_login_var.get()
 
         if not base_url or not username or not password:
             messagebox.showinfo("Login", "Base URL, username, and password are required.", parent=self.root)
@@ -170,18 +180,14 @@ class BrowserGuiApp:
         self._save_config()
 
         def work():
-            client = Client.login(base_url, username, password, force_login=force_login)
-            syncer = client.get_syncer()
-            root_folder = client.get_root()
-            syncer.remote.get_item(root_folder)
-            list(syncer.remote.list_children(root_folder))
-            return client, syncer, root_folder
+            return self._bootstrap_client(Client.login(base_url, username, password))
 
         self._run_worker(work, self._login_done, self._login_failed)
 
     def _login_done(self, result: tuple[Client, Syncer, Folder]) -> None:
         self.client, self.syncer, self.current_folder = result
         self.folder_stack = [self.current_folder]
+        self._save_auth_from_client()
         self._set_busy(False, "Ready")
         self._build_browser()
         self._render_folder()
@@ -191,6 +197,66 @@ class BrowserGuiApp:
         self.login_button.configure(state="normal")
         self.login_status_var.set(str(exc))
         messagebox.showerror("Login failed", str(exc), parent=self.root)
+
+    def _try_cached_login(self) -> bool:
+        token = self.auth.get("auth_token")
+        device_id = self.auth.get("device_id")
+        base_url = self.auth.get("base_url") or self.config.get("base_url")
+        if not token or not device_id or not base_url:
+            return False
+
+        self._build_startup("Signing in...")
+
+        def work():
+            Client._validate_and_set_base(base_url)
+            return self._bootstrap_client(Client(base_url, token, device_id))
+
+        self._run_worker(work, self._login_done, self._cached_login_failed)
+        return True
+
+    def _cached_login_failed(self, exc: Exception) -> None:
+        self.client = None
+        self.syncer = None
+        self.current_folder = None
+        self._clear_auth()
+        self._set_busy(False, "")
+        self._build_login()
+        self.login_status_var.set("Saved login expired. Sign in again.")
+
+    def _bootstrap_client(self, client: Client) -> tuple[Client, Syncer, Folder]:
+        syncer = client.get_syncer()
+        root_folder = client.get_root()
+        syncer.remote.get_item(root_folder)
+        list(syncer.remote.list_children(root_folder))
+        return client, syncer, root_folder
+
+    def logout(self) -> None:
+        if self._busy:
+            return
+
+        client = self.client
+        self._set_busy(True, "Logging out...")
+
+        def work():
+            if client is not None:
+                client.logout()
+
+        self._run_worker(work, lambda _result: self._logout_done(), self._logout_failed)
+
+    def _logout_done(self) -> None:
+        self.client = None
+        self.syncer = None
+        self.current_folder = None
+        self.folder_stack = []
+        self.items.clear()
+        self._clear_auth()
+        self._set_busy(False, "")
+        self._build_login()
+        self.login_status_var.set("Logged out.")
+
+    def _logout_failed(self, exc: Exception) -> None:
+        self._logout_done()
+        self.login_status_var.set(f"Logged out locally. Server logout failed: {exc}")
 
     def refresh(self) -> None:
         if self.current_folder is None or self._busy:
@@ -426,7 +492,7 @@ class BrowserGuiApp:
             for node in self.syncer.remote.list_children(self.current_folder)
         ]
         children.sort(key=lambda item: (not item.is_dir, item.name.lower()))
-        self.breadcrumbs.set_items(self._safe_breadcrumbs(self.current_folder))
+        self.breadcrumbs.set_items(self.current_folder.breadcrumbs)
         for index, item in enumerate(children):
             row_id = str(index)
             self.items[row_id] = item
@@ -437,7 +503,7 @@ class BrowserGuiApp:
                 image=self.icons["folder" if item.is_dir else file_icon_key(item.name)],
                 values=(
                     item.name,
-                    "" if item.is_dir else self._format_bytes(getattr(item, "size", None)),
+                    "" if item.is_dir else self._format_bytes(item.size),
                     self._format_datetime(item.last_modified_at),
                     item.id,
                 ),
@@ -496,13 +562,13 @@ class BrowserGuiApp:
     def _update_selection_actions(self) -> None:
         selected = self._selected_items()
         folder_selected = len(selected) == 1 and isinstance(selected[0], Folder)
-        if hasattr(self, "download_button"):
+        if self._widget_exists(getattr(self, "download_button", None)):
             self.download_button.configure(state="normal" if selected and not self._busy else "disabled")
-        if hasattr(self, "sync_button"):
+        if self._widget_exists(getattr(self, "sync_button", None)):
             self.sync_button.configure(state="normal" if folder_selected and not self._busy else "disabled")
-        if hasattr(self, "rename_button"):
+        if self._widget_exists(getattr(self, "rename_button", None)):
             self.rename_button.configure(state="normal" if len(selected) == 1 and not self._busy else "disabled")
-        if hasattr(self, "trash_button"):
+        if self._widget_exists(getattr(self, "trash_button", None)):
             self.trash_button.configure(state="normal" if selected and not self._busy else "disabled")
 
     def _operation_done(self, message: str, *, refresh: bool = False) -> None:
@@ -537,12 +603,6 @@ class BrowserGuiApp:
 
         if self._prompt_resource_password(item):
             retry()
-
-    def _safe_breadcrumbs(self, folder: Folder):
-        breadcrumbs = getattr(folder, "_breadcrumbs", None)
-        if breadcrumbs:
-            return breadcrumbs
-        return [(folder.id, safe_item_label(folder))]
 
     def _prompt_resource_password(self, item: Item) -> bool:
         return prompt_resource_password(self.root, item, self._remember_resource_password)
@@ -589,13 +649,13 @@ class BrowserGuiApp:
         if hasattr(self, "login_status_var"):
             self.login_status_var.set(status)
 
-        for name in ("back_button", "refresh_button", "download_button", "sync_button", "upload_file_button", "upload_folder_button", "rename_button", "trash_button"):
+        for name in ("back_button", "refresh_button", "download_button", "sync_button", "upload_file_button", "upload_folder_button", "rename_button", "trash_button", "logout_button"):
             button = getattr(self, name, None)
-            if button is not None:
+            if self._widget_exists(button):
                 button.configure(state="disabled" if busy else "normal")
-        if not busy and hasattr(self, "sync_button"):
+        if not busy and self._widget_exists(getattr(self, "sync_button", None)):
             self._update_selection_actions()
-        if hasattr(self, "transfer_status"):
+        if hasattr(self, "transfer_status") and self._widget_exists(getattr(self.transfer_status, "parent", None)):
             with self._active_transfer_lock:
                 has_transfer = self._active_transfer is not None
             self.transfer_status.set_abort_enabled(busy and has_transfer)
@@ -603,6 +663,31 @@ class BrowserGuiApp:
     def _clear_root(self) -> None:
         for child in self.root.winfo_children():
             child.destroy()
+        for name in (
+            "back_button",
+            "refresh_button",
+            "download_button",
+            "sync_button",
+            "upload_file_button",
+            "upload_folder_button",
+            "rename_button",
+            "trash_button",
+            "logout_button",
+            "login_button",
+            "table",
+            "breadcrumbs",
+            "transfer_status",
+        ):
+            if hasattr(self, name):
+                setattr(self, name, None)
+
+    def _widget_exists(self, widget) -> bool:
+        if widget is None:
+            return False
+        try:
+            return bool(widget.winfo_exists())
+        except tk.TclError:
+            return False
 
     def _show_callback_exception(self, exc_type, exc, tb) -> None:
         traceback.print_exception(exc_type, exc, tb)
@@ -621,6 +706,31 @@ class BrowserGuiApp:
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.config_path, "w", encoding="utf-8") as f:
             json.dump(self.config, f, indent=2, sort_keys=True)
+
+    def _load_auth(self) -> dict:
+        if not self.auth_path.exists():
+            return {}
+        try:
+            with open(self.auth_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_auth_from_client(self) -> None:
+        self.auth = {
+            "base_url": APIConfig.base_url,
+            "username": self.config.get("username") or self.auth.get("username", ""),
+            "auth_token": APIConfig.token,
+            "device_id": APIConfig.device_id,
+        }
+        self.auth_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.auth_path, "w", encoding="utf-8") as f:
+            json.dump(self.auth, f, indent=2, sort_keys=True)
+
+    def _clear_auth(self) -> None:
+        self.auth = {}
+        if self.auth_path.exists():
+            self.auth_path.unlink()
 
     def _create_icons(self) -> dict[str, tk.PhotoImage]:
         return {
@@ -643,6 +753,7 @@ class BrowserGuiApp:
             "action_rename": self._create_action_icon("rename"),
             "action_trash": self._create_action_icon("trash"),
             "action_cancel": self._create_action_icon("cancel"),
+            "action_logout": self._create_action_icon("logout"),
         }
 
     def _button(self, parent, text: str, command, icon_key: str) -> ttk.Button:
@@ -721,6 +832,10 @@ class BrowserGuiApp:
             draw.ellipse((3, 3, 15, 15), outline=red, width=2)
             draw.line((6, 6, 12, 12), fill=red, width=2)
             draw.line((12, 6, 6, 12), fill=red, width=2)
+        elif kind == "logout":
+            draw.rectangle((3, 4, 10, 14), outline=gray, width=2)
+            draw.line((9, 9, 15, 9), fill=red, width=2)
+            draw.polygon([(13, 6), (16, 9), (13, 12)], fill=red)
         return ImageTk.PhotoImage(image)
 
     def _set_active_transfer(self, direction: str, transfer) -> None:

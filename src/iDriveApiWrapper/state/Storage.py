@@ -172,10 +172,6 @@ def safe_open(path: Path, mode: str, **kwargs):
         f.close()
 
 
-# -------------------------
-# Optional: Safe persistent ops
-# -------------------------
-
 @contextmanager
 def persistent_open(path: Path, mode: str, **kwargs):
     _ensure_within_persistent(path)

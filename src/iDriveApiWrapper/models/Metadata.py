@@ -23,13 +23,13 @@ class PhotoMetadata:
 
 class VideoMetadata:
     def __init__(self, data):
-        self._brands: Optional[str, None] = None
-        self._mime: Optional[str, None] = None
-        self._has_IOD: Optional[bool, None] = None
-        self._has_moov: Optional[bool, None] = None
-        self._is_progressive: Optional[bool, None] = None
-        self._is_fragmented: Optional[bool, None] = None
-        self._tracks: Optional[list, None] = None
+        self._brands: Optional[str] = None
+        self._mime: Optional[str] = None
+        self._has_IOD: Optional[bool] = None
+        self._has_moov: Optional[bool] = None
+        self._is_progressive: Optional[bool] = None
+        self._is_fragmented: Optional[bool] = None
+        self._tracks: Optional[list] = None
 
         self._video_tracks: list[VideoTrackTuple] = []
         self._audio_tracks: list[AudioTrackTuple] = []

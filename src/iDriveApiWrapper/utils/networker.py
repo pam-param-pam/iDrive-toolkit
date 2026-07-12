@@ -28,7 +28,7 @@ def make_request(method: str, endpoint: str, data: dict = None, headers: dict = 
     headers = {k: v for k, v in (headers or {}).items() if v is not None}
     headers.update(_get_headers())
 
-    SENSITIVE_HEADERS = {"authorization"}
+    SENSITIVE_HEADERS = {"authorization", "x-resource-password"}
     safe_headers = {
         key: (_mask_preserving_spaces(value) if key.lower() in SENSITIVE_HEADERS else value)
         for key, value in headers.items()

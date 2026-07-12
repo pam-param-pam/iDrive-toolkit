@@ -5,19 +5,17 @@ from urllib.parse import urlparse, urlunparse
 from .Config import APIConfig
 from .deduplicater import Deduplicater
 from .downloader.UltraDownloader import UltraDownloader
-from .exceptions import BackendUnauthorizedError, BackendResourceNotFoundError
+from .exceptions import BackendResourceNotFoundError
 from .models.DiscordSettings import DiscordSettings
 from .models.File import File
 from .models.Folder import Folder
 from .models.Item import Item
-from .models.ItemsList import ItemsList
 from .models.Share import Share
 from .models.UserProfile import UserProfile
 from .state.Storage import IdriveStorage, set_storage
 from .syncer.Syncer import Syncer
 from .uploader.UltraUploader import UltraUploader
 from .utils import common
-from .utils.AuthClient import AuthClient
 from .utils.WebsocketManager import WebsocketManager
 from .utils.networker import make_request
 
@@ -38,9 +36,7 @@ logger.addHandler(console_handler)
 
 
 class Client:
-    def __init__(self, _internal: bool, base_url: str, token: str, device_id: str):
-        if not _internal:
-            raise RuntimeError("Use login() instead.")
+    def __init__(self, base_url: str, token: str, device_id: str):
         set_storage(IdriveStorage())
         APIConfig.base_url = base_url
         APIConfig.token = token
@@ -97,41 +93,34 @@ class Client:
         APIConfig.base_ws = base_ws
 
     @classmethod
-    def login(cls, base_url: str, username: str, password: str, force_login: bool = False) -> "Client":
+    def login(cls, base_url: str, username: str, password: str) -> "Client":
         set_storage(IdriveStorage())
 
         cls._validate_and_set_base(base_url)
-        # todo make sure the file stores the auth token per username and password(hash perhaps both idk)
-        token, device_id = AuthClient.login(username, password, force_login)
-        try:
-            APIConfig.token = token
-            make_request("GET", "user/me")
-        except BackendUnauthorizedError as e:
-            logger.info("Cached auth_token is invalid. Attempting to log you in")
-            APIConfig.token = None
-            token, device_id = AuthClient.login(username, password, force_login=True)
 
-        return cls(_internal=True, base_url=base_url, token=token, device_id=device_id)
+        data = make_request("POST", "auth/token/login", data={"username": username, "password": password})
+        token = data["auth_token"]
+        device_id = data["device_id"]
 
-    def logout(self):
-        # todo
-        pass
+        return cls(base_url=base_url, token=token, device_id=device_id)
 
-    def get_root(self):
+    def logout(self) -> None:
+        make_request("POST", "auth/token/logout")
+        APIConfig.token = None
+        APIConfig.device_id = None
+
+    def get_root(self) -> Folder:
         return Folder(self.get_user_profile().user.root)
 
-    def search(self, query: str, files: bool = True, folders: bool = True, type: str = "", extension: str = "", max_results: int = 50) -> ItemsList:
-        # todo
-        pass
-        # data = make_request("GET", "user/search", params={"query": query, "files": files, "folder": folders, "type": type, "extension": extension, "resultsLimit": max_results})
-        # return Folder._parse_children(None, data)
+    def get_search_builder(self):
+        raise NotImplementedError()
 
     def get_trash(self) -> Union[List[Union[Folder, File]], None]:
         data = make_request("GET", "user/trash")
         data = data['trash']
         return Folder._parse_children(None, data)
 
-    def get_file(self, file_id: str, password: str = None, check: bool = True) -> File:
+    def get_file(self, file_id: str, password: Optional[str] = None, check: bool = True) -> File:
         file = File(file_id)
         file.set_password(password)
         if not password:
@@ -140,7 +129,7 @@ class Client:
             file._fetch_data()
         return file
 
-    def get_folder(self, folder_id: str, password: str = None, check: bool = True) -> Folder:
+    def get_folder(self, folder_id: str, password: Optional[str] = None, check: bool = True) -> Folder:
         folder = Folder(folder_id)
         folder.set_password(password)
         if not password:

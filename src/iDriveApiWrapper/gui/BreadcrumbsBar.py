@@ -16,7 +16,7 @@ class BreadcrumbsBar(ttk.Frame):
         self.command = command
         self._items: list[tuple[str, str]] = []
 
-    def set_items(self, breadcrumbs: Iterable[BreadcrumbLike | tuple[str, str]]) -> None:
+    def set_items(self, breadcrumbs: Iterable[BreadcrumbLike]) -> None:
         self._items = [self._normalize(item) for item in breadcrumbs]
         self._render()
 
@@ -41,7 +41,7 @@ class BreadcrumbsBar(ttk.Frame):
             ).pack(side="left")
 
     @staticmethod
-    def _normalize(item: BreadcrumbLike | tuple[str, str]) -> tuple[str, str]:
+    def _normalize(item: BreadcrumbLike) -> tuple[str, str]:
         if isinstance(item, tuple):
             return str(item[0]), str(item[1])
         return str(item.id), str(item.name)
