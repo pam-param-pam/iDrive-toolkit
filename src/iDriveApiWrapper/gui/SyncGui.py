@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from .TransferStatusBar import TransferStatusBar
 
 
 TK_STOP_EVENT = "break"
+logger = logging.getLogger("iDrive")
 
 
 class SyncGui:
@@ -1023,6 +1025,7 @@ class SyncGui:
             except BackendMissingOrIncorrectResourcePasswordError:
                 self.root.after(0, lambda: self._worker_password_required(status, work, done, password_items))
             except Exception as exc:
+                logger.exception("Something failed.", exc_info=exc)
                 self.root.after(0, lambda exc=exc: self._worker_failed("Error", exc))
             else:
                 self.root.after(0, lambda: self._worker_done(done, result))

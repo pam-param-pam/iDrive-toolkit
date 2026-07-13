@@ -1,5 +1,4 @@
 from ..models.Resource import Resource
-from ..utils.networker import make_request
 
 
 class Fragment(Resource):

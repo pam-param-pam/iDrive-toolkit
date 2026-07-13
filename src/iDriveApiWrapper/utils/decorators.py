@@ -1,6 +1,9 @@
 from __future__ import annotations
+
+import logging
 from functools import wraps
 
+logger = logging.getLogger("iDrive")
 
 def autoFetchProperty(fetch_method_name: str):
     """Decorator for lazy-loading properties with a specified fetch function."""
@@ -29,7 +32,7 @@ def autoFetchProperty(fetch_method_name: str):
 
             # Call the fetch function
             if getattr(self, attr_name) is None or refresh:
-                print(f"Calling fetch func from within decorator. Attribute: {attr_name}, refresh={refresh}")
+                logger.debug(f"Calling fetch func from within decorator. Attribute: {attr_name}, refresh={refresh}")
                 setattr(self, running_flag_name, True)
                 try:
                     fetch_func()

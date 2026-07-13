@@ -100,8 +100,7 @@ class FileSaverWorker:
             self._on_backend_save(files)
 
         except Exception as exc:
-            logger.error("Save failed")
-            print(exc)
+            logger.exception(f"Save failed for files: {files}")
             self._on_backend_save_error(files, exc)
 
     # ---------------- result handling ----------------

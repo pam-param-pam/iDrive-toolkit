@@ -50,7 +50,7 @@ class AutoScaler:
         step = self.policy.scale_up_step
         added = 0
         logger.info(
-            "[AutoScaler] Scale UP requested step=%s current=%s min=%s max=%s",
+            "Scale UP requested step=%s current=%s min=%s max=%s",
             step,
             self.current,
             self.policy.min_workers,
@@ -58,17 +58,17 @@ class AutoScaler:
         )
         for _ in range(step):
             if self.current >= self.policy.max_workers:
-                logger.info(f"[AutoScaler] Wanted scale UP but already at max={self.policy.max_workers}")
+                logger.info(f"Wanted scale UP but already at max={self.policy.max_workers}")
                 break
 
             try:
                 result = spawn_func()
             except Exception:
-                logger.exception("[AutoScaler] Failed to spawn worker")
+                logger.exception("Failed to spawn worker")
                 break
 
-            if result is False:
-                logger.info("[AutoScaler] Spawn callback declined scale UP")
+            if not result:
+                logger.info("Spawn callback declined scale UP")
                 break
 
             self.current += 1
@@ -76,7 +76,7 @@ class AutoScaler:
 
         if added:
             self._last_scale_up_time = time.time()
-            logger.info(f"[AutoScaler] Scaled UP -> workers={self.current}")
+            logger.info(f"Scaled UP -> workers={self.current}")
 
         return added
 
@@ -84,7 +84,7 @@ class AutoScaler:
         step = self.policy.scale_down_step
         removed = 0
         logger.info(
-            "[AutoScaler] Scale DOWN requested step=%s current=%s min=%s max=%s",
+            "Scale DOWN requested step=%s current=%s min=%s max=%s",
             step,
             self.current,
             self.policy.min_workers,
@@ -92,17 +92,17 @@ class AutoScaler:
         )
         for _ in range(step):
             if self.current <= self.policy.min_workers:
-                logger.info(f"[AutoScaler] Wanted scale DOWN but already at min={self.policy.min_workers}")
+                logger.info(f"Wanted scale DOWN but already at min={self.policy.min_workers}")
                 break
 
             try:
                 result = kill_func()
             except Exception:
-                logger.exception("[AutoScaler] Failed to stop worker")
+                logger.exception("Failed to stop worker")
                 break
 
-            if result is False:
-                logger.info("[AutoScaler] Stop callback declined scale DOWN")
+            if not result:
+                logger.info("Stop callback declined scale DOWN")
                 break
 
             self.current -= 1
@@ -110,7 +110,7 @@ class AutoScaler:
 
         if removed:
             self._last_scale_down_time = time.time()
-            logger.info(f"[AutoScaler] Scaled DOWN -> workers={self.current}")
+            logger.info(f"Scaled DOWN -> workers={self.current}")
 
         return removed
 
@@ -120,7 +120,7 @@ class AutoScaler:
 
     def start(self, spawn_func, kill_func):
         logger.info(
-            "[AutoScaler] Starting initial=%s min=%s max=%s up_step=%s down_step=%s "
+            "Starting initial=%s min=%s max=%s up_step=%s down_step=%s "
             "up_window=%s down_window=%s up_improvement=%.3f plateau=%.3f "
             "hard_error_grace=%s hard_error_cooldown=%.1fs hard_error_backoff=%.1fs "
             "scale_up_cooldown=%.1fs scale_down_cooldown=%.1fs sample_interval=%.1fs",
@@ -145,7 +145,7 @@ class AutoScaler:
         return t
 
     def _loop(self, spawn_func, kill_func):
-        logger.info("[AutoScaler] Started autoscaling loop")
+        logger.info("Started autoscaling loop")
 
         while not self._stop_event.is_set():
             if not self._pause_event.wait(timeout=0.5):
@@ -167,7 +167,7 @@ class AutoScaler:
             with self.lock:
                 if now < self._backoff_until:
                     logger.info(
-                        "[AutoScaler] Sample skipped during backoff workers=%s rate=%.1fB/s "
+                        "Sample skipped during backoff workers=%s rate=%.1fB/s "
                         "errors=%s backoff_remaining=%.1fs",
                         self.current,
                         rate,
@@ -178,7 +178,7 @@ class AutoScaler:
                     continue
 
                 if self.policy.should_react_to_hard_errors(hard_errors):
-                    logger.warning(f"[AutoScaler] Hard throttling ({hard_errors}) -> entering backoff")
+                    logger.warning(f"Hard throttling ({hard_errors}) -> entering backoff")
 
                     if can_scale_down:
                         self._decrease_workers(kill_func)
@@ -197,7 +197,7 @@ class AutoScaler:
 
                 if self._should_roll_back_probe() and can_scale_down:
                     logger.info(
-                        "[AutoScaler] Scale-up probe did not improve throughput enough "
+                        "Scale-up probe did not improve throughput enough "
                         f"(reference={self._probe_reference_rate:.1f}, best={self._best_rate_since_scale:.1f})"
                     )
                     if self._decrease_workers(kill_func):
@@ -211,7 +211,7 @@ class AutoScaler:
                     and can_scale_down
                 ):
                     logger.info(
-                        f"[AutoScaler] Throughput fell below best rate -> scale DOWN "
+                        f"Throughput fell below best rate -> scale DOWN "
                         f"(rate={rate:.1f}, best={self._best_rate:.1f})"
                     )
                     if self._decrease_workers(kill_func):
@@ -225,7 +225,7 @@ class AutoScaler:
 
                 if self._should_accept_probe():
                     logger.info(
-                        "[AutoScaler] Scale-up probe accepted "
+                        "Scale-up probe accepted "
                         f"(reference={self._probe_reference_rate:.1f}, best={self._best_rate_since_scale:.1f})"
                     )
                     self._best_rate = max(self._best_rate, self._best_rate_since_scale)
@@ -242,10 +242,7 @@ class AutoScaler:
                     and can_scale_up
                 ):
                     reference_rate = max(rate, self._best_rate)
-                    logger.info(
-                        f"[AutoScaler] Throughput is healthy -> probing scale UP "
-                        f"(rate={rate:.1f}, best={self._best_rate:.1f})"
-                    )
+                    logger.info(f"Throughput is healthy -> probing scale UP (rate={rate:.1f}, best={self._best_rate:.1f})")
                     if self._increase_workers(spawn_func):
                         self._start_probe(reference_rate)
                     continue
@@ -257,18 +254,11 @@ class AutoScaler:
 
                 self._last_rate = rate
 
-        logger.info("[AutoScaler] Exiting autoscaling loop")
+        logger.info("Exiting autoscaling loop")
 
-    def _log_sample(
-        self,
-        *,
-        rate: float,
-        hard_errors: int,
-        can_scale_up: bool,
-        can_scale_down: bool,
-    ) -> None:
+    def _log_sample(self, rate: float, hard_errors: int, can_scale_up: bool, can_scale_down: bool) -> None:
         logger.info(
-            "[AutoScaler] Sample workers=%s min=%s max=%s rate=%.1fB/s last=%.1fB/s "
+            "Sample workers=%s min=%s max=%s rate=%.1fB/s last=%.1fB/s "
             "best=%.1fB/s healthy=%s/%s low=%s/%s hard_errors=%s "
             "probe_ref=%s probe_best=%.1fB/s probe_samples=%s "
             "can_up=%s can_down=%s paused=%s backoff=%s",
@@ -301,7 +291,7 @@ class AutoScaler:
         if not can_scale_up:
             reasons.append("cooldown")
         logger.info(
-            "[AutoScaler] Scale UP conditions reached but blocked reasons=%s workers=%s max=%s rate=%.1fB/s",
+            "Scale UP conditions reached but blocked reasons=%s workers=%s max=%s rate=%.1fB/s",
             ",".join(reasons) if reasons else "unknown",
             self.current,
             self.policy.max_workers,
@@ -315,7 +305,7 @@ class AutoScaler:
         if not can_scale_down:
             reasons.append("cooldown")
         logger.info(
-            "[AutoScaler] Scale DOWN conditions reached but blocked reasons=%s workers=%s min=%s",
+            "Scale DOWN conditions reached but blocked reasons=%s workers=%s min=%s",
             ",".join(reasons) if reasons else "unknown",
             self.current,
             self.policy.min_workers,
@@ -387,11 +377,11 @@ class AutoScaler:
     # -------------------------------
 
     def pause(self):
-        logger.info("[AutoScaler] Paused")
+        logger.info("Paused")
         self._pause_event.clear()
 
     def resume(self):
-        logger.info("[AutoScaler] Resumed")
+        logger.info("Resumed")
         self._pause_event.set()
 
     def is_paused(self) -> bool:
@@ -401,7 +391,7 @@ class AutoScaler:
         return time.time() < self._backoff_until
 
     def stop(self):
-        logger.info("[AutoScaler] Stop requested")
+        logger.info("Stop requested")
         self.stop_flag = True
         self._stop_event.set()
         self._pause_event.set()  # ensure loop can exit

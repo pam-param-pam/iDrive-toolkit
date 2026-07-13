@@ -162,8 +162,7 @@ class Syncer:
         self._upload_many_and_invalidate([(local_path, remote_parent)], [remote_parent_id])
 
     def _handle_only_remote(self, entry: DiffEntry) -> None:
-        remote_item, target_dir = self._plan_only_remote_download(entry)
-        self._download(remote_item, target_dir)
+        self._download_many([self._plan_only_remote_download(entry)])
 
     def _handle_changed(self, entry: DiffEntry, strategy: ChangedFileStrategy) -> None:
         self._require_status(entry, NodeStatus.CHANGED)

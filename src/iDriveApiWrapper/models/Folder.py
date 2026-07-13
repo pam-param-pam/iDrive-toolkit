@@ -34,6 +34,7 @@ class Folder(Item):
         self._file_count: Optional[Folder] = None
         self._folder_count: Optional[Folder] = None
 
+        # _fetch_hash
         self._hash: Optional[str] = None
 
     @property
@@ -80,7 +81,6 @@ class Folder(Item):
         data = make_request("GET", f"folders/{self.id}", headers=self._get_password_header())
         self._set_data(data['folder'])
         self._set_breadcrumbs(data['breadcrumbs'])
-        self._fetched = True
 
     def _fetch_hash(self):
         data = make_request("GET", f"folders/{self.id}/hash", headers=self._get_password_header())
@@ -99,7 +99,7 @@ class Folder(Item):
         data = make_request("POST", "folders", headers=parent._get_password_header(), data={"parent_id": parent.id, "name": name})
         folder = Folder(data['id'])
         folder._set_data(data)
-        # folder.inherit_password_from(parent)
+        folder.inherit_password_from(parent)
 
         return folder
 

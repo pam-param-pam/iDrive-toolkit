@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Optional, TYPE_CHECKING, Union
-
-from overrides import overrides
+from typing import Optional, TYPE_CHECKING
 
 from ..models.Resource import Resource
 from ..utils.decorators import autoFetchProperty

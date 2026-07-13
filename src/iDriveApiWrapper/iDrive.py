@@ -18,21 +18,23 @@ from .uploader.UltraUploader import UltraUploader
 from .utils import common
 from .utils.WebsocketManager import WebsocketManager
 from .utils.networker import make_request
+from .utils.utils import CapitalizeModuleFormatter
 
-# Create a custom logger
 logger = logging.getLogger("iDrive")
 logger.setLevel(logging.DEBUG)
 
-# Create a console handler
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)  # Set handler level to DEBUG
 
-# Define a formatter and attach it to the handler
-formatter = logging.Formatter("%(name)s: %(message)s")
-console_handler.setFormatter(formatter)
 
-# Add the handler to the logger
-logger.addHandler(console_handler)
+if not logger.handlers:
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+
+    formatter = CapitalizeModuleFormatter("[%(module_upper)s] %(message)s")
+
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+logger.propagate = False
 
 
 class Client:

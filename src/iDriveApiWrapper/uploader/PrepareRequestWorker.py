@@ -1,5 +1,5 @@
+import logging
 import time
-import traceback
 import uuid
 import zlib
 from collections import defaultdict
@@ -11,6 +11,9 @@ from .models import DiscordAttachment, DiscordRequest, UploadInput, UploadFileSt
 from .extractor import get_file_extension, _run_ffprobe, _is_type, extract_video_metadata_if_needed, extract_thumbnail_if_needed, extract_subtitles_if_needed
 from ..uploader.Encryptor import Encryptor
 from ..uploader.UploadContext import UploadContext
+
+logger = logging.getLogger("iDrive")
+
 
 class FileProfiler:
     def __init__(self, file_name: str):
@@ -33,13 +36,12 @@ class FileProfiler:
 
     def report(self):
         total = sum(self.times.values())
-
-        print(f"\n=== FILE PROFILE: {self.file_name} ===")
+        logger.debug(f"\n=== FILE PROFILE: {self.file_name} ===")
         for k, v in sorted(self.times.items(), key=lambda x: -x[1]):
             count = self.counts[k]
             avg = v / count if count else 0
             pct = (v / total * 100) if total else 0
-            print(f"{k:20} total={v:8.2f}s  avg={avg:6.4f}s  calls={count:6d}  {pct:5.1f}%")
+            logger.debug(f"{k:20} total={v:8.2f}s  avg={avg:6.4f}s  calls={count:6d}  {pct:5.1f}%")
 
 
 class _RequestBuilder:
@@ -92,10 +94,9 @@ class PrepareRequestWorker:
                         break
 
             except Exception as e:
+                logger.exception(f"Failed to prepare request on {item.path}")
                 self.ctx.add_error(e)
                 self._fail_new_request_states(initial_state_ids, e)
-                print(f"[PrepareRequestWorker] FAILED on {item.path}: {e!r}")
-                traceback.print_exc()
 
             finally:
                 self.ctx.complete_upload_request()
@@ -289,7 +290,7 @@ class PrepareRequestWorker:
 
         self.ctx.set_crc(frontend_id, overall_crc)
 
-        # prof.report()
+        prof.report()
 
         req = self._builder.flush()
         if req:
