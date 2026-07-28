@@ -16,6 +16,7 @@ class UnsafePathError(Exception):
 # -------------------------
 # Storage class
 # -------------------------
+# todo fix this and simplify dirs
 
 class IdriveStorage:
     APP_NAME = "idrive"
@@ -97,10 +98,9 @@ def set_storage(storage: IdriveStorage):
 
 def get_storage() -> IdriveStorage:
     global _current_storage
-    try:
-        return _current_storage
-    except LookupError:
-        raise RuntimeError("Storage not initialized")
+    if _current_storage is None:
+        _current_storage = IdriveStorage()
+    return _current_storage
 
 
 # -------------------------

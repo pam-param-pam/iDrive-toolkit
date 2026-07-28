@@ -217,10 +217,8 @@ class AutoScaler:
                     if self._decrease_workers(kill_func):
                         self._reset_trend(rate)
                     continue
-                elif (
-                    self._probe_reference_rate is None
-                    and self._low_rate_steps == self.policy.scale_down_window
-                ):
+
+                elif self._probe_reference_rate is None and self._low_rate_steps == self.policy.scale_down_window:
                     self._log_scale_down_blocked(can_scale_down)
 
                 if self._should_accept_probe():
@@ -246,10 +244,8 @@ class AutoScaler:
                     if self._increase_workers(spawn_func):
                         self._start_probe(reference_rate)
                     continue
-                elif (
-                    self._probe_reference_rate is None
-                    and self._healthy_steps == self.policy.scale_up_window
-                ):
+
+                elif self._probe_reference_rate is None and self._healthy_steps == self.policy.scale_up_window:
                     self._log_scale_up_blocked(rate, can_scale_up)
 
                 self._last_rate = rate
@@ -290,6 +286,7 @@ class AutoScaler:
             reasons.append("at_max")
         if not can_scale_up:
             reasons.append("cooldown")
+
         logger.info(
             "Scale UP conditions reached but blocked reasons=%s workers=%s max=%s rate=%.1fB/s",
             ",".join(reasons) if reasons else "unknown",
@@ -304,6 +301,7 @@ class AutoScaler:
             reasons.append("at_min")
         if not can_scale_down:
             reasons.append("cooldown")
+
         logger.info(
             "Scale DOWN conditions reached but blocked reasons=%s workers=%s min=%s",
             ",".join(reasons) if reasons else "unknown",
@@ -352,9 +350,7 @@ class AutoScaler:
     def _should_accept_probe(self) -> bool:
         if self._probe_reference_rate is None:
             return False
-        return self._best_rate_since_scale >= self._probe_reference_rate * (
-            1.0 + self.policy.up_improvement_factor
-        )
+        return self._best_rate_since_scale >= self._probe_reference_rate * 1.0 + self.policy.up_improvement_factor
 
     def _should_roll_back_probe(self) -> bool:
         if self._probe_reference_rate is None:

@@ -5,7 +5,15 @@ Python client utilities for the iDrive backend. The package includes object wrap
 ## Install
 
 ```powershell
-pip install -e .
+pip install iDriveApiWrapper
+```
+
+Optional feature sets:
+
+```powershell
+pip install iDriveApiWrapper[transfer]
+pip install iDriveApiWrapper[gui]
+pip install iDriveApiWrapper[all]
 ```
 
 For local development:
@@ -17,7 +25,7 @@ pip install -r dev-requirements.txt
 ## Basic Usage
 
 ```python
-from src.iDriveApiWrapper.iDrive import Client
+from iDriveApiWrapper.iDrive import Client
 
 client = Client.login(
     "https://idrive.pamparampam.dev/api",
@@ -42,7 +50,7 @@ folder.restore_from_trash()
 The remote browser provides login, browsing, upload/download, remote rename/trash actions, folder sync, cached auth, logout, and a selectable logs window.
 
 ```powershell
-python remote-browser.py
+idrive-remote-browser
 ```
 
 The browser stores UI config and auth tokens through `IdriveStorage`, under the app's local data directory.
@@ -52,7 +60,7 @@ The browser stores UI config and auth tokens through `IdriveStorage`, under the 
 Every `Client` owns a `WebsocketManager` at `client.websocket`. It connects to the authenticated `/user` WebSocket endpoint, sends `PONG` replies for server `PING` messages, reconnects after WebSocket errors, and dispatches parsed `WebsocketEvent` objects to registered callbacks.
 
 ```python
-from src.iDriveApiWrapper.iDrive import Client
+from iDriveApiWrapper.iDrive import Client
 
 client = Client.login("https://idrive.pamparampam.dev/api", "username", "password")
 
@@ -80,6 +88,7 @@ If the backend sends a `FORCE_LOGOUT` event, the manager shuts the listener down
 ## Upload and Download
 
 Use the client factories so worker limits and account settings are loaded from the backend.
+Video metadata, thumbnail, and subtitle extraction require FFmpeg tools (`ffmpeg` and `ffprobe`) to be installed and available on `PATH`.
 
 ```python
 from pathlib import Path

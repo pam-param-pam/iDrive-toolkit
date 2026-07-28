@@ -4,8 +4,8 @@ import time
 
 from tqdm import tqdm
 
-from src.iDriveApiWrapper.uploader.UltraUploader import UltraUploader
-from src.iDriveApiWrapper.uploader.models import FileUploadStatus
+from .UltraUploader import UltraUploader
+from .models import FileUploadStatus
 
 
 def _command_listener(cmd_queue: queue.Queue, stop_event: threading.Event):

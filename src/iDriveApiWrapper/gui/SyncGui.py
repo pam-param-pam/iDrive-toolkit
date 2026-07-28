@@ -9,20 +9,20 @@ import tkinter as tk
 import traceback
 import webbrowser
 from pathlib import Path
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import messagebox, ttk
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 from ..exceptions import BackendMissingOrIncorrectResourcePasswordError
 from ..syncer.BaseScanner import Node, NodeKind, NodeOrigin
 from ..syncer.DiffEngine import DiffEntry, DiffResult, NodeStatus
-from ..syncer.Syncer import ChangedFileStrategy, SyncConflictError, SyncTransferCancelled
+from ..syncer.Syncer import ChangedFileStrategy, RenamedFileStrategy, SyncConflictError, SyncTransferCancelled
 from ..syncer.formatting import conflict_summary, entry_local_label, entry_name, entry_remote_label, remote_label
 from ..syncer.progress import DiffProgress, DiffProgressPhase, TransferProgress
 from ..models.Item import Item
 from ..models.Folder import Folder
 from .BreadcrumbsBar import BreadcrumbsBar
-from .GuiUtils import file_icon_key, needs_resource_password, password_prompt_item, prompt_resource_password
+from .GuiUtils import apply_window_icon, file_icon_key, needs_resource_password, password_prompt_item, prompt_resource_password, set_windows_app_user_model_id
 from .TransferStatusBar import TransferStatusBar
 
 
@@ -30,8 +30,17 @@ TK_STOP_EVENT = "break"
 logger = logging.getLogger("iDrive")
 
 
+class SyncGuiAlreadyOpenError(RuntimeError):
+    pass
+
+
 class SyncGui:
+    _open_window: tk.Misc | None = None
+
     def __init__(self, syncer, local_root: Path, remote_root: Folder | str, parent: tk.Misc | None = None):
+        if self.__class__._open_window is not None and self.__class__._open_window.winfo_exists():
+            raise SyncGuiAlreadyOpenError("A sync window is already open.")
+
         self.syncer = syncer
         self.initial_local_root = Path(local_root).resolve()
         self.initial_remote_id = self.syncer.remote.normalize_id(remote_root)
@@ -42,16 +51,22 @@ class SyncGui:
         self.entries: list[DiffEntry] = []
         self._busy = False
         self._owns_root = parent is None
+        self._closed = False
 
+        if self._owns_root:
+            set_windows_app_user_model_id()
         self.root = tk.Tk() if self._owns_root else tk.Toplevel(parent)
+        self.__class__._open_window = self.root
         self.root.report_callback_exception = self._show_callback_exception
         self.root.title("iDrive Interactive Sync")
+        apply_window_icon(self.root)
         self.root.geometry("1300x760")
         self.root.minsize(1300, 560)
 
         self.icons = self._create_icons()
         self._build_widgets()
         self.syncer.set_transfer_progress_callback(self._queue_transfer_progress)
+        self.syncer.set_status_callback(self._queue_status)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         root_item = self._current_remote_folder()
         if root_item is not None and needs_resource_password(root_item):
@@ -67,8 +82,14 @@ class SyncGui:
             self.root.wait_window()
 
     def _on_close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self.syncer.set_transfer_progress_callback(None)
+        self.syncer.set_status_callback(None)
         self.syncer.clear_sync_boundary()
+        if self.__class__._open_window is self.root:
+            self.__class__._open_window = None
         self.root.destroy()
 
     def _show_callback_exception(self, exc_type, exc, tb) -> None:
@@ -336,6 +357,9 @@ class SyncGui:
     def _apply_transfer_progress(self, progress: TransferProgress) -> None:
         self.transfer_status.apply_sync_progress(progress)
 
+    def _queue_status(self, status: str) -> None:
+        self.root.after(0, lambda status=status: self._set_busy(True, status))
+
     def _format_bytes(self, value: int) -> str:
         return TransferStatusBar.format_bytes(value)
 
@@ -387,6 +411,7 @@ class SyncGui:
         entries.extend(result.only_local)
         entries.extend(result.only_remote)
         entries.extend(result.changed)
+        entries.extend(result.renamed)
         entries.extend(result.conflicts)
         if self.show_same:
             entries.extend(result.same)
@@ -408,19 +433,75 @@ class SyncGui:
         self._show_entry_details(selected[0])
 
     def sync_all(self) -> None:
+        selected = self._selected_entries()
+        if selected:
+            self._sync_selected_entries(selected)
+            return
+
         if self.result.conflicts:
             messagebox.showwarning("Conflicts", conflict_summary(self.result.conflicts), parent=self.root)
             return
         strategy = self._ask_changed_strategy()
         if strategy is None:
             return
+        renamed_strategy = self._ask_renamed_strategy() if self.result.renamed else RenamedFileStrategy.USE_LOCAL_NAME
+        if renamed_strategy is None:
+            return
         if not messagebox.askyesno("Sync All", "Apply all changes at this level and recurse into changed folders?", parent=self.root):
             return
         local_root, remote_root = self.stack[-1]
         self._run_action(
             "Syncing this level...",
-            lambda: self.syncer.sync_one_level(local_root, remote_root, strategy=strategy),
+            lambda: self.syncer.sync_one_level(local_root, remote_root, strategy=strategy, renamed_strategy=renamed_strategy),
         )
+
+    def _sync_selected_entries(self, entries: list[DiffEntry]) -> None:
+        conflicts = [entry for entry in entries if entry.status == NodeStatus.CONFLICT]
+        if conflicts:
+            messagebox.showwarning("Conflicts", conflict_summary(conflicts), parent=self.root)
+            return
+
+        syncable_entries = [
+            entry
+            for entry in entries
+            if entry.status in (NodeStatus.ONLY_LOCAL, NodeStatus.ONLY_REMOTE, NodeStatus.CHANGED, NodeStatus.RENAMED)
+        ]
+        if not syncable_entries:
+            messagebox.showinfo("Sync Selected", "No selected entries need syncing.", parent=self.root)
+            return
+
+        changed_entries = [entry for entry in syncable_entries if entry.status == NodeStatus.CHANGED]
+        strategy: ChangedFileStrategy | None = None
+        if changed_entries:
+            strategy = self._ask_changed_strategy()
+            if strategy is None:
+                return
+        renamed_entries = [entry for entry in syncable_entries if entry.status == NodeStatus.RENAMED]
+        renamed_strategy: RenamedFileStrategy | None = None
+        if renamed_entries:
+            renamed_strategy = self._ask_renamed_strategy()
+            if renamed_strategy is None:
+                return
+
+        if not messagebox.askyesno("Sync Selected", f"Sync {len(syncable_entries)} selected entr{'y' if len(syncable_entries) == 1 else 'ies'}?", parent=self.root):
+            return
+
+        def work():
+            for entry in syncable_entries:
+                if entry.status == NodeStatus.ONLY_LOCAL:
+                    self.syncer._handle_only_local(entry)
+                elif entry.status == NodeStatus.ONLY_REMOTE:
+                    self.syncer._handle_only_remote(entry)
+                elif entry.status == NodeStatus.CHANGED:
+                    if strategy is None:
+                        raise ValueError("Changed entry requires a changed-file strategy")
+                    self.syncer._handle_changed(entry, strategy=strategy)
+                elif entry.status == NodeStatus.RENAMED:
+                    if renamed_strategy is None:
+                        raise ValueError("Renamed entry requires a renamed-file strategy")
+                    self.syncer._handle_renamed(entry, strategy=renamed_strategy)
+
+        self._run_action("Syncing selected entries...", work, password_items=self._remote_items_for_entries(syncable_entries, include_parent=True))
 
     def upload_local(self) -> None:
         entries = self._selected_entries() or self.result.only_local
@@ -899,6 +980,7 @@ class SyncGui:
             f"local={len(self.result.only_local)}  "
             f"remote={len(self.result.only_remote)}  "
             f"changed={len(self.result.changed)}  "
+            f"renamed={len(self.result.renamed)}  "
             f"conflicts={len(self.result.conflicts)}  "
             f"same={len(self.result.same)}"
         )
@@ -942,7 +1024,7 @@ class SyncGui:
         changed_file_selected = [entry for entry in selected if entry.status == NodeStatus.CHANGED and not entry.is_folder]
 
         states = {
-            "sync_all": not selected,
+            "sync_all": True,
             "upload": bool(local_only_selected) and len(local_only_selected) == len(selected),
             "create_remote_folder": len(selected) == 1 and self._can_create_remote_folder(selected[0]),
             "download": bool(remote_only_selected) and len(remote_only_selected) == len(selected),
@@ -952,6 +1034,7 @@ class SyncGui:
             "trash_remote": bool(remote_selected) and len(remote_selected) == len(selected),
         }
 
+        self.selection_buttons["sync_all"].configure(text="Sync Selected" if selected else "Sync All")
         for action, enabled in states.items():
             self.selection_buttons[action].configure(state="normal" if enabled else "disabled")
 
@@ -989,23 +1072,114 @@ class SyncGui:
         return self.icons[file_icon_key(entry_name(entry))]
 
     def _ask_changed_strategy(self) -> ChangedFileStrategy | None:
-        choices = {
-            "newer": ChangedFileStrategy.NEWER,
-            "upload_local": ChangedFileStrategy.UPLOAD_LOCAL,
-            "download_remote": ChangedFileStrategy.DOWNLOAD_REMOTE,
-            "skip": ChangedFileStrategy.SKIP,
-            "error": ChangedFileStrategy.ERROR,
-        }
-        prompt = "Changed file strategy: newer, upload_local, download_remote, skip, error"
-        value = simpledialog.askstring("Changed Strategy", prompt, initialvalue="newer", parent=self.root)
-        if value is None:
-            return None
+        choices = [
+            ChangedFileStrategy.SKIP,
+            ChangedFileStrategy.NEWER,
+            ChangedFileStrategy.UPLOAD_LOCAL,
+            ChangedFileStrategy.DOWNLOAD_REMOTE,
+            ChangedFileStrategy.ERROR,
+        ]
+        selected: ChangedFileStrategy | None = None
 
-        strategy = choices.get(value.strip().lower())
-        if strategy is None:
-            messagebox.showerror("Changed Strategy", f"Invalid strategy: {value}", parent=self.root)
-            return None
-        return strategy
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Changed Strategy")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.columnconfigure(0, weight=1)
+
+        ttk.Label(dialog, text="Changed file strategy").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+        value_var = tk.StringVar(value=ChangedFileStrategy.SKIP.value)
+        strategy_select = ttk.Combobox(
+            dialog,
+            textvariable=value_var,
+            values=[strategy.value for strategy in choices],
+            state="readonly",
+            width=24,
+        )
+        strategy_select.grid(row=1, column=0, sticky="ew", padx=12)
+
+        buttons = ttk.Frame(dialog)
+        buttons.grid(row=2, column=0, sticky="e", padx=12, pady=12)
+
+        def accept() -> None:
+            nonlocal selected
+            selected = next((strategy for strategy in choices if strategy.value == value_var.get()), None)
+            dialog.destroy()
+
+        def cancel() -> None:
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Cancel", command=cancel).pack(side="right", padx=(6, 0))
+        ttk.Button(buttons, text="OK", command=accept).pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.bind("<Return>", lambda _event: accept())
+        dialog.bind("<Escape>", lambda _event: cancel())
+
+        self._center_dialog_on_parent(dialog)
+        strategy_select.focus_set()
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return selected
+
+    def _ask_renamed_strategy(self) -> RenamedFileStrategy | None:
+        choices = [
+            RenamedFileStrategy.USE_LOCAL_NAME,
+            RenamedFileStrategy.USE_REMOTE_NAME,
+        ]
+        selected: RenamedFileStrategy | None = None
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Renamed Strategy")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.columnconfigure(0, weight=1)
+
+        ttk.Label(dialog, text="Renamed file strategy").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+        value_var = tk.StringVar(value=RenamedFileStrategy.USE_LOCAL_NAME.value)
+        strategy_select = ttk.Combobox(
+            dialog,
+            textvariable=value_var,
+            values=[strategy.value for strategy in choices],
+            state="readonly",
+            width=24,
+        )
+        strategy_select.grid(row=1, column=0, sticky="ew", padx=12)
+
+        buttons = ttk.Frame(dialog)
+        buttons.grid(row=2, column=0, sticky="e", padx=12, pady=12)
+
+        def accept() -> None:
+            nonlocal selected
+            selected = next((strategy for strategy in choices if strategy.value == value_var.get()), None)
+            dialog.destroy()
+
+        def cancel() -> None:
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Cancel", command=cancel).pack(side="right", padx=(6, 0))
+        ttk.Button(buttons, text="OK", command=accept).pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.bind("<Return>", lambda _event: accept())
+        dialog.bind("<Escape>", lambda _event: cancel())
+
+        self._center_dialog_on_parent(dialog)
+        strategy_select.focus_set()
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return selected
+
+    def _center_dialog_on_parent(self, dialog: tk.Toplevel) -> None:
+        dialog.update_idletasks()
+        parent_x = self.root.winfo_rootx()
+        parent_y = self.root.winfo_rooty()
+        parent_width = self.root.winfo_width()
+        parent_height = self.root.winfo_height()
+        dialog_width = dialog.winfo_reqwidth()
+        dialog_height = dialog.winfo_reqheight()
+
+        x = parent_x + max((parent_width - dialog_width) // 2, 0)
+        y = parent_y + max((parent_height - dialog_height) // 2, 0)
+        dialog.geometry(f"+{x}+{y}")
 
     def _run_action(self, status: str, work, *, password_items: list[Item] | None = None) -> None:
         self._run_worker(status, work, lambda _result: self._load_current_level(clear_cache=False), password_items=password_items)

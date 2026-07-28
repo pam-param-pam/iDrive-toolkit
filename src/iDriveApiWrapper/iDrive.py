@@ -1,10 +1,11 @@
+from __future__ import annotations
+
 import logging
-from typing import Union, List, Optional
+from typing import TYPE_CHECKING, Union, List, Optional
 from urllib.parse import urlparse, urlunparse
 
 from .Config import APIConfig
 from .deduplicater import Deduplicater
-from .downloader.UltraDownloader import UltraDownloader
 from .exceptions import BackendResourceNotFoundError
 from .models.DiscordSettings import DiscordSettings
 from .models.File import File
@@ -14,11 +15,14 @@ from .models.Share import Share
 from .models.UserProfile import UserProfile
 from .state.Storage import IdriveStorage, set_storage
 from .syncer.Syncer import Syncer
-from .uploader.UltraUploader import UltraUploader
 from .utils import common
 from .utils.WebsocketManager import WebsocketManager
 from .utils.networker import make_request
 from .utils.utils import CapitalizeModuleFormatter
+
+if TYPE_CHECKING:
+    from .downloader.UltraDownloader import UltraDownloader
+    from .uploader.UltraUploader import UltraUploader
 
 logger = logging.getLogger("iDrive")
 logger.setLevel(logging.DEBUG)
@@ -196,6 +200,8 @@ class Client:
 
     def get_downloader(self) -> UltraDownloader:
         if not self._ultraDownloader or self._ultraDownloader.is_shutdown():
+            from .downloader.UltraDownloader import UltraDownloader
+
             discord_settings = self.get_discord_settings()
             max_workers = len(discord_settings.bots)*3
             self._ultraDownloader = UltraDownloader(min_workers=1, max_workers=max_workers)
@@ -204,6 +210,8 @@ class Client:
 
     def get_uploader(self, initial_workers: Optional[int] = None) -> UltraUploader:
         if not self._ultra_uploader or self._ultra_uploader.is_shutdown():
+            from .uploader.UltraUploader import UltraUploader
+
             user_settings = self.get_user_profile()
             discord_settings = self.get_discord_settings()
 

@@ -9,7 +9,16 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError as exc:
+    raise RuntimeError(
+        "The remote browser GUI requires optional GUI dependencies. "
+        "Install them with `pip install iDriveApiWrapper[gui]`. "
+        "Install transfer support too with `pip install iDriveApiWrapper[transfer]`, "
+        "or install everything with `pip install iDriveApiWrapper[all]`."
+    ) from exc
 
 from ..Config import APIConfig
 from ..iDrive import Client
@@ -19,18 +28,20 @@ from ..models.Folder import Folder
 from ..models.Item import Item
 from ..state.Storage import IdriveStorage
 from ..syncer.Syncer import Syncer
-from src.iDriveApiWrapper.gui.transfer_errors import raise_transfer_errors
+from .transfer_errors import raise_transfer_errors
 from .BreadcrumbsBar import BreadcrumbsBar
-from .GuiUtils import file_icon_key, needs_resource_password, password_prompt_item, prompt_resource_password, safe_item_label
-from .SyncGui import SyncGui
+from .GuiUtils import apply_window_icon, file_icon_key, needs_resource_password, password_prompt_item, prompt_resource_password, safe_item_label, set_windows_app_user_model_id
+from .SyncGui import SyncGui, SyncGuiAlreadyOpenError
 from .TransferStatusBar import TransferStatusBar
 
 
 class BrowserGuiApp:
     def __init__(self):
-        self.root = tk.Tk()
+        set_windows_app_user_model_id()
+        self.root = TkinterDnD.Tk()
         self.root.report_callback_exception = self._show_callback_exception
         self.root.title("iDrive Remote Browser")
+        apply_window_icon(self.root)
         self.root.geometry("980x640")
         self.root.minsize(760, 460)
 
@@ -49,6 +60,7 @@ class BrowserGuiApp:
         self._active_transfer = None
         self._active_transfer_lock = threading.Lock()
         self._transfer_cancelled = False
+        self._sync_window = None
         self._ui_queue: queue.Queue[tuple] = queue.Queue()
 
         self._poll_ui_queue()
@@ -150,6 +162,9 @@ class BrowserGuiApp:
         self.table.bind("<Button-3>", self._show_context_menu)
         self.table.bind("<Escape>", self._clear_selection)
         self.table.bind("<<TreeviewSelect>>", lambda _event: self._update_selection_actions())
+        self._register_external_drop_target(self.root)
+        self._register_external_drop_target(table_frame)
+        self._register_external_drop_target(self.table)
 
         scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
         scroll.grid(row=0, column=1, sticky="ns")
@@ -222,7 +237,7 @@ class BrowserGuiApp:
         self._clear_auth()
         self._set_busy(False, "")
         self._build_login()
-        self.login_status_var.set("Saved login expired. Sign in again.")
+        self.login_status_var.set(f"Saved login failed ({str(exc)}). Sign in again.")
 
     def _bootstrap_client(self, client: Client) -> tuple[Client, Syncer, Folder]:
         syncer = client.get_syncer()
@@ -378,14 +393,14 @@ class BrowserGuiApp:
         if path:
             self.config["last_upload_dir"] = str(Path(path).parent)
             self._save_config()
-            self._upload_path(Path(path))
+            self._upload_paths([Path(path)])
 
     def upload_folder(self) -> None:
         path = filedialog.askdirectory(title="Upload folder", initialdir=self.config.get("last_upload_dir") or None)
         if path:
             self.config["last_upload_dir"] = path
             self._save_config()
-            self._upload_path(Path(path))
+            self._upload_paths([Path(path)])
 
     def sync_selected_folder(self) -> None:
         if self.client is None or self._busy:
@@ -413,7 +428,15 @@ class BrowserGuiApp:
 
     def _open_sync_gui(self, folder: Folder, local_dir: Path) -> None:
         try:
-            SyncGui(self.syncer, local_dir, folder, parent=self.root).run()
+            sync_gui = SyncGui(self.syncer, local_dir, folder, parent=self.root)
+            self._sync_window = sync_gui.root
+            sync_gui.run()
+            self._sync_window = None
+        except SyncGuiAlreadyOpenError:
+            if self._widget_exists(self._sync_window):
+                self._sync_window.lift()
+                self._sync_window.focus_force()
+            messagebox.showinfo("Sync Folder", "A sync window is already open.", parent=self.root)
         except BackendMissingOrIncorrectResourcePasswordError as exc:
             self._operation_failed_with_password_retry(
                 exc,
@@ -421,23 +444,49 @@ class BrowserGuiApp:
                 lambda: self._open_sync_gui(folder, local_dir),
             )
 
-    def _upload_path(self, path: Path) -> None:
+    def _upload_paths(self, paths: list[Path]) -> None:
         if self.client is None or self.current_folder is None or self._busy:
             return
 
-        self._set_busy(True, f"Uploading {path.name}...")
+        existing_paths = [path for path in paths if path.exists()]
+        if not existing_paths:
+            messagebox.showinfo("Upload", "No existing files or folders were selected.", parent=self.root)
+            return
+
+        target_folder = self.current_folder
+        if len(existing_paths) == 1:
+            status = f"Uploading {existing_paths[0].name}..."
+        else:
+            status = f"Uploading {len(existing_paths)} item(s)..."
+        self._set_busy(True, status)
 
         def work():
             uploader = self.client.get_uploader()
             self._set_active_transfer("upload", uploader)
             try:
-                uploader.upload(path, parent=self.current_folder)
+                for path in existing_paths:
+                    uploader.upload(path, parent=target_folder)
                 uploader.join()
                 raise_transfer_errors(uploader, "Upload")
             finally:
                 self._clear_active_transfer()
 
-        self._run_password_retryable_worker(work, lambda _result: self._operation_done("Upload complete", refresh=True), [self.current_folder] if self.current_folder else [])
+        self._run_password_retryable_worker(work, lambda _result: self._operation_done("Upload complete", refresh=True), [target_folder])
+
+    def _register_external_drop_target(self, widget) -> None:
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._drop_external_paths)
+        except tk.TclError:
+            return
+
+    def _drop_external_paths(self, event) -> str:
+        paths = [Path(path) for path in self.root.tk.splitlist(event.data)]
+        if paths:
+            self.config["last_upload_dir"] = str(paths[0].parent)
+            self._save_config()
+            self._upload_paths(paths)
+        return "copy"
 
     def abort_transfer(self) -> None:
         with self._active_transfer_lock:

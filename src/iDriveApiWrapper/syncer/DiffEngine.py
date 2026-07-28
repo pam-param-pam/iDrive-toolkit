@@ -22,6 +22,7 @@ class NodeStatus(Enum):
     ONLY_REMOTE = "only_remote"
     SAME = "same"
     CHANGED = "changed"
+    RENAMED = "renamed"
     CONFLICT = "conflict"
 
 @dataclass
@@ -29,6 +30,7 @@ class DiffResult:
     only_local: list[DiffEntry] = field(default_factory=list)
     only_remote: list[DiffEntry] = field(default_factory=list)
     changed: list[DiffEntry] = field(default_factory=list)
+    renamed: list[DiffEntry] = field(default_factory=list)
     same: list[DiffEntry] = field(default_factory=list)
     conflicts: list[DiffEntry] = field(default_factory=list)
 
@@ -96,9 +98,9 @@ class DiffEntry:
             if not self.remote or self.local:
                 raise ValueError("ONLY_REMOTE requires remote only")
 
-        elif self.status in (NodeStatus.SAME, NodeStatus.CHANGED):
+        elif self.status in (NodeStatus.SAME, NodeStatus.CHANGED, NodeStatus.RENAMED):
             if not self.local or not self.remote:
-                raise ValueError("SAME/CHANGED require both sides")
+                raise ValueError("SAME/CHANGED/RENAMED require both sides")
             if self.local.kind != self.remote.kind:
                 raise ValueError("KIND must be the same")
 
@@ -227,6 +229,8 @@ class DiffEngine:
                 unit="files",
             )
 
+        self._detect_renamed_files(result, local_parent, remote_parent)
+
         # -------------------------
         # FINAL SORT (deterministic)
         # -------------------------
@@ -239,6 +243,7 @@ class DiffEngine:
         result.only_remote.sort(key=_sort_key)
         result.same.sort(key=_sort_key)
         result.changed.sort(key=_sort_key)
+        result.renamed.sort(key=_sort_key)
         result.conflicts.sort(key=_sort_key)
 
         emit_progress(progress, DiffProgressPhase.COMPLETE, "Diff complete")
@@ -418,3 +423,52 @@ class DiffEngine:
             return local.hash == remote.hash
 
         return local.size == remote.size and local.hash == remote.hash
+
+    def _detect_renamed_files(self, result: DiffResult, local_parent: Node, remote_parent: Node) -> None:
+        if not result.only_local or not result.only_remote:
+            return
+
+        local_by_signature = self._unique_files_by_signature(result.only_local, local=True)
+        remote_by_signature = self._unique_files_by_signature(result.only_remote, local=False)
+        signatures = sorted(set(local_by_signature.keys()) & set(remote_by_signature.keys()))
+
+        renamed_pairs: list[tuple[DiffEntry, DiffEntry]] = []
+        for signature in signatures:
+            local_entry = local_by_signature[signature]
+            remote_entry = remote_by_signature[signature]
+            if local_entry.local.name == remote_entry.remote.name:
+                continue
+            renamed_pairs.append((local_entry, remote_entry))
+
+        if not renamed_pairs:
+            return
+
+        renamed_local = {id(local_entry) for local_entry, _remote_entry in renamed_pairs}
+        renamed_remote = {id(remote_entry) for _local_entry, remote_entry in renamed_pairs}
+        result.only_local = [entry for entry in result.only_local if id(entry) not in renamed_local]
+        result.only_remote = [entry for entry in result.only_remote if id(entry) not in renamed_remote]
+
+        for local_entry, remote_entry in renamed_pairs:
+            result.renamed.append(
+                DiffEntry(
+                    status=NodeStatus.RENAMED,
+                    local=local_entry.local,
+                    remote=remote_entry.remote,
+                    local_parent=local_parent,
+                    remote_parent=remote_parent,
+                )
+            )
+
+    def _unique_files_by_signature(self, entries: list[DiffEntry], *, local: bool) -> dict[tuple[int, str], DiffEntry]:
+        unique: dict[tuple[int, str], DiffEntry | None] = {}
+        for entry in entries:
+            node = entry.local if local else entry.remote
+            if node is None or node.kind != NodeKind.FILE or node.size is None or node.hash is None:
+                continue
+            signature = (node.size, str(node.hash))
+            if signature in unique:
+                unique[signature] = None
+            else:
+                unique[signature] = entry
+
+        return {signature: entry for signature, entry in unique.items() if entry is not None}

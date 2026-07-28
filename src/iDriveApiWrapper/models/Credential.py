@@ -1,6 +1,6 @@
 from abc import ABC
 
-from src.iDriveApiWrapper.utils.networker import make_request
+from ..utils.networker import make_request
 
 
 class Credential(ABC):

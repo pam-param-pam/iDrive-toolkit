@@ -10,7 +10,8 @@ from typing import List, Optional, Dict, Any, Mapping, Tuple
 import rawpy
 from PIL import Image
 
-from src.iDriveApiWrapper.uploader.models import ExtractedThumbnail, VideoMetadata, SubtitleTrack, AudioTrack, VideoTrack, ExtractedSubtitle
+from .models import ExtractedThumbnail, VideoMetadata, SubtitleTrack, AudioTrack, VideoTrack, ExtractedSubtitle
+from ..utils.ffmpeg import require_media_tool
 
 logger = logging.getLogger("iDrive")
 
@@ -22,6 +23,7 @@ def get_file_extension(filename: str) -> str:
 
 
 def _run_media(cmd: List[str], timeout: int, text: bool = False) -> subprocess.CompletedProcess:
+    require_media_tool(cmd[0])
     creationflags = 0
     if sys.platform == "win32":
         creationflags = subprocess.CREATE_NO_WINDOW
@@ -54,6 +56,7 @@ def _is_type(extensions: Mapping[str, list[str]], extension: str, file_type: str
 def _run_ffprobe(path: str, extensions, extension) -> Dict[str, Any]:
     if not _is_type(extensions, extension, "Video"):
         return {}
+    require_media_tool("ffprobe")
 
     cmd = [
         "ffprobe",
@@ -283,6 +286,7 @@ def extract_subtitles_if_needed(extensions: Mapping[str, list[str]], extension: 
         ]
 
         try:
+            require_media_tool("ffmpeg")
             proc = subprocess.run(
                 cmd,
                 stdin=subprocess.DEVNULL,
@@ -324,6 +328,7 @@ def extract_subtitles_if_needed(extensions: Mapping[str, list[str]], extension: 
     return results
 def _get_video_duration(path: Path) -> Optional[float]:
     try:
+        require_media_tool("ffprobe")
         cmd = [
             "ffprobe",
             "-v", "error",

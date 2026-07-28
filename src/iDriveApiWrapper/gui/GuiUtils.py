@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import ctypes
+import sys
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox, simpledialog
 from typing import Iterable, Callable
 
 from ..exceptions import BackendMissingOrIncorrectResourcePasswordError
 from ..models.Item import Item
 
+
+APP_USER_MODEL_ID = "iDriveApiWrapper.RemoteBrowser"
+APP_ICON_ICO_PATH = Path(__file__).with_name("app_icon.ico")
+APP_ICON_PNG_PATH = Path(__file__).with_name("app_icon.png")
 
 FILE_ICON_EXTENSIONS: tuple[tuple[str, set[str]], ...] = (
     ("file_image", {"jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff", "heic", "raw"}),
@@ -25,6 +32,34 @@ def file_icon_key(name: str) -> str:
         if extension in extensions:
             return icon_key
     return "file"
+
+
+def apply_window_icon(window: tk.Misc) -> None:
+    if APP_ICON_ICO_PATH.exists():
+        try:
+            window.iconbitmap(default=str(APP_ICON_ICO_PATH))
+        except tk.TclError:
+            pass
+
+    if not APP_ICON_PNG_PATH.exists():
+        return
+
+    try:
+        icon = tk.PhotoImage(file=str(APP_ICON_PNG_PATH))
+        window.iconphoto(True, icon)
+    except tk.TclError:
+        return
+    setattr(window, "_app_icon_photo", icon)
+
+
+def set_windows_app_user_model_id() -> None:
+    if sys.platform != "win32":
+        return
+
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except (AttributeError, OSError):
+        return
 
 
 def safe_item_label(item: Item) -> str:

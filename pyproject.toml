@@ -16,22 +16,50 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
 ]
 keywords = ["iDrive", "discord", "fileStorage", "API", "wrapper"]
 
 dependencies = [
-    "tqdm ~= 4.67.1",
     "httpx ~= 0.28.1",
     "overrides ~= 7.7.0",
     "cryptography ~= 45.0.6",
     "requests",
     "websockets",
-    "numpy",
-    "rawpy",
-    "pillow",
 ]
-requires-python = ">=3.7"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+transfer = [
+    "pillow",
+    "rawpy",
+    "tqdm ~= 4.67.1",
+]
+gui = [
+    "pillow",
+    "tkinterdnd2",
+]
+all = [
+    "pillow",
+    "rawpy",
+    "tkinterdnd2",
+    "tqdm ~= 4.67.1",
+]
 
 [project.urls]
 Github = "https://github.com/pam-param-pam/iDrive-api-wrapper"
 
+[project.scripts]
+idrive-remote-browser = "iDriveApiWrapper.gui.BrowserGui:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["iDriveApiWrapper*"]
+
+[tool.setuptools.package-data]
+"iDriveApiWrapper.gui" = ["app_icon.ico", "app_icon.png"]

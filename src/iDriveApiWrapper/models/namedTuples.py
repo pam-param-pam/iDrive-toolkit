@@ -52,6 +52,7 @@ class User(NamedTuple):
     maxAttachmentsPerMessage: int
     unreadNotifications: int
     autoSetupComplete: bool
+    isStaff: bool
 
 
 class Perms(NamedTuple):

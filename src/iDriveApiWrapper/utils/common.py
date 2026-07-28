@@ -4,12 +4,16 @@ from typing import List
 from urllib.parse import unquote
 
 import requests
-from tqdm import tqdm
 
 from ..Config import APIConfig
 from ..models.Folder import Folder
 from ..models.Item import Item
 from .networker import make_request
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 
 def _extract_ids_and_passwords(items: List[Item]) -> dict:
@@ -90,13 +94,13 @@ def download_from_url(download_url: str, path: str = None) -> str:
 
     # Open the file in binary write mode
     with open(path, 'wb') as file:
-        # Use tqdm for a progress bar (optional)
-        with tqdm(total=total_size, unit='B', unit_scale=True, desc=filename) as progress_bar:
+        if tqdm is None:
             for chunk in response.iter_content(chunk_size=8192):
-                # Write the chunk to the file
                 file.write(chunk)
-
-                # Update the progress bar
-                progress_bar.update(len(chunk))
+        else:
+            with tqdm(total=total_size, unit='B', unit_scale=True, desc=filename) as progress_bar:
+                for chunk in response.iter_content(chunk_size=8192):
+                    file.write(chunk)
+                    progress_bar.update(len(chunk))
 
     return path

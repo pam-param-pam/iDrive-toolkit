@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from ..utils.networker import make_request
 
 
 @dataclass

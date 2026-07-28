@@ -22,7 +22,7 @@ from .progress import (
 from .state import StateStore
 from ..models.File import File
 from ..models.Folder import Folder
-from src.iDriveApiWrapper.gui.transfer_errors import raise_transfer_errors
+from ..gui.transfer_errors import raise_transfer_errors
 
 
 UploadTask = tuple[Path, Folder]
@@ -36,6 +36,11 @@ class ChangedFileStrategy(Enum):
     NEWER = "newer"
     UPLOAD_LOCAL = "upload_local"
     DOWNLOAD_REMOTE = "download_remote"
+
+
+class RenamedFileStrategy(Enum):
+    USE_LOCAL_NAME = "use_local_name"
+    USE_REMOTE_NAME = "use_remote_name"
 
 
 class SyncConflictError(RuntimeError):
@@ -64,6 +69,7 @@ class Syncer:
         self.remote = RemoteScanner()
         self.diff_engine = DiffEngine(self.local, self.remote)
         self._transfer_progress_callback: TransferProgressCallback | None = None
+        self._status_callback: Callable[[str], None] | None = None
         self._active_transfer = None
         self._active_transfer_cancel_thread: threading.Thread | None = None
         self._active_transfer_lock = threading.Lock()
@@ -88,6 +94,9 @@ class Syncer:
 
     def set_transfer_progress_callback(self, callback: TransferProgressCallback | None) -> None:
         self._transfer_progress_callback = callback
+
+    def set_status_callback(self, callback: Callable[[str], None] | None) -> None:
+        self._status_callback = callback
 
     def set_sync_boundary(self, local_root: Path, remote_root: Folder | str) -> None:
         self._boundary_local_root = Path(local_root).resolve()
@@ -122,7 +131,13 @@ class Syncer:
             if temporary_boundary:
                 self.clear_sync_boundary()
 
-    def sync_one_level(self, local_root: Path, remote_root: Folder | str, strategy: ChangedFileStrategy) -> DiffResult:
+    def sync_one_level(
+        self,
+        local_root: Path,
+        remote_root: Folder | str,
+        strategy: ChangedFileStrategy,
+        renamed_strategy: RenamedFileStrategy = RenamedFileStrategy.USE_LOCAL_NAME,
+    ) -> DiffResult:
         temporary_boundary = self._ensure_sync_boundary(local_root, remote_root)
         try:
             result = self.diff(local_root, remote_root)
@@ -134,7 +149,10 @@ class Syncer:
             changed_uploads, changed_upload_parent_ids, changed_downloads = self._plan_changed_transfers(
                 result.changed,
                 strategy=strategy,
+                renamed_strategy=renamed_strategy,
             )
+            for entry in result.renamed:
+                self._handle_renamed(entry, renamed_strategy)
             self._upload_many_and_invalidate(
                 only_local_uploads + changed_uploads,
                 only_local_parent_ids + changed_upload_parent_ids,
@@ -164,13 +182,18 @@ class Syncer:
     def _handle_only_remote(self, entry: DiffEntry) -> None:
         self._download_many([self._plan_only_remote_download(entry)])
 
-    def _handle_changed(self, entry: DiffEntry, strategy: ChangedFileStrategy) -> None:
+    def _handle_changed(
+        self,
+        entry: DiffEntry,
+        strategy: ChangedFileStrategy,
+        renamed_strategy: RenamedFileStrategy = RenamedFileStrategy.USE_LOCAL_NAME,
+    ) -> None:
         self._require_status(entry, NodeStatus.CHANGED)
 
         if entry.is_folder:
             local_path = self._require_local_path(entry)
             remote_id = self._require_remote_id(entry)
-            self.sync_one_level(local_path, remote_id, strategy=strategy)
+            self.sync_one_level(local_path, remote_id, strategy=strategy, renamed_strategy=renamed_strategy)
             return
 
         if strategy == ChangedFileStrategy.ERROR:
@@ -191,6 +214,21 @@ class Syncer:
             return
 
         raise ValueError(f"Unsupported changed file strategy: {strategy}")
+
+    def _handle_renamed(self, entry: DiffEntry, strategy: RenamedFileStrategy) -> None:
+        self._require_status(entry, NodeStatus.RENAMED)
+        if entry.is_folder:
+            raise SyncConflictError("Folder rename sync is not supported")
+
+        if strategy == RenamedFileStrategy.USE_LOCAL_NAME:
+            self._rename_remote_to_local(entry)
+            return
+
+        if strategy == RenamedFileStrategy.USE_REMOTE_NAME:
+            self._rename_local_to_remote(entry)
+            return
+
+        raise ValueError(f"Unsupported renamed file strategy: {strategy}")
 
     # -------------------------
     # Transfer operations
@@ -433,13 +471,22 @@ class Syncer:
 
         return remote_item, target_dir, None
 
-    def _plan_changed_transfers(self, entries: list[DiffEntry], strategy: ChangedFileStrategy) -> ChangedTransferPlan:
+    def _plan_changed_transfers(
+        self,
+        entries: list[DiffEntry],
+        strategy: ChangedFileStrategy,
+        renamed_strategy: RenamedFileStrategy,
+    ) -> ChangedTransferPlan:
         uploads: list[UploadTask] = []
         upload_parent_ids: list[str] = []
         downloads: list[DownloadTask] = []
 
         for entry in entries:
-            upload_task, upload_parent_id, download_task = self._plan_changed_transfer(entry, strategy=strategy)
+            upload_task, upload_parent_id, download_task = self._plan_changed_transfer(
+                entry,
+                strategy=strategy,
+                renamed_strategy=renamed_strategy,
+            )
             if upload_task is not None and upload_parent_id is not None:
                 uploads.append(upload_task)
                 upload_parent_ids.append(upload_parent_id)
@@ -448,13 +495,18 @@ class Syncer:
 
         return uploads, upload_parent_ids, downloads
 
-    def _plan_changed_transfer(self, entry: DiffEntry, strategy: ChangedFileStrategy) -> tuple[UploadTask | None, str | None, DownloadTask | None]:
+    def _plan_changed_transfer(
+        self,
+        entry: DiffEntry,
+        strategy: ChangedFileStrategy,
+        renamed_strategy: RenamedFileStrategy,
+    ) -> tuple[UploadTask | None, str | None, DownloadTask | None]:
         self._require_status(entry, NodeStatus.CHANGED)
 
         if entry.is_folder:
             local_path = self._require_local_path(entry)
             remote_id = self._require_remote_id(entry)
-            self.sync_one_level(local_path, remote_id, strategy=strategy)
+            self.sync_one_level(local_path, remote_id, strategy=strategy, renamed_strategy=renamed_strategy)
             return None, None, None
 
         if strategy == ChangedFileStrategy.ERROR:
@@ -485,7 +537,7 @@ class Syncer:
         if entry.is_folder:
             raise SyncConflictError("Folder replacement must be handled by recursive sync")
 
-        remote_item.delete()
+        remote_item.move_to_trash()
         self.remote.forget(remote_id)
         self.remote.invalidate(remote_parent_id)
         return (local_path, remote_parent), remote_parent_id
@@ -515,6 +567,30 @@ class Syncer:
         if replace_local_path is not None and replace_local_path.exists():
             replace_local_path.unlink()
         self._download(remote_item, parent_local_path)
+
+    def _rename_remote_to_local(self, entry: DiffEntry) -> None:
+        local_node = self._require_local_node(entry)
+        remote_id = self._require_remote_id(entry)
+        remote_item = self.remote.require_cached_item(remote_id)
+        parent_remote_id = self._require_parent_remote_id(entry)
+
+        self._emit_status(f"Renamed {local_node.name}")
+        remote_item.rename(local_node.name)
+        self.remote.invalidate(parent_remote_id)
+
+    def _rename_local_to_remote(self, entry: DiffEntry) -> None:
+        local_path = self._require_local_path(entry)
+        remote_node = self._require_remote_node(entry)
+        target_path = local_path.with_name(remote_node.name)
+
+        if target_path.exists():
+            raise FileExistsError(f"Cannot rename local file because target exists: {target_path}")
+        self._emit_status(f"Renamed {remote_node.name}")
+        local_path.rename(target_path)
+
+    def _emit_status(self, status: str) -> None:
+        if self._status_callback is not None:
+            self._status_callback(status)
 
     def _delete_local_entry(self, entry: DiffEntry) -> None:
         local_path = self._require_local_path(entry)

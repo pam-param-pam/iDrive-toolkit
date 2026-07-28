@@ -5,7 +5,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict
 
-from src.iDriveApiWrapper.state.Storage import get_storage, persistent_open
+from ..state.Storage import get_storage, persistent_open
 
 logger = logging.getLogger("iDrive")
 

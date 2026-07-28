@@ -12,6 +12,7 @@ from .Subtitle import Subtitle
 from .Tag import Tag
 from ..models.Item import Item
 from ..utils.decorators import autoFetchProperty
+from ..utils.ffmpeg import require_media_tool
 from ..utils.networker import make_request
 
 logger = logging.getLogger("iDrive")
@@ -225,6 +226,7 @@ class File(Item):
     def play(self):
         if self.type != "Video":
             raise ValueError("File is not a video")
+        require_media_tool("ffplay")
         os.system(f'ffplay -i "{self.download_url}"')
 
     @overrides
