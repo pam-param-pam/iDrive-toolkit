@@ -96,7 +96,7 @@ jobs:
             --icon src/idrive_toolkit/gui/app_icon.ico `
             --collect-all idrive_toolkit `
             --collect-all tkinterdnd2 `
-            remote-browser.py
+            gui_main.py
 
       - name: Build Linux browser executable
         if: runner.os == 'Linux'
@@ -108,7 +108,7 @@ jobs:
             --name idrive-remote-browser \
             --collect-all idrive_toolkit \
             --collect-all tkinterdnd2 \
-            remote-browser.py
+            gui_main.py
           chmod +x dist/idrive-remote-browser
           tar -C dist -czf dist/idrive-remote-browser-linux.tar.gz idrive-remote-browser
 
