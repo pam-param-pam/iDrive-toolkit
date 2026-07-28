@@ -1,19 +1,19 @@
-# iDrive API Wrapper
+# iDrive Toolkit
 
 Python client utilities for the iDrive backend. The package includes object wrappers for files/folders, high-throughput upload/download helpers, sync tooling, a Tk remote browser, and a WebSocket event client.
 
 ## Install
 
 ```powershell
-pip install iDriveApiWrapper
+pip install idrive_toolkit
 ```
 
 Optional feature sets:
 
 ```powershell
-pip install iDriveApiWrapper[transfer]
-pip install iDriveApiWrapper[gui]
-pip install iDriveApiWrapper[all]
+pip install idrive_toolkit[transfer]
+pip install idrive_toolkit[gui]
+pip install idrive_toolkit[all]
 ```
 
 For local development:
@@ -25,7 +25,7 @@ pip install -r dev-requirements.txt
 ## Basic Usage
 
 ```python
-from iDriveApiWrapper.iDrive import Client
+from idrive_toolkit.iDrive import Client
 
 client = Client.login(
     "https://idrive.pamparampam.dev/api",
@@ -60,7 +60,7 @@ The browser stores UI config and auth tokens through `IdriveStorage`, under the 
 Every `Client` owns a `WebsocketManager` at `client.websocket`. It connects to the authenticated `/user` WebSocket endpoint, sends `PONG` replies for server `PING` messages, reconnects after WebSocket errors, and dispatches parsed `WebsocketEvent` objects to registered callbacks.
 
 ```python
-from iDriveApiWrapper.iDrive import Client
+from idrive_toolkit.iDrive import Client
 
 client = Client.login("https://idrive.pamparampam.dev/api", "username", "password")
 

@@ -42,46 +42,108 @@ jobs:
       - name: Validate built wheel
         run: |
           python -m pip install --force-reinstall --no-deps dist/*.whl
-          python - <<'PY'
-          import importlib.metadata as metadata
-          import iDriveApiWrapper
-
-          dist = metadata.distribution("iDriveApiWrapper")
-          print(f"Package: {dist.metadata['Name']}")
-          print(f"Version: {dist.version}")
-          print(f"Imported version: {iDriveApiWrapper.__version__}")
-          PY
+          python -c "import importlib.metadata as metadata, idrive_toolkit; dist = metadata.distribution('idrive_toolkit'); print(f'Package: {dist.metadata[\"Name\"]}'); print(f'Version: {dist.version}'); print(f'Imported version: {idrive_toolkit.__version__}')"
 
       - name: Upload distribution artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dist
+          name: python-package
           path: dist/*
+
+  build-browser:
+    name: Build browser GUI (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            os: windows-latest
+            asset: dist/idrive-remote-browser.exe
+            artifact: idrive-remote-browser-windows
+          - platform: linux
+            os: ubuntu-latest
+            asset: dist/idrive-remote-browser-linux.tar.gz
+            artifact: idrive-remote-browser-linux
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Linux GUI runtime libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk tcl tk
+
+      - name: Install application and PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller ".[all]"
+
+      - name: Build Windows browser executable
+        if: runner.os == 'Windows'
+        run: |
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name idrive-remote-browser `
+            --icon src/idrive_toolkit/gui/app_icon.ico `
+            --collect-all idrive_toolkit `
+            --collect-all tkinterdnd2 `
+            remote-browser.py
+
+      - name: Build Linux browser executable
+        if: runner.os == 'Linux'
+        run: |
+          python -m PyInstaller \
+            --noconfirm \
+            --clean \
+            --onefile \
+            --name idrive-remote-browser \
+            --collect-all idrive_toolkit \
+            --collect-all tkinterdnd2 \
+            remote-browser.py
+          chmod +x dist/idrive-remote-browser
+          tar -C dist -czf dist/idrive-remote-browser-linux.tar.gz idrive-remote-browser
+
+      - name: Upload browser executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.asset }}
 
   release:
     name: Create GitHub release
     runs-on: ubuntu-latest
-    needs: build
+    needs:
+      - build
+      - build-browser
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
 
     steps:
-      - name: Download distribution artifact
+      - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
-          name: dist
-          path: dist
+          path: release-assets
+          merge-multiple: true
 
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
-          PRERELEASE_FLAG: ${{ inputs.prerelease && '--prerelease' || '' }}
+          PRERELEASE_FLAG: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease && '--prerelease' || '' }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/* --clobber
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
           else
-            gh release create "$RELEASE_TAG" dist/* \
+            gh release create "$RELEASE_TAG" release-assets/* \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_TAG" \
               --notes "Release $RELEASE_TAG" \

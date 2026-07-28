@@ -11,7 +11,7 @@ from ..exceptions import BackendMissingOrIncorrectResourcePasswordError
 from ..models.Item import Item
 
 
-APP_USER_MODEL_ID = "iDriveApiWrapper.RemoteBrowser"
+APP_USER_MODEL_ID = "idrive_toolkit.RemoteBrowser"
 APP_ICON_ICO_PATH = Path(__file__).with_name("app_icon.ico")
 APP_ICON_PNG_PATH = Path(__file__).with_name("app_icon.png")
 

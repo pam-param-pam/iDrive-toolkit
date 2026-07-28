@@ -15,9 +15,9 @@ try:
 except ImportError as exc:
     raise RuntimeError(
         "The remote browser GUI requires optional GUI dependencies. "
-        "Install them with `pip install iDriveApiWrapper[gui]`. "
-        "Install transfer support too with `pip install iDriveApiWrapper[transfer]`, "
-        "or install everything with `pip install iDriveApiWrapper[all]`."
+        "Install them with `pip install idrive_toolkit[gui]`. "
+        "Install transfer support too with `pip install idrive_toolkit[transfer]`, "
+        "or install everything with `pip install idrive_toolkit[all]`."
     ) from exc
 
 from ..Config import APIConfig

@@ -7,3 +7,4 @@ websockets
 numpy
 rawpy
 pillow
+tkinterdnd2

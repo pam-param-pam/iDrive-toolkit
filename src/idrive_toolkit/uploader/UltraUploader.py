@@ -1,3 +1,4 @@
+import logging
 import threading
 import uuid
 from pathlib import Path
@@ -37,8 +38,9 @@ DOWNLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
 
     initial_workers=4,
 )
-# todo fix throuthpot beind reported as improving, despite it not imporiving lol
-# todo fix how it handles ratelimit errors from discord
+
+logger = logging.getLogger("iDrive")
+
 class UltraUploader:
     def __init__(
         self,
@@ -95,43 +97,42 @@ class UltraUploader:
     # ------------------------------------------------------------------
 
     def _start_queue_monitor(self, interval: float = 1.0):
-        # def monitor():
-        #     last_uploaded = 0
-        #     last_time = time.perf_counter()
-        #
-        #     while True:
-        #         time.sleep(interval)
-        #
-        #         now = time.perf_counter()
-        #
-        #         input_q = self._input_queue.qsize()
-        #         upload_q = self._upload_queue.qsize()
-        #         response_q = self._response_queue.qsize()
-        #         ready_q = self._ready_files_queue.qsize()
-        #
-        #         # throughput (bytes)
-        #         total_uploaded = self.ctx.processed_size
-        #
-        #         delta_bytes = total_uploaded - last_uploaded
-        #         delta_time = now - last_time
-        #
-        #         speed = delta_bytes / delta_time if delta_time > 0 else 0
-        #
-        #         print(
-        #             f"[MON] "
-        #             f"in={input_q:4d} "
-        #             f"up={upload_q:4d} "
-        #             f"resp={response_q:4d} "
-        #             f"ready={ready_q:4d} "
-        #             f"| speed={speed / 1024 / 1024:.2f} MiB/s"
-        #         )
-        #
-        #         last_uploaded = total_uploaded
-        #         last_time = now
-        #
-        # t = threading.Thread(target=monitor, daemon=True)
-        # t.start()
-        pass
+        def monitor():
+            last_uploaded = 0
+            last_time = time.perf_counter()
+
+            while True:
+                time.sleep(interval)
+
+                now = time.perf_counter()
+
+                input_q = self._input_queue.qsize()
+                upload_q = self._upload_queue.qsize()
+                response_q = self._response_queue.qsize()
+                ready_q = self._ready_files_queue.qsize()
+
+                # throughput (bytes)
+                total_uploaded = self.ctx.processed_size
+
+                delta_bytes = total_uploaded - last_uploaded
+                delta_time = now - last_time
+
+                speed = delta_bytes / delta_time if delta_time > 0 else 0
+
+                logger.debug(
+                    f"[MON] "
+                    f"in={input_q:4d} "
+                    f"up={upload_q:4d} "
+                    f"resp={response_q:4d} "
+                    f"ready={ready_q:4d} "
+                    f"| speed={speed / 1024 / 1024:.2f} MiB/s"
+                )
+
+                last_uploaded = total_uploaded
+                last_time = now
+
+        t = threading.Thread(target=monitor, daemon=True)
+        t.start()
 
     def _start_workers(self) -> None:
         if self._started:

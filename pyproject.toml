@@ -5,9 +5,9 @@ requires      = ["setuptools>=61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "iDriveApiWrapper"
+name = "idrive_toolkit"
 version = "1.0.0"
-description = "API wrapper for iDrive project"
+description = "Python toolkit for the iDrive backend"
 readme = "README.md"
 
 authors = [{ name = "Pamparampampam" }]
@@ -20,7 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-keywords = ["iDrive", "discord", "fileStorage", "API", "wrapper"]
+keywords = ["iDrive", "discord", "fileStorage", "API", "sync", "transfer"]
 
 dependencies = [
     "httpx ~= 0.28.1",
@@ -49,17 +49,17 @@ all = [
 ]
 
 [project.urls]
-Github = "https://github.com/pam-param-pam/iDrive-api-wrapper"
+Github = "https://github.com/pam-param-pam/idrive_toolkit"
 
 [project.scripts]
-idrive-remote-browser = "iDriveApiWrapper.gui.BrowserGui:main"
+idrive-remote-browser = "idrive_toolkit.gui.BrowserGui:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["iDriveApiWrapper*"]
+include = ["idrive_toolkit*"]
 
 [tool.setuptools.package-data]
-"iDriveApiWrapper.gui" = ["app_icon.ico", "app_icon.png"]
+"idrive_toolkit.gui" = ["app_icon.ico", "app_icon.png"]

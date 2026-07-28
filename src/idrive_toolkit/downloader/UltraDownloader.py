@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import threading
@@ -18,8 +19,6 @@ from ..state.Storage import get_storage, safe_rmtree
 from ..utils.autoScaler.AutoScalePolicy import AutoScalePolicy
 from ..utils.autoScaler.AutoScaler import AutoScaler
 
-# todo make this not break on empty files
-
 UPLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
     scale_up_step=3,
     scale_down_step=1,
@@ -38,6 +37,8 @@ UPLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
 
     initial_workers=20,
 )
+
+logger = logging.getLogger("iDrive")
 
 
 class UltraDownloader:
@@ -97,15 +98,15 @@ class UltraDownloader:
                 frag_q = self._fragment_queue.qsize()
                 fin_q = self._finalize_queue.qsize()
 
-                print(
+                logger.debug(
                     f"[DOW] "
                     f"file={file_q:4d} "
                     f"frag={frag_q:4d} "
                     f"fin={fin_q:4d} "
                 )
 
-        # t = threading.Thread(target=monitor, daemon=True)
-        # t.start()
+        t = threading.Thread(target=monitor, daemon=True)
+        t.start()
 
     def _start_workers(self) -> None:
         if self._started:
