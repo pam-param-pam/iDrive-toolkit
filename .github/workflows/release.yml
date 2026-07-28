@@ -6,10 +6,6 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      tag_name:
-        description: "Release tag to create or reuse, for example v1.0.0"
-        required: true
-        type: string
       prerelease:
         description: "Mark this release as a prerelease"
         required: false
@@ -94,6 +90,7 @@ jobs:
             --windowed `
             --name idrive-remote-browser `
             --icon src/idrive_toolkit/gui/app_icon.ico `
+            --copy-metadata idrive_toolkit `
             --collect-all idrive_toolkit `
             --collect-all tkinterdnd2 `
             gui_main.py
@@ -106,6 +103,7 @@ jobs:
             --clean \
             --onefile \
             --name idrive-remote-browser \
+            --copy-metadata idrive_toolkit \
             --collect-all idrive_toolkit \
             --collect-all tkinterdnd2 \
             gui_main.py
@@ -127,6 +125,27 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Read release version
+        id: version
+        run: |
+          python -c "import pathlib, tomllib; version = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version']; print(f'version={version}'); print(f'tag=v{version}')" >> "$GITHUB_OUTPUT"
+
+      - name: Validate pushed tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          if [ "$GITHUB_REF_NAME" != "${{ steps.version.outputs.tag }}" ]; then
+            echo "Pushed tag '$GITHUB_REF_NAME' does not match pyproject.toml version tag '${{ steps.version.outputs.tag }}'."
+            exit 1
+          fi
+
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
@@ -137,7 +156,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
           PRERELEASE_FLAG: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease && '--prerelease' || '' }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then

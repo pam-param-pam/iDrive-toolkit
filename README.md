@@ -47,10 +47,10 @@ folder.restore_from_trash()
 
 ## Remote Browser GUI
 
-The remote browser provides login, browsing, upload/download, remote rename/trash actions, folder sync, cached auth, logout, and a selectable logs window.
+The remote browser provides login, browsing, upload/download, remote rename/trash actions, folder sync, cached auth, logout.
 
 ```powershell
-idrive-remote-browser
+idrive-gui
 ```
 
 The browser stores UI config and auth tokens through `IdriveStorage`, under the app's local data directory.

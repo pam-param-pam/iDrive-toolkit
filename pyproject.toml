@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "idrive_toolkit"
 version = "1.0.0"
-description = "Python toolkit for the iDrive backend"
+description = "Python toolkit for the iDrive project"
 readme = "README.md"
 
 authors = [{ name = "Pamparampampam" }]
@@ -26,6 +26,7 @@ dependencies = [
     "httpx ~= 0.28.1",
     "overrides ~= 7.7.0",
     "cryptography ~= 45.0.6",
+    "packaging ~= 25.0",
     "requests",
     "websockets",
 ]
@@ -49,10 +50,10 @@ all = [
 ]
 
 [project.urls]
-Github = "https://github.com/pam-param-pam/idrive_toolkit"
+Github = "https://github.com/pam-param-pam/iDrive-toolkit"
 
 [project.scripts]
-idrive-remote-browser = "idrive_toolkit.gui.BrowserGui:main"
+idrive-gui = "idrive_toolkit.gui.BrowserGui:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -63,3 +64,6 @@ include = ["idrive_toolkit*"]
 
 [tool.setuptools.package-data]
 "idrive_toolkit.gui" = ["app_icon.ico", "app_icon.png"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["__pycache__/*", "*.py[cod]"]

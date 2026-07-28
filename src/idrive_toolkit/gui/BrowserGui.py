@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 import tkinter as tk
@@ -28,11 +29,14 @@ from ..models.Folder import Folder
 from ..models.Item import Item
 from ..state.Storage import IdriveStorage
 from ..syncer.Syncer import Syncer
+from ..version_check import UpdateInfo, check_for_update
 from .transfer_errors import raise_transfer_errors
 from .BreadcrumbsBar import BreadcrumbsBar
 from .GuiUtils import apply_window_icon, file_icon_key, needs_resource_password, password_prompt_item, prompt_resource_password, safe_item_label, set_windows_app_user_model_id
 from .SyncGui import SyncGui, SyncGuiAlreadyOpenError
 from .TransferStatusBar import TransferStatusBar
+
+logger = logging.getLogger("iDrive")
 
 
 class BrowserGuiApp:
@@ -64,6 +68,7 @@ class BrowserGuiApp:
         self._ui_queue: queue.Queue[tuple] = queue.Queue()
 
         self._poll_ui_queue()
+        self.root.after(1000, self._start_version_check)
         if not self._try_cached_login():
             self._build_login()
 
@@ -685,6 +690,42 @@ class BrowserGuiApp:
 
         self._run_worker(work, done, failed)
 
+    def _start_version_check(self) -> None:
+        def work():
+            try:
+                return check_for_update()
+            except Exception:
+                logger.exception("Error while checking for update")
+                return None
+
+        self._run_worker(work, self._version_check_done, lambda _exc: None)
+
+    def _version_check_done(self, update: UpdateInfo | None) -> None:
+        if update is None or not self._widget_exists(self.root):
+            return
+
+        # if self.config.get("dismissed_update_version") == update.latest_version:
+        #     return
+
+        if update.is_frozen:
+            message = (
+                f"Version {update.latest_version} is available.\n\n"
+                f"You are running {update.current_version}.\n\n"
+                "Open the GitHub release page to download the new browser GUI?"
+            )
+        else:
+            message = (
+                f"Version {update.latest_version} is available.\n\n"
+                f"You are running {update.current_version}.\n\n"
+                "Open the GitHub release page to download the new browser GUI?"
+            )
+
+        if messagebox.askyesno("Update available", message, parent=self.root):
+            webbrowser.open(update.release_url)
+        else:
+            self.config["dismissed_update_version"] = update.latest_version
+            self._save_config()
+
     def _poll_ui_queue(self) -> None:
         try:
             while True:
@@ -742,7 +783,7 @@ class BrowserGuiApp:
             return False
 
     def _show_callback_exception(self, exc_type, exc, tb) -> None:
-        traceback.print_exception(exc_type, exc, tb)
+        logger.exception(exc)
         messagebox.showerror("Error", "".join(traceback.format_exception_only(exc_type, exc)).strip(), parent=self.root)
 
     def _load_config(self) -> dict:
