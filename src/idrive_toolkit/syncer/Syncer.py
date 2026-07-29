@@ -71,6 +71,9 @@ class Syncer:
         self._transfer_progress_callback: TransferProgressCallback | None = None
         self._status_callback: Callable[[str], None] | None = None
         self._active_transfer = None
+        self._active_transfer_direction: TransferProgressDirection | None = None
+        self._last_transfer = None
+        self._last_transfer_direction: TransferProgressDirection | None = None
         self._active_transfer_cancel_thread: threading.Thread | None = None
         self._active_transfer_lock = threading.Lock()
         self._transfer_cancel_requested = threading.Event()
@@ -119,6 +122,39 @@ class Syncer:
                 if self._active_transfer is active_transfer and self._active_transfer_cancel_thread is None:
                     self._active_transfer_cancel_thread = cancel_thread
                     cancel_thread.start()
+
+    def pause_current_transfer(self) -> bool:
+        with self._active_transfer_lock:
+            active_transfer = self._active_transfer
+        if active_transfer is None:
+            return False
+        pause = getattr(active_transfer, "pause_all", None)
+        if not callable(pause):
+            return False
+        pause()
+        return True
+
+    def resume_current_transfer(self) -> bool:
+        with self._active_transfer_lock:
+            active_transfer = self._active_transfer
+        if active_transfer is None:
+            return False
+        resume = getattr(active_transfer, "resume_all", None)
+        if not callable(resume):
+            return False
+        resume()
+        return True
+
+    def get_current_transfer(self) -> tuple[str | None, object | None]:
+        with self._active_transfer_lock:
+            direction = self._active_transfer_direction or self._last_transfer_direction
+            transfer = self._active_transfer if self._active_transfer is not None else self._last_transfer
+            return direction.value if direction is not None else None, transfer
+
+    def get_active_transfer(self) -> tuple[str | None, object | None]:
+        with self._active_transfer_lock:
+            direction = self._active_transfer_direction
+            return direction.value if direction is not None else None, self._active_transfer
 
     def diff(self, local_root: Path, remote_root: Folder | str, progress: DiffProgressCallback | None = None) -> DiffResult:
         temporary_boundary = self._ensure_sync_boundary(local_root, remote_root)
@@ -280,6 +316,9 @@ class Syncer:
 
         with self._active_transfer_lock:
             self._active_transfer = transfer
+            self._active_transfer_direction = direction
+            self._last_transfer = transfer
+            self._last_transfer_direction = direction
             self._active_transfer_cancel_thread = None
         self._transfer_cancel_requested.clear()
 
@@ -337,6 +376,7 @@ class Syncer:
             with self._active_transfer_lock:
                 if self._active_transfer is transfer:
                     self._active_transfer = None
+                    self._active_transfer_direction = None
                     self._active_transfer_cancel_thread = None
             self._transfer_cancel_requested.clear()
 

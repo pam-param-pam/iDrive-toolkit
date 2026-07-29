@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import re
 import sys
 import threading
 import tkinter as tk
@@ -49,7 +50,7 @@ class _GuiStream:
 
     def write(self, text: str) -> int:
         if text:
-            self._write_log(text, self._level_name)
+            self._write_log(text, self._classify_text(text))
             if self._original is not None:
                 self._original.write(text)
         return len(text)
@@ -66,6 +67,14 @@ class _GuiStream:
     @property
     def encoding(self):
         return getattr(self._original, "encoding", None)
+
+    def _classify_text(self, text: str) -> str:
+        match = re.search(r"\b(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b", text)
+        if match:
+            return match.group(1)
+        if "Traceback (most recent call last)" in text or "Exception" in text:
+            return "EXCEPTION"
+        return self._level_name
 
 
 class _GuiLogHandler(logging.Handler):
@@ -129,6 +138,7 @@ class BrowserGuiApp:
         self._log_window = None
         self._log_text = None
         self._log_filter_var = tk.StringVar(value="All")
+        self._log_filter_var.trace_add("write", lambda *_args: self._render_log_buffer())
         self._original_stdout = sys.stdout
         self._original_stderr = sys.stderr
         self._stdout_proxy = None

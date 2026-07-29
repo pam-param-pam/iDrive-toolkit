@@ -113,9 +113,32 @@ class TransferStatusBar:
             self.set_abort_enabled(False)
             self.set_pause_enabled(False)
             return
+        if self._transfer is not None and self.is_transfer_paused(self._transfer):
+            self.set_paused(True)
+            self.set_progress(progress.current_bytes, progress.total_bytes)
+            if self._paused_status is None:
+                self._paused_status = self.format_sync_progress(
+                    TransferProgress(
+                        direction=progress.direction,
+                        phase=progress.phase,
+                        message="Paused files",
+                        current_bytes=progress.current_bytes,
+                        total_bytes=progress.total_bytes,
+                        completed_items=progress.completed_items,
+                        total_items=progress.total_items,
+                        failed_items=progress.failed_items,
+                        bytes_per_second=0.0,
+                        eta_seconds=None,
+                    )
+                )
+            self.status_var.set(self._paused_status)
+            self.set_abort_enabled(True)
+            self.set_pause_enabled(True)
+            return
         self.status_var.set(self.format_sync_progress(progress))
         self.set_progress(progress.current_bytes, progress.total_bytes)
         self.set_abort_enabled(progress.phase == TransferProgressPhase.RUNNING)
+        self.set_pause_enabled(progress.phase == TransferProgressPhase.RUNNING)
 
     def attach_transfer(self, direction: str, transfer: Any) -> None:
         self._aborting = False

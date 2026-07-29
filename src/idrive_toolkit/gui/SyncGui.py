@@ -8,6 +8,7 @@ import threading
 import tkinter as tk
 import traceback
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -52,6 +53,14 @@ class SyncGui:
         self._busy = False
         self._sort_column = "name"
         self._sort_reverse = False
+        self._state_window = None
+        self._state_table = None
+        self._state_filter_failed = None
+        self._state_rows: dict[str, dict[str, str]] = {}
+        self._state_refresh_after_id = None
+        self._state_sort_column = "added"
+        self._state_sort_reverse = False
+        self._attached_transfer = None
         self._owns_root = parent is None
         self._closed = False
 
@@ -105,6 +114,14 @@ class SyncGui:
             return False
         try:
             return bool(self.root.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _widget_exists(self, widget) -> bool:
+        if widget is None:
+            return False
+        try:
+            return bool(widget.winfo_exists())
         except tk.TclError:
             return False
 
@@ -204,9 +221,18 @@ class SyncGui:
         bottom = ttk.Frame(self.root, padding=(10, 4, 10, 10))
         bottom.grid(row=3, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
-        self.transfer_status = TransferStatusBar(bottom, abort_icon=self.icons["action_cancel"], abort_command=self.abort_transfer)
+        self.transfer_status = TransferStatusBar(
+            bottom,
+            abort_icon=self.icons["action_cancel"],
+            abort_command=self.abort_transfer,
+            pause_icon=self.icons["action_pause"],
+            resume_icon=self.icons["action_resume"],
+            pause_command=self.toggle_transfer_pause,
+        )
         self.status_var = self.transfer_status.status_var
         self.progress_var = self.transfer_status.progress_var
+        self.transfer_states_button = ttk.Button(bottom, text="File States", command=self.show_transfer_states, state="disabled")
+        self.transfer_states_button.grid(row=0, column=4, sticky="e", padx=(6, 0))
 
     def _button(self, parent, text: str, command, icon_key: str | None = None) -> ttk.Button:
         image = self.icons.get(icon_key) if icon_key else None
@@ -235,6 +261,8 @@ class SyncGui:
             "action_trash": self._create_action_icon("trash"),
             "action_open": self._create_action_icon("open"),
             "action_cancel": self._create_action_icon("cancel"),
+            "action_pause": self._create_action_icon("pause"),
+            "action_resume": self._create_action_icon("resume"),
         }
         for key, color, label in (
             ("file", "#6b7785", ""),
@@ -328,6 +356,11 @@ class SyncGui:
             draw.ellipse((3, 3, 15, 15), outline=red, width=2)
             draw.line((6, 6, 12, 12), fill=red, width=2)
             draw.line((12, 6, 6, 12), fill=red, width=2)
+        elif kind == "pause":
+            draw.rectangle((5, 4, 7, 14), fill=gray)
+            draw.rectangle((11, 4, 13, 14), fill=gray)
+        elif kind == "resume":
+            draw.polygon([(6, 4), (14, 9), (6, 14)], fill=green)
 
         return ImageTk.PhotoImage(image)
 
@@ -385,7 +418,9 @@ class SyncGui:
     def _apply_transfer_progress(self, progress: TransferProgress) -> None:
         if not self._window_alive():
             return
+        self._attach_current_transfer_if_needed()
         self.transfer_status.apply_sync_progress(progress)
+        self._update_transfer_states_button()
 
     def _queue_status(self, status: str) -> None:
         self._safe_after(lambda status=status: self._set_busy(True, status))
@@ -645,6 +680,312 @@ class SyncGui:
     def abort_transfer(self) -> None:
         self.transfer_status.set_aborting()
         self.syncer.abort_current_transfer()
+
+    def toggle_transfer_pause(self) -> None:
+        direction, transfer = self.syncer.get_active_transfer()
+        if transfer is None:
+            return
+
+        ctx = getattr(transfer, "ctx", None)
+        is_paused = getattr(ctx, "is_paused", None)
+        paused = bool(is_paused()) if callable(is_paused) else False
+
+        if paused:
+            if self.syncer.resume_current_transfer():
+                self.transfer_status.set_paused(False)
+        else:
+            if self.syncer.pause_current_transfer():
+                self.transfer_status.set_paused(True)
+
+    def _attach_current_transfer_if_needed(self) -> None:
+        direction, transfer = self.syncer.get_active_transfer()
+        if transfer is None or direction is None or self._attached_transfer is transfer:
+            return
+        self._attached_transfer = transfer
+        self.transfer_status.attach_transfer(direction, transfer)
+
+    def _get_report_transfer(self):
+        return self.syncer.get_current_transfer()
+
+    def _update_transfer_states_button(self) -> None:
+        button = getattr(self, "transfer_states_button", None)
+        if not self._widget_exists(button):
+            return
+        _direction, transfer = self._get_report_transfer()
+        button.configure(state="normal" if transfer is not None else "disabled")
+
+    def show_transfer_states(self) -> None:
+        direction, transfer = self._get_report_transfer()
+        if transfer is None:
+            messagebox.showinfo("File States", "No upload or download state is available yet.", parent=self.root)
+            return
+
+        if self._widget_exists(self._state_window):
+            self._state_window.lift()
+            self._state_window.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("File States")
+        window.geometry("1100x520")
+        window.minsize(760, 320)
+        window.transient(self.root)
+        apply_window_icon(window)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        frame = ttk.Frame(window, padding=8)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        columns = ("added", "status", "name", "path", "progress", "reason")
+        table = ttk.Treeview(frame, columns=columns, show="headings", selectmode="extended")
+        self._state_column_titles = {
+            "added": "Added",
+            "status": "Status",
+            "name": "Name",
+            "path": "Path",
+            "progress": "Progress",
+            "reason": "Reason",
+        }
+        for column, title, width in (
+            ("added", "Added", 150),
+            ("status", "Status", 120),
+            ("name", "Name", 220),
+            ("path", "Path", 340),
+            ("progress", "Progress", 110),
+            ("reason", "Reason", 260),
+        ):
+            table.heading(column, text=title, command=lambda c=column: self._sort_transfer_states(c))
+            table.column(column, width=width, stretch=column in ("name", "path", "reason"))
+        table.tag_configure("failed", foreground="#b42318")
+        table.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=table.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        table.configure(yscrollcommand=scroll.set)
+
+        controls = ttk.Frame(frame)
+        controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        controls.columnconfigure(0, weight=1)
+        self._state_filter_failed = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="Failed/aborted only", variable=self._state_filter_failed, command=self._refresh_transfer_states).grid(row=0, column=0, sticky="w")
+        ttk.Button(controls, text="Copy Selected Paths", command=lambda: self._copy_state_values("path", selected=True)).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(controls, text="Copy Selected Names", command=lambda: self._copy_state_values("name", selected=True)).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(controls, text="Copy Failed/Aborted", command=lambda: self._copy_state_values("path", failed_only=True)).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(controls, text="Refresh", command=self._refresh_transfer_states).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(controls, text="Close", command=window.destroy).grid(row=0, column=5)
+
+        menu = tk.Menu(window, tearoff=False)
+        menu.add_command(label="Copy Path", command=lambda: self._copy_state_values("path", selected=True))
+        menu.add_command(label="Copy Name", command=lambda: self._copy_state_values("name", selected=True))
+        menu.add_command(label="Copy Reason", command=lambda: self._copy_state_values("reason", selected=True))
+        table.bind("<Button-3>", lambda event: self._show_state_context_menu(event, menu))
+        table.bind("<Control-c>", lambda _event: self._copy_state_values("path", selected=True))
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        window.bind("<Escape>", lambda _event: window.destroy())
+
+        self._state_window = window
+        self._state_table = table
+        self._configure_state_sort_headings()
+        self._refresh_transfer_states()
+
+    def _refresh_transfer_states(self) -> None:
+        self._state_refresh_after_id = None
+        if not self._widget_exists(self._state_table):
+            return
+
+        direction, transfer = self._get_report_transfer()
+        rows = self._collect_transfer_state_rows(direction, transfer)
+        failed_only = bool(self._state_filter_failed and self._state_filter_failed.get())
+        shown = [row for row in rows if not failed_only or row["is_failed"] == "1" or row["is_aborted"] == "1"]
+        selected_keys = {
+            row["key"]
+            for item_id in self._state_table.selection()
+            if (row := self._state_rows.get(str(item_id))) is not None
+        }
+
+        for item_id in self._state_table.get_children():
+            self._state_table.delete(item_id)
+        self._state_rows = {}
+        restored_selection = []
+        for index, row in enumerate(shown):
+            iid = str(index)
+            self._state_rows[iid] = row
+            tags = ("failed",) if row["is_failed"] == "1" else ()
+            self._state_table.insert("", "end", iid=iid, values=(row["added"], row["status"], row["name"], row["path"], row["progress"], row["reason"]), tags=tags)
+            if row["key"] in selected_keys:
+                restored_selection.append(iid)
+        if restored_selection:
+            self._state_table.selection_set(restored_selection)
+
+        _active_direction, active_transfer = self.syncer.get_active_transfer()
+        if active_transfer is not None:
+            self._schedule_transfer_states_refresh()
+
+    def _schedule_transfer_states_refresh(self) -> None:
+        if self._state_refresh_after_id is not None or not self._widget_exists(self._state_table):
+            return
+        self._state_refresh_after_id = self.root.after(1000, self._refresh_transfer_states)
+
+    def _collect_transfer_state_rows(self, direction: str | None, transfer) -> list[dict[str, str]]:
+        if transfer is None:
+            return []
+        ctx = getattr(transfer, "ctx", None)
+        if ctx is None:
+            return []
+
+        records = getattr(ctx, "records", {})
+        rows = []
+        for index, error in enumerate(getattr(ctx, "errors", []), start=1):
+            rows.append(
+                {
+                    "key": f"transfer-error:{index}",
+                    "added": "",
+                    "added_at": str(float("inf")),
+                    "status": "failed",
+                    "name": f"transfer error {index}",
+                    "path": f"transfer error {index}",
+                    "progress": "",
+                    "progress_value": "0",
+                    "reason": self._format_error_reason(error),
+                    "is_failed": "1",
+                    "is_aborted": "0",
+                }
+            )
+
+        for state_id, state in ctx.get_all_states().items():
+            with getattr(state, "lock", threading.Lock()):
+                status = getattr(getattr(state, "status", ""), "value", getattr(state, "status", ""))
+                error = getattr(state, "error", None)
+                rows.append(self._transfer_state_row(direction, str(state_id), state, records.get(state_id), str(status), error))
+        rows.sort(key=self._transfer_state_sort_key, reverse=self._state_sort_reverse)
+        return rows
+
+    def _transfer_state_row(self, direction: str | None, state_id: str, state, record, status: str, error) -> dict[str, str]:
+        name = state_id
+        path = state_id
+        size_total = getattr(state, "size_total", 0) or 0
+        current = getattr(state, "bytes_downloaded", None)
+        if current is None:
+            current = getattr(state, "bytes_uploaded", 0) or 0
+
+        artifacts = getattr(state, "artifacts", None)
+        if artifacts is not None:
+            name = str(getattr(artifacts, "name", "") or name)
+            path = str(getattr(artifacts, "local_path", "") or name)
+            size_total = getattr(artifacts, "size", size_total) or size_total
+
+        if record is not None:
+            file_info = getattr(record, "file_info", None)
+            if file_info is not None:
+                name = str(getattr(file_info, "name", "") or name)
+                path = str(getattr(record, "final_user_output_path", "") or getattr(file_info, "path", "") or path)
+
+        added_at = float(getattr(state, "added_at", 0.0) or 0.0)
+        return {
+            "key": state_id,
+            "added": self._format_added_timestamp(added_at),
+            "added_at": str(added_at),
+            "status": status,
+            "name": name,
+            "path": path,
+            "progress": f"{self._format_bytes(int(current))}/{self._format_bytes(int(size_total))}",
+            "progress_value": str(int(current)),
+            "reason": self._format_error_reason(error),
+            "is_failed": "1" if status in ("failed", "save_failed") else "0",
+            "is_aborted": "1" if status == "aborted" else "0",
+        }
+
+    def _format_error_reason(self, error) -> str:
+        if error is None:
+            return ""
+
+        parts = []
+        message = getattr(error, "message", None) or str(error) or repr(error)
+        parts.append(f"{error.__class__.__name__}: {message}")
+
+        status = getattr(error, "status", None)
+        if status is not None and f"HTTP {status}" not in message:
+            parts.append(f"HTTP {status}")
+
+        method = getattr(error, "method", None)
+        url = getattr(error, "url", None)
+        if method or url:
+            target = " ".join(str(part) for part in (method, url) if part)
+            if target and target not in message:
+                parts.append(target)
+
+        text = getattr(error, "text", None)
+        if text and text not in message:
+            parts.append(str(text))
+
+        cause = getattr(error, "cause", None) or getattr(error, "__cause__", None)
+        if cause is not None:
+            cause_message = str(cause)
+            if cause_message and cause_message not in message:
+                parts.append(f"caused by {cause.__class__.__name__}: {cause_message}")
+
+        return " | ".join(parts)
+
+    def _format_added_timestamp(self, value: float) -> str:
+        if value <= 0:
+            return ""
+        return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _sort_transfer_states(self, column: str) -> None:
+        if self._state_sort_column == column:
+            self._state_sort_reverse = not self._state_sort_reverse
+        else:
+            self._state_sort_column = column
+            self._state_sort_reverse = False
+        self._configure_state_sort_headings()
+        self._refresh_transfer_states()
+
+    def _transfer_state_sort_key(self, row: dict[str, str]):
+        column = self._state_sort_column
+        if column == "added":
+            return float(row.get("added_at", "0") or 0)
+        if column == "progress":
+            return int(row.get("progress_value", "0") or 0)
+        return row.get(column, "").lower()
+
+    def _configure_state_sort_headings(self) -> None:
+        table = getattr(self, "_state_table", None)
+        if not self._widget_exists(table):
+            return
+        for column, title in getattr(self, "_state_column_titles", {}).items():
+            suffix = ""
+            if column == self._state_sort_column:
+                suffix = " v" if self._state_sort_reverse else " ^"
+            table.heading(column, text=f"{title}{suffix}", command=lambda c=column: self._sort_transfer_states(c))
+
+    def _copy_state_values(self, key: str, *, selected: bool = False, failed_only: bool = False) -> None:
+        if not self._widget_exists(self._state_table):
+            return
+        item_ids = self._state_table.selection() if selected else self._state_table.get_children()
+        values = []
+        for item_id in item_ids:
+            row = self._state_rows.get(str(item_id))
+            if row is None or (failed_only and row["is_failed"] != "1" and row["is_aborted"] != "1"):
+                continue
+            value = row.get(key, "")
+            if value:
+                values.append(value)
+        if not values:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(values))
+
+    def _show_state_context_menu(self, event, menu: tk.Menu) -> None:
+        row_id = self._state_table.identify_row(event.y)
+        if row_id:
+            if row_id not in self._state_table.selection():
+                self._state_table.selection_set(row_id)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def _apply_entries(self, entries: list[DiffEntry], handler, prompt: str) -> None:
         if not entries:
@@ -1350,8 +1691,12 @@ class SyncGui:
         self._busy = busy
         self.status_var.set(status)
         self.transfer_status.set_abort_enabled(False)
+        self.transfer_status.set_pause_enabled(False)
+        self._update_transfer_states_button()
         if not busy:
             self.transfer_status.set_progress(0, 0)
+            self.transfer_status.clear_transfer()
+            self._attached_transfer = None
         state = "disabled" if busy else "normal"
         for button in self.buttons:
             button.configure(state=state)
