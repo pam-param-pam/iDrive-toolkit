@@ -86,6 +86,7 @@ class FragmentTask:
 class FileState:
     file_id: str
     fragments_total: int
+    added_at: float = field(default_factory=time.time)
     fragments_downloaded: int = 0
     size_total: int = 0
     bytes_downloaded: int = 0
@@ -157,6 +158,10 @@ class ThrottleState:
             first_ts = self._byte_events[0][0]
             duration = max(now - first_ts, 0.001)
             return total_bytes / duration
+
+    def reset_bytes(self) -> None:
+        with self.lock:
+            self._byte_events.clear()
 
     def _prune_times(self, arr, now: float) -> None:
         cutoff = now - self.window

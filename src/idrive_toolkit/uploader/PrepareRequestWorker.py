@@ -3,6 +3,7 @@ import time
 import uuid
 import zlib
 from collections import defaultdict
+from pathlib import Path
 from queue import Full, Queue
 from typing import Iterator
 
@@ -54,6 +55,10 @@ class _RequestBuilder:
         return len(self.attachments) < self.ctx.max_attachments and self.total_size + attachment.size <= self.ctx.max_size
 
     def add(self, attachment: DiscordAttachment) -> None:
+        if attachment.size > self.ctx.max_size:
+            raise RuntimeError(
+                f"{attachment.__class__.__name__} size {attachment.size} exceeds max Discord content size {self.ctx.max_size}"
+            )
         self.attachments.append(attachment)
         self.total_size += attachment.size
 
@@ -187,12 +192,13 @@ class PrepareRequestWorker:
                 thumb_encryptor = Encryptor(method=thumbnail_crypto.method, key=thumbnail_crypto.key, iv=thumbnail_crypto.iv)
                 encrypted_thumb = thumb_encryptor.encrypt(thumbnail.data)
                 att = ThumbnailAttachment(frontend_id=frontend_id, data=encrypted_thumb, crypto=thumbnail_crypto)
-                self.ctx.set_expected_thumbnail(frontend_id, True)
+                if not self._should_skip_oversized_extracted_attachment(att, path):
+                    self.ctx.set_expected_thumbnail(frontend_id, True)
 
-                req = self._builder.flush_if_needed(att)
-                if req:
-                    yield req
-                self._builder.add(att)
+                    req = self._builder.flush_if_needed(att)
+                    if req:
+                        yield req
+                    self._builder.add(att)
 
         if is_video:
             with prof.measure("subtitles"):
@@ -202,6 +208,11 @@ class PrepareRequestWorker:
                     encrypted_sub = sub_encryptor.encrypt(sub.data)
                     att = SubtitleAttachment(frontend_id=frontend_id, data=encrypted_sub, language=sub.language, is_forced=sub.is_forced, crypto=subtitle_crypto)
                     self.ctx.increment_expected_subtitles(frontend_id)
+
+                    if self._should_skip_oversized_extracted_attachment(att, path):
+                        with self.ctx.states[frontend_id].lock:
+                            self.ctx.states[frontend_id].expected_subtitles -= 1
+                        continue
 
                     req = self._builder.flush_if_needed(att)
                     if req:
@@ -229,8 +240,7 @@ class PrepareRequestWorker:
                 remaining_file = file_size - offset
 
                 # ---- PRE-FLUSH (like JS) ----
-                if (remaining_request < max_size // 3 < remaining_file) \
-                        or len(self._builder.attachments) >= self.ctx.max_attachments:
+                if (remaining_request < max_size // 3 < remaining_file) or len(self._builder.attachments) >= self.ctx.max_attachments:
                     with prof.measure("flush"):
                         req = self._builder.flush()
                     if req:
@@ -316,3 +326,17 @@ class PrepareRequestWorker:
                     continue
                 state.error = error
                 state.status = FileUploadStatus.FAILED
+
+    def _should_skip_oversized_extracted_attachment(self, attachment: DiscordAttachment, path: Path) -> bool:
+        if attachment.size <= self.ctx.max_size:
+            return False
+
+        logger.warning(
+            "[PrepareRequestWorker] Skipping oversized extracted attachment type=%s file=%r local_path=%r size=%s max_content_size=%s",
+            attachment.__class__.__name__,
+            path.name,
+            str(path),
+            attachment.size,
+            self.ctx.max_size,
+        )
+        return True

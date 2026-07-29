@@ -215,7 +215,7 @@ class Client:
             user_settings = self.get_user_profile()
             discord_settings = self.get_discord_settings()
 
-            max_workers = len(discord_settings.webhooks) * 2
+            max_workers = min(len(discord_settings.webhooks) * 2, 8)
             self._ultra_uploader = UltraUploader(
                 min_workers=1,
                 max_workers=max_workers,

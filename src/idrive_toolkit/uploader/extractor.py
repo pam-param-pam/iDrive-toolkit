@@ -1,4 +1,5 @@
 import json
+import html
 import logging
 import re
 import subprocess
@@ -296,21 +297,30 @@ def extract_subtitles_if_needed(extensions: Mapping[str, list[str]], extension: 
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,   # <-- don’t hide errors blindly
-                timeout=5,
+                timeout=20,
                 creationflags=_media_creationflags(),
             )
 
             if proc.returncode != 0:
                 logger.debug(
-                    "[Extractor] subtitle extract failed for %s (stream %d): %s",
+                    "Subtitle extract failed for %s (stream %d): %s",
                     path, sub_index, proc.stderr.decode(errors="ignore")
                 )
                 continue
 
             if proc.stdout:
+                subtitle_data = _sanitize_extracted_webvtt(proc.stdout)
+                if len(subtitle_data) != len(proc.stdout):
+                    logger.debug(
+                        "Sanitized subtitle stream source=%s stream=%s before=%s after=%s",
+                        path,
+                        sub_index,
+                        len(proc.stdout),
+                        len(subtitle_data),
+                    )
                 results.append(
                     ExtractedSubtitle(
-                        data=proc.stdout,
+                        data=subtitle_data,
                         language=language,
                         is_forced=is_forced,
                     )
@@ -318,19 +328,154 @@ def extract_subtitles_if_needed(extensions: Mapping[str, list[str]], extension: 
 
         except subprocess.TimeoutExpired:
             logger.debug(
-                "[Extractor] subtitle timeout for %s (stream %d)",
+                "Subtitle timeout for %s (stream %d)",
                 path, sub_index
             )
             continue
 
         except Exception:
             logger.exception(
-                "[Extractor] unexpected subtitle failure for %s (stream %d)",
+                "Unexpected subtitle failure for %s (stream %d)",
                 path, sub_index
             )
             continue
 
     return results
+
+
+def _sanitize_extracted_webvtt(data: bytes) -> bytes:
+    try:
+        text = data.decode("utf-8", errors="replace")
+        cues = _parse_webvtt_cues(text)
+        if not cues:
+            return data
+
+        cleaned = []
+        for start, end, body in cues:
+            cleaned_body = _clean_subtitle_body(body)
+            if not cleaned_body:
+                continue
+            if cleaned and _should_merge_cues(cleaned[-1], (start, end, cleaned_body)):
+                prev_start, _prev_end, prev_body = cleaned[-1]
+                cleaned[-1] = (prev_start, end, _best_merged_body(prev_body, cleaned_body))
+            else:
+                cleaned.append((start, end, cleaned_body))
+
+        if not cleaned:
+            return data
+
+        rendered = ["WEBVTT", ""]
+        for start, end, body in cleaned:
+            rendered.append(f"{_format_vtt_timestamp(start)} --> {_format_vtt_timestamp(end)}")
+            rendered.extend(body.splitlines())
+            rendered.append("")
+
+        return "\n".join(rendered).encode("utf-8")
+    except Exception:
+        logger.exception("Failed to sanitize extracted subtitle")
+        return data
+
+
+def _parse_webvtt_cues(text: str) -> list[tuple[int, int, str]]:
+    cues = []
+    for block in re.split(r"\r?\n\r?\n", text.strip()):
+        lines = [line.strip("\ufeff") for line in block.splitlines()]
+        time_index = next((idx for idx, line in enumerate(lines) if "-->" in line), None)
+        if time_index is None:
+            continue
+
+        time_line = lines[time_index]
+        start_text, end_text = [part.strip().split()[0] for part in time_line.split("-->", 1)]
+        start = _parse_vtt_timestamp(start_text)
+        end = _parse_vtt_timestamp(end_text)
+        body = "\n".join(lines[time_index + 1 :])
+        if start is not None and end is not None and body.strip():
+            cues.append((start, end, body))
+    return cues
+
+
+def _parse_vtt_timestamp(value: str) -> Optional[int]:
+    match = re.fullmatch(r"(?:(\d+):)?(\d{2}):(\d{2})\.(\d{3})", value)
+    if not match:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    millis = int(match.group(4))
+    return (((hours * 60) + minutes) * 60 + seconds) * 1000 + millis
+
+
+def _format_vtt_timestamp(value: int) -> str:
+    millis = value % 1000
+    total_seconds = value // 1000
+    seconds = total_seconds % 60
+    total_minutes = total_seconds // 60
+    minutes = total_minutes % 60
+    hours = total_minutes // 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+
+def _clean_subtitle_body(body: str) -> str:
+    text = " ".join(line.strip() for line in body.splitlines() if line.strip())
+    text = html.unescape(re.sub(r"<[^>]+>", "", text))
+    text = re.split(r"\s+[mlb]\s+-?\d", text, maxsplit=1)[0]
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+
+    tokens = text.split()
+    first_content = next(
+        (
+            idx
+            for idx, token in enumerate(tokens)
+            if any(ch.isupper() for ch in token) or token[:1].isdigit() or token[:1] in "\"'(["
+        ),
+        None,
+    )
+    if first_content and all(re.fullmatch(r"[a-z']{1,4}", token) for token in tokens[:first_content]):
+        text = " ".join(tokens[first_content:])
+        tokens = text.split()
+
+    if not any(any(ch.isupper() for ch in token) for token in tokens):
+        return ""
+
+    while len(tokens) > 1 and re.fullmatch(r"[a-z']{1,4}", tokens[-1]):
+        candidate = tokens[:-1]
+        if not any(any(ch.isupper() for ch in token) for token in candidate):
+            break
+        tokens = candidate
+    text = " ".join(tokens)
+
+    if len(tokens) >= 4 and sum(1 for token in tokens if len(token) == 1) / len(tokens) > 0.7:
+        return ""
+    if len(text) > 500:
+        return ""
+    return text
+
+
+def _should_merge_cues(previous: tuple[int, int, str], current: tuple[int, int, str]) -> bool:
+    _prev_start, prev_end, prev_body = previous
+    start, _end, body = current
+    if start - prev_end > 250:
+        return False
+    prev_normalized = _normalize_subtitle_text(prev_body)
+    body_normalized = _normalize_subtitle_text(body)
+    return (
+        prev_normalized == body_normalized
+        or body_normalized.startswith(prev_normalized)
+        or prev_normalized.startswith(body_normalized)
+    )
+
+
+def _best_merged_body(previous: str, current: str) -> str:
+    return current if len(_normalize_subtitle_text(current)) >= len(_normalize_subtitle_text(previous)) else previous
+
+
+def _normalize_subtitle_text(value: str) -> str:
+    return re.sub(r"\s+", "", value).lower()
+
+
+
 def _get_video_duration(path: Path) -> Optional[float]:
     try:
         require_media_tool("ffprobe")
@@ -418,7 +563,7 @@ def _extract_video_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
 
     except subprocess.CalledProcessError as e:
         logger.error(
-            "[Extractor] Video thumbnail extraction failed for %s\nffmpeg stderr:\n%s",
+            "Video thumbnail extraction failed for %s\nffmpeg stderr:\n%s",
             path,
             e.stderr.decode(errors="ignore") if isinstance(e.stderr, bytes) else e.stderr,
         )
@@ -445,7 +590,7 @@ def _encode_webp_thumbnail(img: Image.Image, quality: int = 70) -> Optional[Extr
         return ExtractedThumbnail(data=data)
 
     except Exception:
-        logger.exception("[Extractor] WEBP encoding failed")
+        logger.exception("WEBP encoding failed")
         return None
 
 def _extract_audio_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
@@ -476,18 +621,18 @@ def _extract_audio_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
 
     except subprocess.CalledProcessError as e:
         logger.debug(
-            "[Extractor] audio thumbnail extraction failed for %s: %s",
+            "Audio thumbnail extraction failed for %s: %s",
             path,
             e.stderr.decode(errors="ignore") if isinstance(e.stderr, bytes) else e.stderr,
         )
         return None
 
     except subprocess.TimeoutExpired:
-        logger.debug("[Extractor] audio thumbnail timeout for %s", path)
+        logger.debug("[ExtractAudio thumbnail timeout for %s", path)
         return None
 
     except Exception:
-        logger.exception("[Extractor] unexpected audio thumbnail failure for %s", path)
+        logger.exception("U] unexpected audio thumbnail failure for %s", path)
         return None
 
 def _extract_image_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
@@ -496,7 +641,7 @@ def _extract_image_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
             return _encode_webp_thumbnail(img)
 
     except Exception:
-        logger.exception("[Extractor] Image thumbnail extraction failed for %s", path)
+        logger.exception("Image thumbnail extraction failed for %s", path)
         return None
 
 def _extract_raw_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
@@ -512,5 +657,5 @@ def _extract_raw_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
         return _encode_webp_thumbnail(img)
 
     except Exception:
-        logger.exception("[Extractor] RAW thumbnail extraction failed for %s", path)
+        logger.exception("RAW thumbnail extraction failed for %s", path)
         return None

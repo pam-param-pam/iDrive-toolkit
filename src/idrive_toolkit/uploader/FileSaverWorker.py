@@ -5,6 +5,7 @@ from typing import List, Dict
 
 from .UploadContext import UploadContext
 from .models import BackendFile, FileUploadStatus
+from ..exceptions import BackendHttpError, BackendInternalServerError, BackendRateLimitError, BackendServerTimeout, BackendServiceUnavailableError
 from ..utils.networker import make_request
 
 logger = logging.getLogger("iDrive")
@@ -95,9 +96,30 @@ class FileSaverWorker:
             if parent_password and lock_from_id:
                 resource_passwords[lock_from_id] = parent_password
 
+        attempt = 0
         try:
-            make_request("POST", "files", data={"files": [asdict(f) for f in files], "resourcePasswords": resource_passwords})
-            self._on_backend_save(files)
+            while not self.ctx.stop_requested.is_set():
+                try:
+                    self._mark_backend_save_retrying(files, attempt)
+                    make_request("POST", "files", data={"files": [asdict(f) for f in files], "resourcePasswords": resource_passwords})
+                    self._on_backend_save(files)
+                    return
+                except Exception as exc:
+                    if not self._is_retryable_backend_save_error(exc):
+                        raise
+
+                    wait = self._backend_retry_wait(exc, attempt)
+                    logger.warning(
+                        "[FileSaverWorker] Backend save transient failure (%s) -> retrying in %.1fs "
+                        "(attempt %s, files=%s)",
+                        exc.__class__.__name__,
+                        wait,
+                        attempt,
+                        len(files),
+                    )
+                    if self.ctx.stop_requested.wait(wait):
+                        return
+                    attempt += 1
 
         except Exception as exc:
             logger.exception(f"Save failed for files: {files}")
@@ -118,6 +140,27 @@ class FileSaverWorker:
             state.status = FileUploadStatus.SAVE_FAILED
             state.error = error
             self.failed_files.append(file)
+
+    def _mark_backend_save_retrying(self, files: List[BackendFile], attempt: int) -> None:
+        status = FileUploadStatus.SAVING if attempt == 0 else FileUploadStatus.RETRYING
+        for file in files:
+            state = self.ctx.states.get(file.frontend_id)
+            if state is None or state.is_terminal():
+                continue
+            state.status = status
+
+    def _is_retryable_backend_save_error(self, error: Exception) -> bool:
+        if isinstance(error, (BackendServerTimeout, BackendRateLimitError, BackendServiceUnavailableError, BackendInternalServerError)):
+            return True
+        if isinstance(error, BackendHttpError):
+            return error.status is not None and error.status >= 500
+        return False
+
+    def _backend_retry_wait(self, error: Exception, attempt: int) -> float:
+        explicit_wait = getattr(error, "wait", None)
+        if explicit_wait is not None:
+            return min(float(explicit_wait), 60.0)
+        return min(60.0, 2.0 * (2 ** min(attempt, 5)))
 
     # ---------------- retry ----------------
 

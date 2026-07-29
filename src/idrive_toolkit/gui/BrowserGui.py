@@ -7,6 +7,7 @@ import sys
 import threading
 import tkinter as tk
 import traceback
+from datetime import datetime
 import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -41,13 +42,14 @@ logger = logging.getLogger("iDrive")
 
 
 class _GuiStream:
-    def __init__(self, original, write_log):
+    def __init__(self, original, write_log, level_name: str):
         self._original = original
         self._write_log = write_log
+        self._level_name = level_name
 
     def write(self, text: str) -> int:
         if text:
-            self._write_log(text)
+            self._write_log(text, self._level_name)
             if self._original is not None:
                 self._original.write(text)
         return len(text)
@@ -73,7 +75,8 @@ class _GuiLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            self._write_log(self.format(record) + "\n")
+            level_name = "EXCEPTION" if record.exc_info else record.levelname
+            self._write_log(self.format(record) + "\n", level_name)
         except Exception:
             self.handleError(record)
 
@@ -104,20 +107,28 @@ class BrowserGuiApp:
         self._active_transfer_lock = threading.Lock()
         self._last_transfer = None
         self._last_transfer_direction = None
+        self._active_upload_queue_lock = threading.Lock()
+        self._active_upload_queue: list[tuple[Path, Folder]] = []
+        self._accepting_active_uploads = False
         self._transfer_cancelled = False
         self._state_window = None
         self._state_table = None
         self._state_filter_failed = None
         self._state_rows: dict[str, dict[str, str]] = {}
         self._state_refresh_after_id = None
+        self._browser_sort_column = "name"
+        self._browser_sort_reverse = False
+        self._state_sort_column = "added"
+        self._state_sort_reverse = False
         self._sync_window = None
         self._ui_queue: queue.Queue[tuple] = queue.Queue()
-        self._log_queue: queue.Queue[str] = queue.Queue()
-        self._log_buffer: list[str] = []
+        self._log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._log_buffer: list[tuple[str, str]] = []
         self._log_buffer_lock = threading.Lock()
         self._max_log_chars = 500_000
         self._log_window = None
         self._log_text = None
+        self._log_filter_var = tk.StringVar(value="All")
         self._original_stdout = sys.stdout
         self._original_stderr = sys.stderr
         self._stdout_proxy = None
@@ -216,10 +227,7 @@ class BrowserGuiApp:
         self.table = ttk.Treeview(table_frame, columns=columns, show="tree headings", selectmode="extended")
         ttk.Style(self.root).configure("Treeview", rowheight=34)
         self.table.heading("#0", text="")
-        self.table.heading("name", text="Name")
-        self.table.heading("size", text="Size")
-        self.table.heading("modified", text="Modified")
-        self.table.heading("id", text="ID")
+        self._configure_browser_sort_headings()
         self.table.column("#0", width=56, minwidth=56, stretch=False, anchor="center")
         self.table.column("name", width=300)
         self.table.column("size", width=110, stretch=False, anchor="e")
@@ -242,11 +250,18 @@ class BrowserGuiApp:
         bottom = ttk.Frame(self.root, padding=(10, 4, 10, 10))
         bottom.grid(row=3, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
-        self.transfer_status = TransferStatusBar(bottom, abort_icon=self.icons["action_cancel"], abort_command=self.abort_transfer)
+        self.transfer_status = TransferStatusBar(
+            bottom,
+            abort_icon=self.icons["action_cancel"],
+            abort_command=self.abort_transfer,
+            pause_icon=self.icons["action_pause"],
+            resume_icon=self.icons["action_resume"],
+            pause_command=self.toggle_transfer_pause,
+        )
         self.status_var = self.transfer_status.status_var
         self.progress_var = self.transfer_status.progress_var
         self.transfer_states_button = ttk.Button(bottom, text="File States", command=self.show_transfer_states, state="disabled")
-        self.transfer_states_button.grid(row=0, column=3, sticky="e", padx=(6, 0))
+        self.transfer_states_button.grid(row=0, column=4, sticky="e", padx=(6, 0))
         self._update_transfer_states_button()
 
     def login(self) -> None:
@@ -517,7 +532,7 @@ class BrowserGuiApp:
             )
 
     def _upload_paths(self, paths: list[Path]) -> None:
-        if self.client is None or self.current_folder is None or self._busy:
+        if self.client is None or self.current_folder is None:
             return
 
         existing_paths = [path for path in paths if path.exists()]
@@ -526,24 +541,59 @@ class BrowserGuiApp:
             return
 
         target_folder = self.current_folder
+        if self._busy:
+            if self._enqueue_active_upload(existing_paths, target_folder):
+                self.status_var.set(f"Queued {len(existing_paths)} more upload item(s)...")
+            return
+
         if len(existing_paths) == 1:
             status = f"Uploading {existing_paths[0].name}..."
         else:
             status = f"Uploading {len(existing_paths)} item(s)..."
         self._set_busy(True, status)
+        with self._active_upload_queue_lock:
+            self._active_upload_queue.clear()
+            self._accepting_active_uploads = True
 
         def work():
             uploader = self.client.get_uploader()
             self._set_active_transfer("upload", uploader)
             try:
-                for path in existing_paths:
-                    uploader.upload(path, parent=target_folder)
-                uploader.join()
+                batch = [(path, target_folder) for path in existing_paths]
+                while batch:
+                    for path, parent in batch:
+                        uploader.upload(path, parent=parent)
+                    uploader.join()
+                    batch = self._take_queued_active_uploads()
                 raise_transfer_errors(uploader, "Upload")
             finally:
+                with self._active_upload_queue_lock:
+                    self._accepting_active_uploads = False
+                    self._active_upload_queue.clear()
                 self._clear_active_transfer()
 
         self._run_password_retryable_worker(work, lambda _result: self._operation_done("Upload complete", refresh=True), [target_folder])
+
+    def _enqueue_active_upload(self, paths: list[Path], parent: Folder) -> bool:
+        with self._active_transfer_lock:
+            is_active_upload = self._active_transfer is not None and self._last_transfer_direction == "upload"
+        if not is_active_upload:
+            return False
+
+        with self._active_upload_queue_lock:
+            if not self._accepting_active_uploads:
+                return False
+            self._active_upload_queue.extend((path, parent) for path in paths)
+            return True
+
+    def _take_queued_active_uploads(self) -> list[tuple[Path, Folder]]:
+        with self._active_upload_queue_lock:
+            if not self._active_upload_queue:
+                self._accepting_active_uploads = False
+                return []
+            batch = self._active_upload_queue
+            self._active_upload_queue = []
+            return batch
 
     def _register_external_drop_target(self, widget) -> None:
         try:
@@ -570,6 +620,24 @@ class BrowserGuiApp:
         self.transfer_status.set_aborting()
         self._transfer_cancelled = True
         threading.Thread(target=lambda: transfer.shutdown(cancel_pending=True), daemon=True).start()
+
+    def toggle_transfer_pause(self) -> None:
+        with self._active_transfer_lock:
+            transfer = self._active_transfer
+
+        if transfer is None:
+            return
+
+        ctx = getattr(transfer, "ctx", None)
+        is_paused = getattr(ctx, "is_paused", None)
+        paused = bool(is_paused()) if callable(is_paused) else False
+
+        if paused:
+            transfer.resume_all()
+            self.transfer_status.set_paused(False)
+        else:
+            transfer.pause_all()
+            self.transfer_status.set_paused(True)
 
     def _load_folder(self, folder: Folder, *, refresh: bool, push: bool = False) -> None:
         if needs_resource_password(folder) and not self._prompt_resource_password(folder):
@@ -614,7 +682,7 @@ class BrowserGuiApp:
             self.syncer.remote.require_cached_item(str(node.uid))
             for node in self.syncer.remote.list_children(self.current_folder)
         ]
-        children.sort(key=lambda item: (not item.is_dir, item.name.lower()))
+        children = self._sort_browser_items(children)
         self.breadcrumbs.set_items(self.current_folder.breadcrumbs)
         for index, item in enumerate(children):
             row_id = str(index)
@@ -775,16 +843,29 @@ class BrowserGuiApp:
         frame = ttk.Frame(window, padding=8)
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        filters = ttk.Frame(frame)
+        filters.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(filters, text="Type").pack(side="left", padx=(0, 6))
+        filter_box = ttk.Combobox(
+            filters,
+            textvariable=self._log_filter_var,
+            values=("All", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "EXCEPTION"),
+            state="readonly",
+            width=12,
+        )
+        filter_box.pack(side="left")
+        filter_box.bind("<<ComboboxSelected>>", lambda _event: self._render_log_buffer())
 
         text = tk.Text(frame, wrap="word", state="disabled", font=("Consolas", 10))
-        text.grid(row=0, column=0, sticky="nsew")
+        text.grid(row=1, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
+        scroll.grid(row=1, column=1, sticky="ns")
         text.configure(yscrollcommand=scroll.set)
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=1, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(8, 0))
         ttk.Button(buttons, text="Clear", command=self._clear_logs).pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Close", command=window.destroy).pack(side="left")
 
@@ -825,16 +906,26 @@ class BrowserGuiApp:
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 
-        columns = ("status", "name", "path", "progress", "reason")
+        columns = ("added", "status", "name", "path", "progress", "reason")
         table = ttk.Treeview(frame, columns=columns, show="headings", selectmode="extended")
+        state_titles = {
+            "added": "Added",
+            "status": "Status",
+            "name": "Name",
+            "path": "Path",
+            "progress": "Progress",
+            "reason": "Reason",
+        }
+        self._state_column_titles = state_titles
         for column, title, width in (
+            ("added", "Added", 150),
             ("status", "Status", 120),
             ("name", "Name", 220),
             ("path", "Path", 340),
             ("progress", "Progress", 110),
             ("reason", "Reason", 260),
         ):
-            table.heading(column, text=title)
+            table.heading(column, text=title, command=lambda c=column: self._sort_transfer_states(c))
             table.column(column, width=width, stretch=column in ("name", "path", "reason"))
         table.tag_configure("failed", foreground="#b42318")
         table.grid(row=0, column=0, sticky="nsew")
@@ -864,6 +955,7 @@ class BrowserGuiApp:
 
         self._state_window = window
         self._state_table = table
+        self._configure_state_sort_headings()
         self._refresh_transfer_states()
 
     def _refresh_transfer_states(self) -> None:
@@ -874,15 +966,25 @@ class BrowserGuiApp:
         rows = self._collect_transfer_state_rows(direction, transfer)
         failed_only = bool(self._state_filter_failed and self._state_filter_failed.get())
         shown = [row for row in rows if not failed_only or row["is_failed"] == "1" or row["is_aborted"] == "1"]
+        selected_keys = {
+            row["key"]
+            for item_id in self._state_table.selection()
+            if (row := self._state_rows.get(str(item_id))) is not None
+        }
 
         for item_id in self._state_table.get_children():
             self._state_table.delete(item_id)
         self._state_rows = {}
+        restored_selection = []
         for index, row in enumerate(shown):
             iid = str(index)
             self._state_rows[iid] = row
             tags = ("failed",) if row["is_failed"] == "1" else ()
-            self._state_table.insert("", "end", iid=iid, values=(row["status"], row["name"], row["path"], row["progress"], row["reason"]), tags=tags)
+            self._state_table.insert("", "end", iid=iid, values=(row["added"], row["status"], row["name"], row["path"], row["progress"], row["reason"]), tags=tags)
+            if row["key"] in selected_keys:
+                restored_selection.append(iid)
+        if restored_selection:
+            self._state_table.selection_set(restored_selection)
 
         failed = sum(1 for row in rows if row["is_failed"] == "1")
         aborted = sum(1 for row in rows if row["is_aborted"] == "1")
@@ -907,6 +1009,9 @@ class BrowserGuiApp:
         for index, error in enumerate(getattr(ctx, "errors", []), start=1):
             rows.append(
                 {
+                    "key": f"transfer-error:{index}",
+                    "added": "",
+                    "added_at": str(float("inf")),
                     "status": "failed",
                     "name": f"transfer error {index}",
                     "path": f"transfer error {index}",
@@ -922,7 +1027,7 @@ class BrowserGuiApp:
                 error = getattr(state, "error", None)
                 row = self._transfer_state_row(direction, str(state_id), state, records.get(state_id), str(status), error)
             rows.append(row)
-        rows.sort(key=lambda row: (row["is_failed"] != "1", row["is_aborted"] != "1", row["name"].lower(), row["path"].lower()))
+        rows.sort(key=self._transfer_state_sort_key, reverse=self._state_sort_reverse)
         return rows
 
     def _transfer_result_message(self, message: str) -> str:
@@ -958,11 +1063,16 @@ class BrowserGuiApp:
 
         is_aborted = status == "aborted"
         reason = self._format_error_reason(error)
+        added_at = float(getattr(state, "added_at", 0.0) or 0.0)
         return {
+            "key": state_id,
+            "added": self._format_added_timestamp(added_at),
+            "added_at": str(added_at),
             "status": status,
             "name": name,
             "path": path,
             "progress": f"{self._format_bytes(int(current))}/{self._format_bytes(int(size_total))}",
+            "progress_value": str(int(current)),
             "reason": reason,
             "is_failed": "1" if status in ("failed", "save_failed") else "0",
             "is_aborted": "1" if is_aborted else "0",
@@ -1000,6 +1110,75 @@ class BrowserGuiApp:
 
         return " | ".join(parts)
 
+    def _format_added_timestamp(self, value: float) -> str:
+        if value <= 0:
+            return ""
+        return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _sort_browser_table(self, column: str) -> None:
+        if self._browser_sort_column == column:
+            self._browser_sort_reverse = not self._browser_sort_reverse
+        else:
+            self._browser_sort_column = column
+            self._browser_sort_reverse = False
+        self._configure_browser_sort_headings()
+        self._render_folder()
+
+    def _browser_item_sort_key(self, item: Item):
+        column = self._browser_sort_column
+        if column == "size":
+            return 0 if item.is_dir else int(getattr(item, "size", 0) or 0)
+        if column == "modified":
+            return getattr(item, "last_modified_at", None) or datetime.min
+        if column == "id":
+            return str(item.id).lower()
+        return item.name.lower()
+
+    def _sort_browser_items(self, items: list[Item]) -> list[Item]:
+        sorted_items = sorted(items, key=self._browser_item_sort_key, reverse=self._browser_sort_reverse)
+        return sorted(sorted_items, key=lambda item: not item.is_dir)
+
+    def _configure_browser_sort_headings(self) -> None:
+        titles = {
+            "name": "Name",
+            "size": "Size",
+            "modified": "Modified",
+            "id": "ID",
+        }
+        self.table.heading("#0", text="")
+        for column, title in titles.items():
+            self.table.heading(column, text=self._sort_heading_title(title, column, self._browser_sort_column, self._browser_sort_reverse), command=lambda c=column: self._sort_browser_table(c))
+
+    def _sort_transfer_states(self, column: str) -> None:
+        if self._state_sort_column == column:
+            self._state_sort_reverse = not self._state_sort_reverse
+        else:
+            self._state_sort_column = column
+            self._state_sort_reverse = False
+        self._configure_state_sort_headings()
+        self._refresh_transfer_states()
+
+    def _transfer_state_sort_key(self, row: dict[str, str]):
+        column = self._state_sort_column
+        if column == "added":
+            return float(row.get("added_at", "0") or 0)
+        if column == "progress":
+            return int(row.get("progress_value", "0") or 0)
+        return row.get(column, "").lower()
+
+    def _configure_state_sort_headings(self) -> None:
+        table = getattr(self, "_state_table", None)
+        if not self._widget_exists(table):
+            return
+        for column, title in getattr(self, "_state_column_titles", {}).items():
+            table.heading(column, text=self._sort_heading_title(title, column, self._state_sort_column, self._state_sort_reverse), command=lambda c=column: self._sort_transfer_states(c))
+
+    @staticmethod
+    def _sort_heading_title(title: str, column: str, active_column: str, reverse: bool) -> str:
+        if column != active_column:
+            return title
+        return f"{title} {'v' if reverse else '^'}"
+
     def _copy_state_values(self, key: str, *, selected: bool = False, failed_only: bool = False) -> None:
         if not self._widget_exists(self._state_table):
             return
@@ -1028,8 +1207,8 @@ class BrowserGuiApp:
             menu.grab_release()
 
     def _install_log_capture(self) -> None:
-        self._stdout_proxy = _GuiStream(self._original_stdout, self._enqueue_log)
-        self._stderr_proxy = _GuiStream(self._original_stderr, self._enqueue_log)
+        self._stdout_proxy = _GuiStream(self._original_stdout, self._enqueue_log, "STDOUT")
+        self._stderr_proxy = _GuiStream(self._original_stderr, self._enqueue_log, "STDERR")
         sys.stdout = self._stdout_proxy
         sys.stderr = self._stderr_proxy
 
@@ -1039,25 +1218,30 @@ class BrowserGuiApp:
         logger.addHandler(handler)
         self._log_handler = handler
 
-    def _enqueue_log(self, text: str) -> None:
+    def _enqueue_log(self, text: str, level_name: str = "OUTPUT") -> None:
+        entry = (level_name, text)
         with self._log_buffer_lock:
-            self._log_buffer.append(text)
-            total_chars = sum(len(part) for part in self._log_buffer)
+            self._log_buffer.append(entry)
+            total_chars = sum(len(part[1]) if isinstance(part, tuple) else len(part) for part in self._log_buffer)
             while self._log_buffer and total_chars > self._max_log_chars:
-                total_chars -= len(self._log_buffer.pop(0))
-        self._log_queue.put(text)
+                old = self._log_buffer.pop(0)
+                total_chars -= len(old[1]) if isinstance(old, tuple) else len(old)
+        self._log_queue.put(entry)
 
     def _poll_log_queue(self) -> None:
         try:
             while True:
-                self._append_log_text(self._log_queue.get_nowait())
+                level_name, text = self._log_queue.get_nowait()
+                self._append_log_text(level_name, text)
         except queue.Empty:
             pass
         if self._widget_exists(self.root):
             self.root.after(100, self._poll_log_queue)
 
-    def _append_log_text(self, text: str) -> None:
+    def _append_log_text(self, level_name: str, text: str) -> None:
         if not self._widget_exists(self._log_text):
+            return
+        if not self._log_entry_visible(level_name):
             return
         self._log_text.configure(state="normal")
         self._log_text.insert("end", text)
@@ -1075,12 +1259,37 @@ class BrowserGuiApp:
         if not self._widget_exists(self._log_text):
             return
         with self._log_buffer_lock:
-            text = "".join(self._log_buffer)
+            text = "".join(
+                entry[1] if isinstance(entry, tuple) else entry
+                for entry in self._log_buffer
+                if self._log_entry_visible(entry[0] if isinstance(entry, tuple) else "OUTPUT")
+            )
         self._log_text.configure(state="normal")
         self._log_text.delete("1.0", "end")
         self._log_text.insert("end", text)
         self._log_text.see("end")
         self._log_text.configure(state="disabled")
+
+    def _log_entry_visible(self, level_name: str) -> bool:
+        selected = self._log_filter_var.get() if self._log_filter_var is not None else "All"
+        if level_name in ("STDOUT", "STDERR"):
+            return True
+        if selected == "All":
+            return True
+
+        levels = {
+            "DEBUG": logging.DEBUG,
+            "INFO": logging.INFO,
+            "WARNING": logging.WARNING,
+            "ERROR": logging.ERROR,
+            "EXCEPTION": logging.ERROR,
+            "CRITICAL": logging.CRITICAL,
+        }
+        selected_level = levels.get(selected)
+        entry_level = levels.get(level_name)
+        if selected_level is None or entry_level is None:
+            return False
+        return entry_level <= selected_level
 
     def _clear_logs(self) -> None:
         with self._log_buffer_lock:
@@ -1163,6 +1372,7 @@ class BrowserGuiApp:
             with self._active_transfer_lock:
                 has_transfer = self._active_transfer is not None
             self.transfer_status.set_abort_enabled(busy and has_transfer)
+            self.transfer_status.set_pause_enabled(busy and has_transfer)
 
     def _clear_root(self) -> None:
         for child in self.root.winfo_children():
@@ -1261,6 +1471,8 @@ class BrowserGuiApp:
             "action_rename": self._create_action_icon("rename"),
             "action_trash": self._create_action_icon("trash"),
             "action_cancel": self._create_action_icon("cancel"),
+            "action_pause": self._create_action_icon("pause"),
+            "action_resume": self._create_action_icon("resume"),
             "action_logout": self._create_action_icon("logout"),
             "action_logs": self._create_action_icon("logs"),
         }
@@ -1341,6 +1553,11 @@ class BrowserGuiApp:
             draw.ellipse((3, 3, 15, 15), outline=red, width=2)
             draw.line((6, 6, 12, 12), fill=red, width=2)
             draw.line((12, 6, 6, 12), fill=red, width=2)
+        elif kind == "pause":
+            draw.rectangle((5, 4, 7, 14), fill=gray)
+            draw.rectangle((11, 4, 13, 14), fill=gray)
+        elif kind == "resume":
+            draw.polygon([(6, 4), (14, 9), (6, 14)], fill=green)
         elif kind == "logout":
             draw.rectangle((3, 4, 10, 14), outline=gray, width=2)
             draw.line((9, 9, 15, 9), fill=red, width=2)

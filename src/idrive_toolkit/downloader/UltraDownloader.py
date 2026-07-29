@@ -247,10 +247,12 @@ class UltraDownloader:
     def pause_all(self) -> None:
         self.ctx.pause_all()
         self.scaler.pause()
+        self._stop_queue_monitor()
 
     def resume_all(self) -> None:
         self.ctx.resume_all()
         self.scaler.resume()
+        self._start_queue_monitor()
 
     # ------------------------------------------------------------------
     # Worker helpers

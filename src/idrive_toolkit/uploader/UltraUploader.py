@@ -23,7 +23,7 @@ from ..utils.autoScaler.AutoScaler import AutoScaler
 
 DOWNLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
     scale_up_step=1,
-    scale_down_step=1,
+    scale_down_step=1_000_000,
 
     scale_up_window=4,
     scale_down_window=8,
@@ -32,10 +32,11 @@ DOWNLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
     plateau_factor=0.10,
 
     hard_error_grace=1,
-    hard_error_cooldown=5.0,
+    hard_error_cooldown=20.0,
+    hard_error_backoff=20,
 
     scale_up_cooldown=5.0,
-    scale_down_cooldown=5.0,
+    scale_down_cooldown=2.0,
 
     initial_workers=4,
 )
@@ -65,7 +66,7 @@ class UltraUploader:
         )
         self.scaler = AutoScaler(throttle_state=self.throttle, policy=self.policy)
 
-        self.MAX_RETRIES = 5
+        self.MAX_RETRIES = 20
 
         # Persistent queues
         self._input_queue: Queue[UploadInput] = Queue()
@@ -221,7 +222,14 @@ class UltraUploader:
         self.scaler.stop()
         if self._scaler_thread is not None and self._scaler_thread.is_alive():
             self._scaler_thread.join()
-
+    """
+    Errors:
+    
+    Check if backend save error is properly retried
+    Check why sometimes after a long upload extractor subs fails for DBSaiki Kusuo no Psi-nan 2_-_01_10bit_BD1080p_x265.mp4
+    Check sub exctraction too big (18mb) for DBSaiki Kusuo no Psi-nan 2_-_01_10bit_BD1080p_x265.mp4
+    
+    """
     def _stop_queue_monitor(self) -> None:
         self._monitor_stop_event.set()
         if self._monitor_thread is not None and self._monitor_thread.is_alive():
@@ -264,6 +272,9 @@ class UltraUploader:
         lock_from = self._check_can_upload(parent)
 
         total_size = self.compute_total_size(path)
+        if self.ctx.is_upload_fully_finished():
+            self.throttle.reset_bytes()
+            self.ctx.reset_sizes()
         self.ctx.add_total_size(total_size)
 
         self.ctx.reserve_upload_request()
@@ -281,9 +292,13 @@ class UltraUploader:
 
     def pause_all(self) -> None:
         self.ctx.pause_all()
+        self.scaler.pause()
+        self._stop_queue_monitor()
 
     def resume_all(self) -> None:
         self.ctx.resume_all()
+        self.scaler.resume()
+        self._start_queue_monitor()
 
     # ------------------------------------------------------------------
     # Optional: graceful shutdown

@@ -38,6 +38,9 @@ class UploadWorker:
                             if not self._wait_until_can_upload():
                                 self._mark_cancelled(request)
                                 break
+                            if not self.ctx.wait_for_discord_retry_gate():
+                                self._mark_cancelled(request)
+                                break
 
                             self._mark_uploading(request)
                             self._upload(request)
@@ -62,10 +65,17 @@ class UploadWorker:
                         except DiscordServerTimeout as e:
                             self.throttle.signal_error()
                             self._mark_retrying(request)
+                            wait = self.ctx.record_discord_transient_failure()
 
-                            logger.warning(f"[UploadWorker] Network issue ({e.__class__.__name__}) -> waiting 5s")
+                            logger.warning(
+                                "[UploadWorker] Discord transient failure (%s) -> shared retry gate %.1fs "
+                                "(retry %s)",
+                                e.__class__.__name__,
+                                wait,
+                                request.retries,
+                            )
 
-                            if self.ctx.stop_requested.wait(5):
+                            if self.ctx.stop_requested.wait(wait):
                                 self._mark_cancelled(request)
                                 break
                             request.retries += 1
@@ -102,14 +112,14 @@ class UploadWorker:
                     "application/octet-stream",
                 )
 
-            response = self._client.post(url + "aaa", data=payload, files=files)
+            response = self._client.post(url, data=payload, files=files)
 
             if response.status_code == 429:
-                self.throttle.signal_error()
                 raise DiscordRateLimitError(response)
 
             response.raise_for_status()
 
+            self.ctx.record_discord_success()
             self._add_bytes(request)
             uploaded_bytes = sum(len(att.data) for att in request.attachments)
             self.throttle.signal_bytes(uploaded_bytes)
@@ -117,9 +127,7 @@ class UploadWorker:
 
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-
             if status in (500, 502, 503, 504):
-                self.throttle.signal_error()
                 raise DiscordServerTimeout(response=e.response, cause=e) from e
 
             raise DiscordHttpError(e.response, cause=e) from e

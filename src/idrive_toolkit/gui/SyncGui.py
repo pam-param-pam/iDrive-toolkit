@@ -50,6 +50,8 @@ class SyncGui:
         self.result = DiffResult()
         self.entries: list[DiffEntry] = []
         self._busy = False
+        self._sort_column = "name"
+        self._sort_reverse = False
         self._owns_root = parent is None
         self._closed = False
 
@@ -176,19 +178,16 @@ class SyncGui:
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
 
-        columns = ("name", "status", "local", "remote")
+        columns = ("name", "status", "size", "local", "remote")
         ttk.Style(self.root).configure("Treeview", rowheight=34)
         self.table = ttk.Treeview(table_frame, columns=columns, show="tree headings", selectmode="extended")
-        self.table.heading("#0", text="")
-        self.table.heading("name", text="Name")
-        self.table.heading("status", text="Status")
-        self.table.heading("local", text="Local")
-        self.table.heading("remote", text="Remote")
+        self._configure_sort_headings()
 
         self.table.column("#0", width=56, minwidth=56, stretch=False, anchor="center")
         self.table.column("name", width=260)
         self.table.column("status", width=110, stretch=False)
-        self.table.column("local", width=430)
+        self.table.column("size", width=110, stretch=False, anchor="e")
+        self.table.column("local", width=360)
         self.table.column("remote", width=260)
         self.table.grid(row=0, column=0, sticky="nsew")
         self.table.bind("<Button-1>", self._clear_selection_on_empty_click, add="+")
@@ -447,7 +446,62 @@ class SyncGui:
         if self.show_same:
             entries.extend(result.same)
 
-        return sorted(entries, key=lambda entry: (not entry.is_folder, entry_name(entry).lower(), entry.status.value))
+        return self._sort_entries(entries)
+
+    def _sort_table(self, column: str) -> None:
+        if self._sort_column == column:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_column = column
+            self._sort_reverse = False
+        self._configure_sort_headings()
+        self.entries = self._sort_entries(self.entries)
+        self._render()
+
+    def _entry_sort_key(self, entry: DiffEntry):
+        column = self._sort_column
+        if column == "status":
+            return entry.status.value
+        if column == "size":
+            return self._entry_size_value(entry)
+        if column == "local":
+            return entry_local_label(entry).lower()
+        if column == "remote":
+            return entry_remote_label(entry).lower()
+        return entry_name(entry).lower(), entry.status.value
+
+    def _sort_entries(self, entries: list[DiffEntry]) -> list[DiffEntry]:
+        sorted_entries = sorted(entries, key=self._entry_sort_key, reverse=self._sort_reverse)
+        return sorted(sorted_entries, key=lambda entry: not entry.is_folder)
+
+    def _entry_size_label(self, entry: DiffEntry) -> str:
+        value = self._entry_size_value(entry)
+        return "-" if value < 0 else self._format_bytes(value)
+
+    def _entry_size_value(self, entry: DiffEntry) -> int:
+        sizes = [
+            node.size
+            for node in (entry.local, entry.remote)
+            if node is not None and node.kind != NodeKind.FOLDER and node.size is not None
+        ]
+        return max(sizes) if sizes else -1
+
+    def _configure_sort_headings(self) -> None:
+        titles = {
+            "name": "Name",
+            "status": "Status",
+            "size": "Size",
+            "local": "Local",
+            "remote": "Remote",
+        }
+        self.table.heading("#0", text="")
+        for column, title in titles.items():
+            self.table.heading(column, text=self._sort_heading_title(title, column), command=lambda c=column: self._sort_table(c))
+
+    def _sort_heading_title(self, title: str, column: str) -> str:
+        if column != self._sort_column:
+            return title
+        return f"{title} {'v' if self._sort_reverse else '^'}"
 
     def open_selected_entry(self) -> None:
         selected = self._selected_entries()
@@ -1027,6 +1081,7 @@ class SyncGui:
                 values=(
                     entry_name(entry),
                     entry.status.value,
+                    self._entry_size_label(entry),
                     entry_local_label(entry),
                     entry_remote_label(entry),
                 ),

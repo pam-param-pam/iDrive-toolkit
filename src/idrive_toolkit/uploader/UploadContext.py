@@ -1,4 +1,5 @@
 import threading
+import time
 from enum import Enum, auto
 from typing import Dict, Optional, Mapping
 
@@ -17,7 +18,7 @@ class UploadContext:
         self.max_size: Optional[int] = None
         self.webhooks: list[Webhook] = []
         self.extensions: Mapping[str, list[str]] = {}
-        self.encryption_method: Optional[EncryptionMethod] = None
+        self.encryption_method: Optional[EncryptionMethod]
 
         self.lock = threading.RLock()
         self.states: Dict[str, UploadFileState] = {}
@@ -28,6 +29,9 @@ class UploadContext:
         self.global_pause = threading.Event()
         self.global_pause.set()
         self.stop_requested = threading.Event()
+        self._discord_retry_lock = threading.Lock()
+        self._discord_retry_until = 0.0
+        self._discord_retry_failures = 0
 
         self.total_size: int = 0
         self.processed_size: int = 0
@@ -137,10 +141,12 @@ class UploadContext:
 
     def pause_all(self) -> None:
         with self.lock:
+            self.state = UploadContextState.PAUSED
             self.global_pause.clear()
 
     def resume_all(self) -> None:
         with self.lock:
+            self.state = UploadContextState.RUNNING
             self.global_pause.set()
 
     def pick_webhook(self):
@@ -150,6 +156,32 @@ class UploadContext:
 
     def is_paused(self) -> bool:
         return self.state == UploadContextState.PAUSED
+
+    def wait_for_discord_retry_gate(self) -> bool:
+        while not self.stop_requested.is_set():
+            with self._discord_retry_lock:
+                now = time.monotonic()
+                remaining = self._discord_retry_until - now
+                if remaining <= 0 and self._discord_retry_failures > 0:
+                    self._discord_retry_until = now + 0.75
+                    return True
+            if remaining <= 0:
+                return True
+            if self.stop_requested.wait(min(remaining, 0.5)):
+                return False
+        return False
+
+    def record_discord_transient_failure(self) -> float:
+        with self._discord_retry_lock:
+            self._discord_retry_failures += 1
+            wait = min(60.0, 5.0 * (2 ** min(self._discord_retry_failures - 1, 4)))
+            self._discord_retry_until = max(self._discord_retry_until, time.monotonic() + wait)
+            return wait
+
+    def record_discord_success(self) -> None:
+        with self._discord_retry_lock:
+            self._discord_retry_failures = 0
+            self._discord_retry_until = 0.0
 
     # -------------------------------------------------
     # Size tracking

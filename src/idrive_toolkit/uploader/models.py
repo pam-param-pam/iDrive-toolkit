@@ -1,5 +1,6 @@
 import base64
 import logging
+import time
 from typing import List
 
 
@@ -159,8 +160,8 @@ class FileArtifacts:
     created_at: int
     size: int
     parent_id: str
-    lock_from_id: str
-    parent_password: str
+    lock_from_id: str | None
+    parent_password: str | None
     file_crypto: Crypto
     encryption_method: EncryptionMethod
     video_metadata: Optional[VideoMetadata]
@@ -170,6 +171,7 @@ class FileArtifacts:
 
 @dataclass
 class UploadFileState:
+    added_at: float = field(default_factory=time.time)
     expected_chunks: int = 0
     uploaded_chunks: int = 0
     expected_subtitles: int = 0
