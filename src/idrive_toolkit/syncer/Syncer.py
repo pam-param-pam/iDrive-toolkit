@@ -431,7 +431,7 @@ class Syncer:
         for state in states.values():
             status = getattr(state, "status", None)
             status_value = getattr(status, "value", status)
-            if status_value in ("completed", "failed", "save_failed"):
+            if status_value in ("completed", "failed", "save_failed", "aborted"):
                 completed_items += 1
             if status_value in ("failed", "save_failed"):
                 failed_items += 1

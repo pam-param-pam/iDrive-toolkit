@@ -21,6 +21,7 @@ class TransferStatusBar:
         self._last_bytes = 0
         self._last_time = 0.0
         self._speed = 0.0
+        self._aborting = False
 
         ttk.Label(parent, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
         self.progress_bar = ttk.Progressbar(parent, variable=self.progress_var, maximum=100, mode="determinate")
@@ -42,7 +43,13 @@ class TransferStatusBar:
     def set_progress(self, current: int | None, total: int | None) -> None:
         self.progress_var.set(self.progress_percent(current, total))
 
+    def set_aborting(self) -> None:
+        self._aborting = True
+        self.status_var.set("Aborting transfer...")
+        self.set_abort_enabled(False)
+
     def reset(self, status: str | None = None) -> None:
+        self._aborting = False
         if status is not None:
             self.status_var.set(status)
         self.progress_var.set(0)
@@ -57,11 +64,15 @@ class TransferStatusBar:
         self.abort_button.configure(state="normal" if enabled else "disabled")
 
     def apply_sync_progress(self, progress: TransferProgress) -> None:
+        if self._aborting:
+            self.set_abort_enabled(False)
+            return
         self.status_var.set(self.format_sync_progress(progress))
         self.set_progress(progress.current_bytes, progress.total_bytes)
         self.set_abort_enabled(progress.phase == TransferProgressPhase.RUNNING)
 
     def attach_transfer(self, direction: str, transfer: Any) -> None:
+        self._aborting = False
         self._transfer = transfer
         self._direction = direction
         self._last_bytes = 0
@@ -90,8 +101,11 @@ class TransferStatusBar:
         self._last_time = now
 
         self.set_progress(current_bytes, total_bytes)
-        self.status_var.set(self.format_polled_transfer(direction, transfer, current_bytes, total_bytes, self._speed))
-        self.set_abort_enabled(True)
+        if not self._aborting:
+            self.status_var.set(self.format_polled_transfer(direction, transfer, current_bytes, total_bytes, self._speed))
+            self.set_abort_enabled(True)
+        else:
+            self.set_abort_enabled(False)
         self.parent.after(self.POLL_MS, self.poll_transfer)
 
     @staticmethod
@@ -115,24 +129,27 @@ class TransferStatusBar:
 
     def format_polled_transfer(self, direction: str, transfer: Any, current_bytes: int, total_bytes: int, speed: float) -> str:
         verb = "Uploading" if direction == "upload" else "Downloading"
-        completed_items, total_items, failed_items = self.transfer_item_counts(transfer)
+        completed_items, total_items, failed_items, aborted_items = self.transfer_item_counts(transfer)
         eta = (total_bytes - current_bytes) / speed if total_bytes > 0 and speed > 0 else None
-        return self._format_transfer(f"{verb} files", current_bytes, total_bytes, speed, completed_items, total_items, failed_items, eta)
+        return self._format_transfer(f"{verb} files", current_bytes, total_bytes, speed, completed_items, total_items, failed_items, eta, aborted_items)
 
     @staticmethod
-    def transfer_item_counts(transfer: Any) -> tuple[int, int, int]:
+    def transfer_item_counts(transfer: Any) -> tuple[int, int, int, int]:
         states = transfer.ctx.get_all_states()
         total_items = len(states)
         completed = 0
         failed = 0
+        aborted = 0
         for state in states.values():
             status = getattr(state, "status", None)
             status_value = getattr(status, "value", status)
-            if status_value in ("completed", "failed", "save_failed"):
+            if status_value in ("completed", "failed", "save_failed", "aborted"):
                 completed += 1
             if status_value in ("failed", "save_failed"):
                 failed += 1
-        return completed, total_items, failed
+            if status_value == "aborted":
+                aborted += 1
+        return completed, total_items, failed, aborted
 
     def _format_transfer(
         self,
@@ -144,6 +161,7 @@ class TransferStatusBar:
         total_items: int,
         failed_items: int,
         eta_seconds: float | None,
+        aborted_items: int = 0,
     ) -> str:
         byte_part = f"{self.format_bytes(current_bytes)}/{self.format_bytes(total_bytes)}"
         speed_part = f"{self.format_bytes(int(speed))}/s"
@@ -155,6 +173,8 @@ class TransferStatusBar:
             file_part = f"{completed_items} files/{total_items}"
             if failed_items:
                 file_part = f"{file_part}, failed={failed_items}"
+            if aborted_items:
+                file_part = f"{file_part}, aborted={aborted_items}"
             return f"{message} ({transfer_part}, {file_part})"
         return f"{message} ({transfer_part})"
 

@@ -26,6 +26,7 @@ class FileUploadStatus(Enum):
     RETRYING = "retrying"
     FAILED = "failed"
     SAVE_FAILED = "save_failed"
+    ABORTED = "aborted"
     COMPLETED = "completed"
 
 
@@ -165,6 +166,7 @@ class FileArtifacts:
     video_metadata: Optional[VideoMetadata]
     duration: Optional[int]
     file_crc: int = 0
+    local_path: Optional[str] = None
 
 @dataclass
 class UploadFileState:
@@ -210,6 +212,7 @@ class UploadFileState:
             FileUploadStatus.COMPLETED,
             FileUploadStatus.FAILED,
             FileUploadStatus.SAVE_FAILED,
+            FileUploadStatus.ABORTED,
         )
 
 

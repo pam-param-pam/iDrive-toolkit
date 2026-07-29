@@ -79,6 +79,8 @@ class UltraDownloader:
         self._download_threads: List[threading.Thread] = []
         self._finalize_threads: List[threading.Thread] = []
         self._scaler_thread: Optional[threading.Thread] = None
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._monitor_stop_event = threading.Event()
         self._spawn_download_worker = None
         self._kill_download_worker = None
 
@@ -90,9 +92,13 @@ class UltraDownloader:
     # ------------------------------------------------------------------
 
     def _start_queue_monitor(self, interval: float = 1.0):
+        if self._monitor_thread is not None and self._monitor_thread.is_alive():
+            return
+
+        self._monitor_stop_event.clear()
+
         def monitor():
-            while True:
-                time.sleep(interval)
+            while not self._monitor_stop_event.wait(interval):
 
                 file_q = self._file_queue.qsize()
                 frag_q = self._fragment_queue.qsize()
@@ -107,10 +113,12 @@ class UltraDownloader:
 
         t = threading.Thread(target=monitor, daemon=True)
         t.start()
+        self._monitor_thread = t
 
     def _start_workers(self) -> None:
         if self._started:
             self._start_scaler()
+            self._start_queue_monitor()
             return
 
         def spawn_one():
@@ -156,6 +164,11 @@ class UltraDownloader:
         self.scaler.stop()
         if self._scaler_thread is not None and self._scaler_thread.is_alive():
             self._scaler_thread.join()
+
+    def _stop_queue_monitor(self) -> None:
+        self._monitor_stop_event.set()
+        if self._monitor_thread is not None and self._monitor_thread.is_alive():
+            self._monitor_thread.join()
 
     # ------------------------------------------------------------------
     # Public API
@@ -281,6 +294,7 @@ class UltraDownloader:
             self._finalize_queue.join()
         finally:
             self._stop_scaler()
+            self._stop_queue_monitor()
 
     # ------------------------------------------------------------------
     # Optional: graceful shutdown
@@ -299,6 +313,7 @@ class UltraDownloader:
 
         self.ctx.global_pause.set()
         self._stop_scaler()
+        self._stop_queue_monitor()
 
         if not cancel_pending:
             self.join()
@@ -368,12 +383,12 @@ class UltraDownloader:
                 queue.task_done()
 
     def _mark_unfinished_cancelled(self) -> None:
-        error = RuntimeError("Download cancelled")
+        error = RuntimeError("Download aborted")
         for state in self.ctx.get_all_states().values():
             with state.lock:
-                if state.status in (FileDownloadStatus.COMPLETED, FileDownloadStatus.FAILED):
+                if state.status in (FileDownloadStatus.COMPLETED, FileDownloadStatus.FAILED, FileDownloadStatus.ABORTED):
                     continue
-                state.status = FileDownloadStatus.FAILED
+                state.status = FileDownloadStatus.ABORTED
                 state.error = error
 
     def _format_bytes(self, num: int) -> str:

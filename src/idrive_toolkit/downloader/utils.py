@@ -44,6 +44,7 @@ def watch_file_download(downloader: UltraDownloader, file_id: str, poll_interval
             if state.status in (
                     FileDownloadStatus.COMPLETED,
                     FileDownloadStatus.FAILED,
+                    FileDownloadStatus.ABORTED,
             ):
                 break
 
@@ -51,6 +52,8 @@ def watch_file_download(downloader: UltraDownloader, file_id: str, poll_interval
 
     if state.status == FileDownloadStatus.FAILED:
         raise RuntimeError(f"Download failed for file {file_id}: {state.error}")
+    if state.status == FileDownloadStatus.ABORTED:
+        raise RuntimeError(f"Download aborted for file {file_id}")
 
 
 def _aggregate_download_progress(downloader: UltraDownloader):
@@ -174,5 +177,6 @@ def _print_state(downloader: UltraDownloader):
     total = len(states)
     completed = sum(1 for s in states.values() if s.status == FileDownloadStatus.COMPLETED)
     failed = sum(1 for s in states.values() if s.status == FileDownloadStatus.FAILED)
+    aborted = sum(1 for s in states.values() if s.status == FileDownloadStatus.ABORTED)
 
-    print(f"[STATE] total={total} completed={completed} failed={failed} paused={downloader.ctx.is_paused()}")
+    print(f"[STATE] total={total} completed={completed} failed={failed} aborted={aborted} paused={downloader.ctx.is_paused()}")

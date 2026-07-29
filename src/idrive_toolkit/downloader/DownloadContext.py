@@ -74,7 +74,7 @@ class DownloadContext:
                 return False
 
             return all(
-                state.status in (FileDownloadStatus.COMPLETED, FileDownloadStatus.FAILED)
+                state.status in (FileDownloadStatus.COMPLETED, FileDownloadStatus.FAILED, FileDownloadStatus.ABORTED)
                 for state in self.states.values()
             )
 
@@ -105,7 +105,7 @@ class DownloadContext:
 
     def get_failed_states(self) -> Dict[str, FileState]:
         with self.lock:
-            return {fid: st for fid, st in self.states.items() if st.error}
+            return {fid: st for fid, st in self.states.items() if st.status == FileDownloadStatus.FAILED and st.error}
 
     def is_paused(self) -> bool:
         return self.state == DownloadContextState.PAUSED

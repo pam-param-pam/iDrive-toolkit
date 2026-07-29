@@ -50,10 +50,7 @@ class UploadWorker:
                                 self._fail_states(request, e)
                                 break
 
-                            logger.warning(
-                                f"[UploadWorker] Throttled ({e.__class__.__name__}) -> "
-                                f"retrying in {e.wait}s (retry {request.retries})"
-                            )
+                            logger.warning(f"[UploadWorker] Throttled ({e.__class__.__name__}) -> retrying in {e.wait}s (retry {request.retries})")
 
                             self._mark_retrying(request)
                             if self.ctx.stop_requested.wait(e.wait):
@@ -66,10 +63,7 @@ class UploadWorker:
                             self.throttle.signal_error()
                             self._mark_retrying(request)
 
-                            logger.warning(
-                                f"[UploadWorker] Network issue ({e.__class__.__name__}) -> "
-                                f"waiting 5s"
-                            )
+                            logger.warning(f"[UploadWorker] Network issue ({e.__class__.__name__}) -> waiting 5s")
 
                             if self.ctx.stop_requested.wait(5):
                                 self._mark_cancelled(request)
@@ -108,7 +102,7 @@ class UploadWorker:
                     "application/octet-stream",
                 )
 
-            response = self._client.post(url, data=payload, files=files)
+            response = self._client.post(url + "aaa", data=payload, files=files)
 
             if response.status_code == 429:
                 self.throttle.signal_error()
@@ -126,12 +120,12 @@ class UploadWorker:
 
             if status in (500, 502, 503, 504):
                 self.throttle.signal_error()
-                raise DiscordServerTimeout(f"Discord server error {status}") from e
+                raise DiscordServerTimeout(response=e.response, cause=e) from e
 
-            raise DiscordHttpError(f"Discord rejected request ({status})") from e
+            raise DiscordHttpError(e.response, cause=e) from e
 
-        except (httpx.TimeoutException, httpx.ReadTimeout) as e:
-            raise DiscordServerTimeout("Upload timed out") from e
+        except (httpx.TimeoutException, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.RequestError) as e:
+            raise DiscordServerTimeout(cause=e) from e
 
     def _wait_until_can_upload(self) -> bool:
         while not self.ctx.stop_requested.is_set():
@@ -175,7 +169,11 @@ class UploadWorker:
                 st.status = FileUploadStatus.FAILED
 
     def _mark_cancelled(self, request: DiscordRequest) -> None:
-        self._fail_states(request, RuntimeError("Upload cancelled"))
+        states = self._get_states_from_request(request)
+
+        for st in states.values():
+            with st.lock:
+                st.status = FileUploadStatus.ABORTED
 
     def _add_bytes(self, request: DiscordRequest):
         for att in request.attachments:

@@ -87,8 +87,8 @@ class PrepareRequestWorker:
                 self._input_queue.task_done()
                 break
 
+            initial_state_ids = set(self.ctx.get_all_states())
             try:
-                initial_state_ids = set(self.ctx.get_all_states())
                 for request in self.prepare_upload(item):
                     if not self._put_until_stopped(self._upload_queue, request):
                         break
@@ -164,7 +164,8 @@ class PrepareRequestWorker:
             encryption_method=encryption_method,
             file_crypto=file_crypto,
             duration=duration,
-            video_metadata=video_metadata
+            video_metadata=video_metadata,
+            local_path=str(path)
         ))
 
         if file_size == 0:

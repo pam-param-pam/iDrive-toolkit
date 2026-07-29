@@ -84,13 +84,40 @@ class SyncGui:
     def _on_close(self) -> None:
         if self._closed:
             return
+        was_busy = self._busy
         self._closed = True
         self.syncer.set_transfer_progress_callback(None)
         self.syncer.set_status_callback(None)
-        self.syncer.clear_sync_boundary()
+        self.syncer.abort_current_transfer()
+        if not was_busy:
+            self.syncer.clear_sync_boundary()
         if self.__class__._open_window is self.root:
             self.__class__._open_window = None
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _window_alive(self) -> bool:
+        if self._closed:
+            return False
+        try:
+            return bool(self.root.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _safe_after(self, callback) -> None:
+        if self._closed:
+            return
+
+        def run_if_open():
+            if self._window_alive():
+                callback()
+
+        try:
+            self.root.after(0, run_if_open)
+        except tk.TclError:
+            pass
 
     def _show_callback_exception(self, exc_type, exc, tb) -> None:
         traceback.print_exception(exc_type, exc, tb)
@@ -333,9 +360,11 @@ class SyncGui:
         self._run_worker(status, work, done, password_items=password_items)
 
     def _queue_diff_progress(self, progress: DiffProgress) -> None:
-        self.root.after(0, lambda progress=progress: self._apply_diff_progress(progress))
+        self._safe_after(lambda progress=progress: self._apply_diff_progress(progress))
 
     def _apply_diff_progress(self, progress: DiffProgress) -> None:
+        if not self._window_alive():
+            return
         self.status_var.set(self._format_diff_progress(progress))
         self.transfer_status.set_progress(progress.current, progress.total)
 
@@ -352,13 +381,15 @@ class SyncGui:
         return f"{progress.message} ({progress.current}/{progress.total})"
 
     def _queue_transfer_progress(self, progress: TransferProgress) -> None:
-        self.root.after(0, lambda progress=progress: self._apply_transfer_progress(progress))
+        self._safe_after(lambda progress=progress: self._apply_transfer_progress(progress))
 
     def _apply_transfer_progress(self, progress: TransferProgress) -> None:
+        if not self._window_alive():
+            return
         self.transfer_status.apply_sync_progress(progress)
 
     def _queue_status(self, status: str) -> None:
-        self.root.after(0, lambda status=status: self._set_busy(True, status))
+        self._safe_after(lambda status=status: self._set_busy(True, status))
 
     def _format_bytes(self, value: int) -> str:
         return TransferStatusBar.format_bytes(value)
@@ -558,8 +589,7 @@ class SyncGui:
         )
 
     def abort_transfer(self) -> None:
-        self.transfer_status.set_abort_enabled(False)
-        self.transfer_status.set_status("Aborting transfer...")
+        self.transfer_status.set_aborting()
         self.syncer.abort_current_transfer()
 
     def _apply_entries(self, entries: list[DiffEntry], handler, prompt: str) -> None:
@@ -1193,31 +1223,42 @@ class SyncGui:
             try:
                 result = work()
             except SyncConflictError as exc:
-                self.root.after(0, lambda exc=exc: self._worker_failed("Sync conflict", exc))
+                self._safe_after(lambda exc=exc: self._worker_failed("Sync conflict", exc))
             except SyncTransferCancelled as exc:
-                self.root.after(0, lambda exc=exc: self._worker_cancelled(exc))
+                self._safe_after(lambda exc=exc: self._worker_cancelled(exc))
             except BackendMissingOrIncorrectResourcePasswordError:
-                self.root.after(0, lambda: self._worker_password_required(status, work, done, password_items))
+                self._safe_after(lambda: self._worker_password_required(status, work, done, password_items))
             except Exception as exc:
                 logger.exception("Something failed.", exc_info=exc)
-                self.root.after(0, lambda exc=exc: self._worker_failed("Error", exc))
+                self._safe_after(lambda exc=exc: self._worker_failed("Error", exc))
             else:
-                self.root.after(0, lambda: self._worker_done(done, result))
+                self._safe_after(lambda: self._worker_done(done, result))
+            finally:
+                if self._closed:
+                    self.syncer.clear_sync_boundary()
 
         threading.Thread(target=target, daemon=True).start()
 
     def _worker_done(self, done, result) -> None:
+        if not self._window_alive():
+            return
         self._set_busy(False, "Ready")
         done(result)
 
     def _worker_failed(self, title: str, exc: Exception) -> None:
+        if not self._window_alive():
+            return
         self._set_busy(False, "Ready")
         messagebox.showerror(title, str(exc), parent=self.root)
 
     def _worker_cancelled(self, exc: SyncTransferCancelled) -> None:
+        if not self._window_alive():
+            return
         self._set_busy(False, str(exc))
 
     def _worker_password_required(self, status: str, work, done, password_items: list[Item] | None = None) -> None:
+        if not self._window_alive():
+            return
         self._set_busy(False, "Password required")
         item = password_prompt_item(password_items or [], self._current_remote_folder())
         if item is None:
@@ -1244,9 +1285,13 @@ class SyncGui:
             return self.syncer.remote.get_item(remote_id)
 
     def _prompt_resource_password(self, item: Item) -> bool:
+        if not self._window_alive():
+            return False
         return prompt_resource_password(self.root, item, self.syncer.remote.set_item_password)
 
     def _set_busy(self, busy: bool, status: str) -> None:
+        if not self._window_alive():
+            return
         self._busy = busy
         self.status_var.set(status)
         self.transfer_status.set_abort_enabled(False)

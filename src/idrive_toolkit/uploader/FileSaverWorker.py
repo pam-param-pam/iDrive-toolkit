@@ -44,7 +44,7 @@ class FileSaverWorker:
                     break
 
                 state = self.ctx.states.get(file.frontend_id)
-                if state and state.status == FileUploadStatus.FAILED:
+                if state and state.status in (FileUploadStatus.FAILED, FileUploadStatus.ABORTED):
                     continue
 
                 self.finished_files.append(file)

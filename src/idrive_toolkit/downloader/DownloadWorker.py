@@ -140,8 +140,7 @@ class DownloadWorker:
     def _mark_cancelled(self, state: FileState) -> None:
         with state.lock:
             if state.status != FileDownloadStatus.COMPLETED:
-                state.status = FileDownloadStatus.FAILED
-                state.error = RuntimeError("Download cancelled")
+                state.status = FileDownloadStatus.ABORTED
 
     def _download_fragment(self, task: FragmentTask) -> int:
         bytes_count = self._download(task=task)
@@ -185,14 +184,14 @@ class DownloadWorker:
             self._cleanup_file(part_path)
             status = e.response.status_code
             if status == 429:
-                raise DiscordRateLimitError(e.response) from e
+                raise DiscordRateLimitError(e.response, cause=e) from e
             if status in (403, 404) or status >= 500:
-                raise DiscordServerTimeout(f"Discord attachment returned HTTP {status}") from e
+                raise DiscordServerTimeout(response=e.response, cause=e) from e
             raise
 
         except (httpx.TimeoutException, httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.RequestError) as e:
             self._cleanup_file(part_path)
-            raise DiscordServerTimeout("Download stream timed out") from e
+            raise DiscordServerTimeout(cause=e) from e
 
     def _cleanup_file(self, path: Path) -> None:
         logger.info("[FragmentDownloader] Cleaning up file after network error")

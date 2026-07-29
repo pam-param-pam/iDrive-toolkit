@@ -121,7 +121,11 @@ class UploadContext:
 
     def get_failed_states(self) -> Dict[str, UploadFileState]:
         with self.lock:
-            return {fid: st for fid, st in self.states.items() if st.error}
+            return {
+                fid: st
+                for fid, st in self.states.items()
+                if st.status in (FileUploadStatus.FAILED, FileUploadStatus.SAVE_FAILED)
+            }
 
     def add_error(self, error: Exception) -> None:
         with self.lock:

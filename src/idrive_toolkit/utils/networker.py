@@ -39,10 +39,10 @@ def make_request(method: str, endpoint: str, data: dict = None, headers: dict = 
     try:
         response = httpxClient.request(method, url, headers=headers, json=data, params=params, files=files, timeout=20)
     except httpx.TimeoutException as e:
-        raise BackendServerTimeout("Request timed out") from e
+        raise BackendServerTimeout(cause=e) from e
 
     except httpx.RequestError as e:
-        raise BackendServerTimeout("Server not responding") from e
+        raise BackendServerTimeout(cause=e) from e
 
     if response.status_code == 429 and retry:
         wait_time = _retry_after_seconds(response)

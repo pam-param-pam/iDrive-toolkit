@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import sys
 import threading
 import tkinter as tk
 import traceback
@@ -39,6 +40,44 @@ from .TransferStatusBar import TransferStatusBar
 logger = logging.getLogger("iDrive")
 
 
+class _GuiStream:
+    def __init__(self, original, write_log):
+        self._original = original
+        self._write_log = write_log
+
+    def write(self, text: str) -> int:
+        if text:
+            self._write_log(text)
+            if self._original is not None:
+                self._original.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if self._original is not None:
+            self._original.flush()
+
+    def isatty(self) -> bool:
+        if self._original is None:
+            return False
+        return bool(getattr(self._original, "isatty", lambda: False)())
+
+    @property
+    def encoding(self):
+        return getattr(self._original, "encoding", None)
+
+
+class _GuiLogHandler(logging.Handler):
+    def __init__(self, write_log):
+        super().__init__()
+        self._write_log = write_log
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._write_log(self.format(record) + "\n")
+        except Exception:
+            self.handleError(record)
+
+
 class BrowserGuiApp:
     def __init__(self):
         set_windows_app_user_model_id()
@@ -46,8 +85,8 @@ class BrowserGuiApp:
         self.root.report_callback_exception = self._show_callback_exception
         self.root.title("iDrive Remote Browser")
         apply_window_icon(self.root)
-        self.root.geometry("980x640")
-        self.root.minsize(760, 460)
+        self.root.geometry("1000x640")
+        self.root.minsize(1080, 460)
 
         self.client: Client | None = None
         self.syncer: Syncer | None = None
@@ -63,11 +102,32 @@ class BrowserGuiApp:
         self._busy = False
         self._active_transfer = None
         self._active_transfer_lock = threading.Lock()
+        self._last_transfer = None
+        self._last_transfer_direction = None
         self._transfer_cancelled = False
+        self._state_window = None
+        self._state_table = None
+        self._state_filter_failed = None
+        self._state_rows: dict[str, dict[str, str]] = {}
+        self._state_refresh_after_id = None
         self._sync_window = None
         self._ui_queue: queue.Queue[tuple] = queue.Queue()
+        self._log_queue: queue.Queue[str] = queue.Queue()
+        self._log_buffer: list[str] = []
+        self._log_buffer_lock = threading.Lock()
+        self._max_log_chars = 500_000
+        self._log_window = None
+        self._log_text = None
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
+        self._stdout_proxy = None
+        self._stderr_proxy = None
+        self._log_handler = None
 
+        self._install_log_capture()
         self._poll_ui_queue()
+        self._poll_log_queue()
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(1000, self._start_version_check)
         if not self._try_cached_login():
             self._build_login()
@@ -100,6 +160,8 @@ class BrowserGuiApp:
 
         self.login_button = ttk.Button(panel, text="Login", command=self.login)
         self.login_button.grid(row=3, column=1, sticky="e", pady=(4, 0))
+        self.logs_button = ttk.Button(panel, text="Logs", command=self.show_logs)
+        self.logs_button.grid(row=3, column=0, sticky="w", pady=(4, 0))
 
         self.login_status_var = tk.StringVar(value="")
         ttk.Label(panel, textvariable=self.login_status_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
@@ -139,6 +201,8 @@ class BrowserGuiApp:
         self.trash_button.pack(side="left", padx=(0, 6))
         self.logout_button = self._button(actions, "Logout", self.logout, "action_logout")
         self.logout_button.pack(side="right")
+        self.logs_button = self._button(actions, "Logs", self.show_logs, "action_logs")
+        self.logs_button.pack(side="right", padx=(0, 6))
 
         self.breadcrumbs = BreadcrumbsBar(self.root, self._navigate_breadcrumb)
         self.breadcrumbs.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 0))
@@ -181,6 +245,9 @@ class BrowserGuiApp:
         self.transfer_status = TransferStatusBar(bottom, abort_icon=self.icons["action_cancel"], abort_command=self.abort_transfer)
         self.status_var = self.transfer_status.status_var
         self.progress_var = self.transfer_status.progress_var
+        self.transfer_states_button = ttk.Button(bottom, text="File States", command=self.show_transfer_states, state="disabled")
+        self.transfer_states_button.grid(row=0, column=3, sticky="e", padx=(6, 0))
+        self._update_transfer_states_button()
 
     def login(self) -> None:
         if self._busy:
@@ -500,8 +567,7 @@ class BrowserGuiApp:
         if transfer is None:
             return
 
-        self.transfer_status.set_abort_enabled(False)
-        self.transfer_status.set_status("Aborting transfer...")
+        self.transfer_status.set_aborting()
         self._transfer_cancelled = True
         threading.Thread(target=lambda: transfer.shutdown(cancel_pending=True), daemon=True).start()
 
@@ -633,6 +699,7 @@ class BrowserGuiApp:
             message = "Transfer aborted"
             refresh = False
         self._reset_transfer_progress()
+        message = self._transfer_result_message(message)
         self._set_busy(False, message)
         if refresh:
             self.refresh()
@@ -640,10 +707,10 @@ class BrowserGuiApp:
     def _operation_failed(self, exc: Exception) -> None:
         if self._transfer_cancelled:
             self._reset_transfer_progress()
-            self._set_busy(False, "Transfer aborted")
+            self._set_busy(False, self._transfer_result_message("Transfer aborted"))
             return
         self._reset_transfer_progress()
-        self._set_busy(False, "Error")
+        self._set_busy(False, self._transfer_result_message("Transfer failed"))
         messagebox.showerror("Error", str(exc), parent=self.root)
 
     def _operation_failed_with_password_retry(self, exc: Exception, items: list[Item | None], retry) -> None:
@@ -689,6 +756,350 @@ class BrowserGuiApp:
             )
 
         self._run_worker(work, done, failed)
+
+    def show_logs(self) -> None:
+        if self._widget_exists(self._log_window):
+            self._log_window.lift()
+            self._log_window.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Logs")
+        window.geometry("900x420")
+        window.minsize(520, 260)
+        window.transient(self.root)
+        apply_window_icon(window)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+
+        frame = ttk.Frame(window, padding=8)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        text = tk.Text(frame, wrap="word", state="disabled", font=("Consolas", 10))
+        text.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=scroll.set)
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=1, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="Clear", command=self._clear_logs).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="left")
+
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        window.bind("<Escape>", lambda _event: window.destroy())
+        self._log_window = window
+        self._log_text = text
+        self._discard_pending_log_updates()
+        self._render_log_buffer()
+
+    def show_transfer_states(self) -> None:
+        direction, transfer = self._get_report_transfer()
+        if transfer is None:
+            messagebox.showinfo("File States", "No upload or download state is available yet.", parent=self.root)
+            return
+
+        if self._widget_exists(self._state_window):
+            self._state_window.lift()
+            self._state_window.focus_force()
+            self._refresh_transfer_states()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title(f"{direction.capitalize()} File States")
+        window.geometry("980x480")
+        window.minsize(700, 320)
+        window.transient(self.root)
+        apply_window_icon(window)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+
+        summary = ttk.Label(window, text="")
+        summary.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
+        self._state_summary = summary
+
+        frame = ttk.Frame(window, padding=(10, 0, 10, 10))
+        frame.grid(row=1, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        columns = ("status", "name", "path", "progress", "reason")
+        table = ttk.Treeview(frame, columns=columns, show="headings", selectmode="extended")
+        for column, title, width in (
+            ("status", "Status", 120),
+            ("name", "Name", 220),
+            ("path", "Path", 340),
+            ("progress", "Progress", 110),
+            ("reason", "Reason", 260),
+        ):
+            table.heading(column, text=title)
+            table.column(column, width=width, stretch=column in ("name", "path", "reason"))
+        table.tag_configure("failed", foreground="#b42318")
+        table.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=table.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        table.configure(yscrollcommand=scroll.set)
+
+        controls = ttk.Frame(frame)
+        controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        controls.columnconfigure(0, weight=1)
+        self._state_filter_failed = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="Failed/aborted only", variable=self._state_filter_failed, command=self._refresh_transfer_states).grid(row=0, column=0, sticky="w")
+        ttk.Button(controls, text="Copy Selected Paths", command=lambda: self._copy_state_values("path", selected=True)).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(controls, text="Copy Selected Names", command=lambda: self._copy_state_values("name", selected=True)).grid(row=0, column=2, padx=(0, 6))
+        ttk.Button(controls, text="Copy Failed/Aborted", command=lambda: self._copy_state_values("path", failed_only=True)).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(controls, text="Refresh", command=self._refresh_transfer_states).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(controls, text="Close", command=window.destroy).grid(row=0, column=5)
+
+        menu = tk.Menu(window, tearoff=False)
+        menu.add_command(label="Copy Path", command=lambda: self._copy_state_values("path", selected=True))
+        menu.add_command(label="Copy Name", command=lambda: self._copy_state_values("name", selected=True))
+        menu.add_command(label="Copy Reason", command=lambda: self._copy_state_values("reason", selected=True))
+        table.bind("<Button-3>", lambda event: self._show_state_context_menu(event, menu))
+        table.bind("<Control-c>", lambda _event: self._copy_state_values("path", selected=True))
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        window.bind("<Escape>", lambda _event: window.destroy())
+
+        self._state_window = window
+        self._state_table = table
+        self._refresh_transfer_states()
+
+    def _refresh_transfer_states(self) -> None:
+        self._state_refresh_after_id = None
+        if not self._widget_exists(self._state_table):
+            return
+        direction, transfer = self._get_report_transfer()
+        rows = self._collect_transfer_state_rows(direction, transfer)
+        failed_only = bool(self._state_filter_failed and self._state_filter_failed.get())
+        shown = [row for row in rows if not failed_only or row["is_failed"] == "1" or row["is_aborted"] == "1"]
+
+        for item_id in self._state_table.get_children():
+            self._state_table.delete(item_id)
+        self._state_rows = {}
+        for index, row in enumerate(shown):
+            iid = str(index)
+            self._state_rows[iid] = row
+            tags = ("failed",) if row["is_failed"] == "1" else ()
+            self._state_table.insert("", "end", iid=iid, values=(row["status"], row["name"], row["path"], row["progress"], row["reason"]), tags=tags)
+
+        failed = sum(1 for row in rows if row["is_failed"] == "1")
+        aborted = sum(1 for row in rows if row["is_aborted"] == "1")
+        if self._widget_exists(getattr(self, "_state_summary", None)):
+            self._state_summary.configure(text=f"{direction.capitalize() if direction else 'Transfer'}: {len(rows)} file(s), {failed} failed, {aborted} aborted")
+        if self._active_transfer is not None:
+            self._schedule_transfer_states_refresh()
+
+    def _schedule_transfer_states_refresh(self) -> None:
+        if self._state_refresh_after_id is not None or not self._widget_exists(self._state_table):
+            return
+        self._state_refresh_after_id = self.root.after(1000, self._refresh_transfer_states)
+
+    def _collect_transfer_state_rows(self, direction: str | None, transfer) -> list[dict[str, str]]:
+        if transfer is None:
+            return []
+        ctx = getattr(transfer, "ctx", None)
+        if ctx is None:
+            return []
+        records = getattr(ctx, "records", {})
+        rows = []
+        for index, error in enumerate(getattr(ctx, "errors", []), start=1):
+            rows.append(
+                {
+                    "status": "failed",
+                    "name": f"transfer error {index}",
+                    "path": f"transfer error {index}",
+                    "progress": "",
+                    "reason": self._format_error_reason(error),
+                    "is_failed": "1",
+                    "is_aborted": "0",
+                }
+            )
+        for state_id, state in ctx.get_all_states().items():
+            with getattr(state, "lock", threading.Lock()):
+                status = getattr(getattr(state, "status", ""), "value", getattr(state, "status", ""))
+                error = getattr(state, "error", None)
+                row = self._transfer_state_row(direction, str(state_id), state, records.get(state_id), str(status), error)
+            rows.append(row)
+        rows.sort(key=lambda row: (row["is_failed"] != "1", row["is_aborted"] != "1", row["name"].lower(), row["path"].lower()))
+        return rows
+
+    def _transfer_result_message(self, message: str) -> str:
+        direction, transfer = self._get_report_transfer()
+        rows = self._collect_transfer_state_rows(direction, transfer)
+        failed = sum(1 for row in rows if row["is_failed"] == "1")
+        aborted = sum(1 for row in rows if row["is_aborted"] == "1")
+        if failed:
+            return f"{message} ({failed} failed - see File States)"
+        if aborted:
+            return f"{message} ({aborted} aborted - see File States)"
+        return message
+
+    def _transfer_state_row(self, direction: str | None, state_id: str, state, record, status: str, error) -> dict[str, str]:
+        name = state_id
+        path = state_id
+        size_total = getattr(state, "size_total", 0) or 0
+        current = getattr(state, "bytes_downloaded", None)
+        if current is None:
+            current = getattr(state, "bytes_uploaded", 0) or 0
+
+        artifacts = getattr(state, "artifacts", None)
+        if artifacts is not None:
+            name = str(getattr(artifacts, "name", "") or name)
+            path = str(getattr(artifacts, "local_path", "") or name)
+            size_total = getattr(artifacts, "size", size_total) or size_total
+
+        if record is not None:
+            file_info = getattr(record, "file_info", None)
+            if file_info is not None:
+                name = str(getattr(file_info, "name", "") or name)
+                path = str(getattr(record, "final_user_output_path", "") or getattr(file_info, "path", "") or path)
+
+        is_aborted = status == "aborted"
+        reason = self._format_error_reason(error)
+        return {
+            "status": status,
+            "name": name,
+            "path": path,
+            "progress": f"{self._format_bytes(int(current))}/{self._format_bytes(int(size_total))}",
+            "reason": reason,
+            "is_failed": "1" if status in ("failed", "save_failed") else "0",
+            "is_aborted": "1" if is_aborted else "0",
+        }
+
+    def _format_error_reason(self, error) -> str:
+        if error is None:
+            return ""
+
+        parts = []
+        error_type = error.__class__.__name__
+        message = getattr(error, "message", None) or str(error) or repr(error)
+        parts.append(f"{error_type}: {message}")
+
+        status = getattr(error, "status", None)
+        if status is not None and f"HTTP {status}" not in message:
+            parts.append(f"HTTP {status}")
+
+        method = getattr(error, "method", None)
+        url = getattr(error, "url", None)
+        if method or url:
+            target = " ".join(str(part) for part in (method, url) if part)
+            if target and target not in message:
+                parts.append(target)
+
+        text = getattr(error, "text", None)
+        if text and text not in message:
+            parts.append(str(text))
+
+        cause = getattr(error, "cause", None) or getattr(error, "__cause__", None)
+        if cause is not None:
+            cause_message = str(cause)
+            if cause_message and cause_message not in message:
+                parts.append(f"caused by {cause.__class__.__name__}: {cause_message}")
+
+        return " | ".join(parts)
+
+    def _copy_state_values(self, key: str, *, selected: bool = False, failed_only: bool = False) -> None:
+        if not self._widget_exists(self._state_table):
+            return
+        item_ids = self._state_table.selection() if selected else self._state_table.get_children()
+        values = []
+        for item_id in item_ids:
+            row = self._state_rows.get(str(item_id))
+            if row is None or (failed_only and row["is_failed"] != "1" and row["is_aborted"] != "1"):
+                continue
+            value = row.get(key, "")
+            if value:
+                values.append(value)
+        if not values:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(values))
+
+    def _show_state_context_menu(self, event, menu: tk.Menu) -> None:
+        row_id = self._state_table.identify_row(event.y)
+        if row_id:
+            if row_id not in self._state_table.selection():
+                self._state_table.selection_set(row_id)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _install_log_capture(self) -> None:
+        self._stdout_proxy = _GuiStream(self._original_stdout, self._enqueue_log)
+        self._stderr_proxy = _GuiStream(self._original_stderr, self._enqueue_log)
+        sys.stdout = self._stdout_proxy
+        sys.stderr = self._stderr_proxy
+
+        handler = _GuiLogHandler(self._enqueue_log)
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        logger.addHandler(handler)
+        self._log_handler = handler
+
+    def _enqueue_log(self, text: str) -> None:
+        with self._log_buffer_lock:
+            self._log_buffer.append(text)
+            total_chars = sum(len(part) for part in self._log_buffer)
+            while self._log_buffer and total_chars > self._max_log_chars:
+                total_chars -= len(self._log_buffer.pop(0))
+        self._log_queue.put(text)
+
+    def _poll_log_queue(self) -> None:
+        try:
+            while True:
+                self._append_log_text(self._log_queue.get_nowait())
+        except queue.Empty:
+            pass
+        if self._widget_exists(self.root):
+            self.root.after(100, self._poll_log_queue)
+
+    def _append_log_text(self, text: str) -> None:
+        if not self._widget_exists(self._log_text):
+            return
+        self._log_text.configure(state="normal")
+        self._log_text.insert("end", text)
+        self._log_text.see("end")
+        self._log_text.configure(state="disabled")
+
+    def _discard_pending_log_updates(self) -> None:
+        try:
+            while True:
+                self._log_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _render_log_buffer(self) -> None:
+        if not self._widget_exists(self._log_text):
+            return
+        with self._log_buffer_lock:
+            text = "".join(self._log_buffer)
+        self._log_text.configure(state="normal")
+        self._log_text.delete("1.0", "end")
+        self._log_text.insert("end", text)
+        self._log_text.see("end")
+        self._log_text.configure(state="disabled")
+
+    def _clear_logs(self) -> None:
+        with self._log_buffer_lock:
+            self._log_buffer.clear()
+        if not self._widget_exists(self._log_text):
+            return
+        self._log_text.configure(state="normal")
+        self._log_text.delete("1.0", "end")
+        self._log_text.configure(state="disabled")
+
+    def _close(self) -> None:
+        if self._log_handler is not None:
+            logger.removeHandler(self._log_handler)
+            self._log_handler = None
+        if self._stdout_proxy is not None and sys.stdout is self._stdout_proxy:
+            sys.stdout = self._original_stdout
+        if self._stderr_proxy is not None and sys.stderr is self._stderr_proxy:
+            sys.stderr = self._original_stderr
+        self.root.destroy()
 
     def _start_version_check(self) -> None:
         def work():
@@ -755,6 +1166,8 @@ class BrowserGuiApp:
 
     def _clear_root(self) -> None:
         for child in self.root.winfo_children():
+            if isinstance(child, tk.Toplevel):
+                continue
             child.destroy()
         for name in (
             "back_button",
@@ -770,6 +1183,8 @@ class BrowserGuiApp:
             "table",
             "breadcrumbs",
             "transfer_status",
+            "transfer_states_button",
+            "logs_button",
         ):
             if hasattr(self, name):
                 setattr(self, name, None)
@@ -847,6 +1262,7 @@ class BrowserGuiApp:
             "action_trash": self._create_action_icon("trash"),
             "action_cancel": self._create_action_icon("cancel"),
             "action_logout": self._create_action_icon("logout"),
+            "action_logs": self._create_action_icon("logs"),
         }
 
     def _button(self, parent, text: str, command, icon_key: str) -> ttk.Button:
@@ -929,22 +1345,51 @@ class BrowserGuiApp:
             draw.rectangle((3, 4, 10, 14), outline=gray, width=2)
             draw.line((9, 9, 15, 9), fill=red, width=2)
             draw.polygon([(13, 6), (16, 9), (13, 12)], fill=red)
+        elif kind == "logs":
+            draw.rectangle((4, 3, 14, 15), outline=gray, width=2)
+            draw.line((6, 7, 12, 7), fill=blue, width=1)
+            draw.line((6, 10, 12, 10), fill=blue, width=1)
+            draw.line((6, 13, 10, 13), fill=blue, width=1)
         return ImageTk.PhotoImage(image)
 
     def _set_active_transfer(self, direction: str, transfer) -> None:
         with self._active_transfer_lock:
             self._active_transfer = transfer
+            self._last_transfer = transfer
+            self._last_transfer_direction = direction
             self._transfer_cancelled = False
-        self._ui_queue.put(("done", lambda _payload: self.transfer_status.attach_transfer(direction, transfer), None))
+        self._ui_queue.put(("done", lambda _payload: self._attach_active_transfer_ui(direction, transfer), None))
 
     def _clear_active_transfer(self) -> None:
         with self._active_transfer_lock:
+            if self._active_transfer is not None:
+                self._last_transfer = self._active_transfer
             self._active_transfer = None
+        self._ui_queue.put(("done", lambda _payload: self._update_transfer_states_button(), None))
 
     def _reset_transfer_progress(self) -> None:
         self._transfer_cancelled = False
         if hasattr(self, "transfer_status"):
             self.transfer_status.reset()
+        self._update_transfer_states_button()
+
+    def _attach_active_transfer_ui(self, direction: str, transfer) -> None:
+        if hasattr(self, "transfer_status") and self._widget_exists(getattr(self.transfer_status, "parent", None)):
+            self.transfer_status.attach_transfer(direction, transfer)
+        self._update_transfer_states_button()
+
+    def _get_report_transfer(self):
+        with self._active_transfer_lock:
+            if self._active_transfer is not None:
+                return self._last_transfer_direction, self._active_transfer
+            return self._last_transfer_direction, self._last_transfer
+
+    def _update_transfer_states_button(self) -> None:
+        button = getattr(self, "transfer_states_button", None)
+        if not self._widget_exists(button):
+            return
+        _direction, transfer = self._get_report_transfer()
+        button.configure(state="normal" if transfer is not None else "disabled")
 
     def _icon_font(self, size: int):
         try:

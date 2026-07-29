@@ -177,15 +177,18 @@ class FilePlanningWorker:
         return False
 
     def _register_cancelled_file(self, raw_file: dict) -> None:
-        self._register_failed_file(raw_file, RuntimeError("Download cancelled"))
+        self._register_file_error(raw_file, None, FileDownloadStatus.ABORTED)
 
     def _register_failed_file(self, raw_file: dict, error: Exception) -> None:
+        self._register_file_error(raw_file, error, FileDownloadStatus.FAILED)
+
+    def _register_file_error(self, raw_file: dict, error: Exception | None, status: FileDownloadStatus) -> None:
         state = FileState(
             file_id=raw_file["id"],
             fragments_total=0,
             size_total=raw_file["size"],
             error=error,
-            status=FileDownloadStatus.FAILED,
+            status=status,
         )
 
         try:
@@ -194,7 +197,7 @@ class FilePlanningWorker:
             existing_state = self._ctx.get_state(raw_file["id"])
             with existing_state.lock:
                 existing_state.error = error
-                existing_state.status = FileDownloadStatus.FAILED
+                existing_state.status = status
 
     def _missing(self, file_dir: Path, fragments: List[FragmentInfo]) -> Tuple[List[FragmentInfo], int, int, int]:
         missing: List[FragmentInfo] = []

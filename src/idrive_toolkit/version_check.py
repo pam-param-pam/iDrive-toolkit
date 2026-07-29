@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
@@ -10,6 +11,7 @@ from packaging.version import InvalidVersion, Version
 
 from . import __version__
 
+logger = logging.getLogger("iDrive")
 
 GITHUB_REPO = "pam-param-pam/iDrive-toolkit"
 LATEST_RELEASE_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
@@ -34,6 +36,11 @@ def check_for_update(timeout: float = 5.0) -> UpdateInfo | None:
     latest_version = _clean_version(str(latest.get("tag_name") or latest.get("name") or ""))
     current_version = _clean_version(__version__)
 
+    logger.info(
+        "Version check: current=%s, latest=%s",
+        current_version,
+        latest_version,
+    )
     if not latest_version or not current_version:
         return None
     if current_version == "0+unknown":

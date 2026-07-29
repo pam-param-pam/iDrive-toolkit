@@ -1,18 +1,39 @@
 # iDrive Toolkit
 
-Python client utilities for the iDrive backend. The package includes object wrappers for files/folders, high-throughput upload/download helpers, sync tooling, a Tk remote browser, and a WebSocket event client.
+Python tools for the iDrive project.
+
+The package can be used as a Python client library, a transfer/sync toolkit, or as a desktop remote browser GUI.
+
+## Download GUI
+
+Prebuilt GUI binaries are attached to the [GitHub Releases page](https://github.com/pam-param-pam/iDrive-toolkit/releases):
+
+- Windows: `idrive-remote-browser.exe`
+- Linux: `idrive-remote-browser-linux.tar.gz`
 
 ## Install
+
+Core API bindings only:
 
 ```powershell
 pip install idrive_toolkit
 ```
 
-Optional feature sets:
+Optional transfer support:
 
 ```powershell
 pip install idrive_toolkit[transfer]
+```
+
+Optional GUI support:
+
+```powershell
 pip install idrive_toolkit[gui]
+```
+
+Everything:
+
+```powershell
 pip install idrive_toolkit[all]
 ```
 
@@ -22,7 +43,28 @@ For local development:
 pip install -r dev-requirements.txt
 ```
 
-## Basic Usage
+## GUI
+
+After installing the GUI extra, start the browser with:
+
+```powershell
+idrive-gui
+```
+
+The browser supports:
+
+- login and cached auth
+- remote folder browsing
+- upload and download
+- drag and drop upload from the file explorer
+- remote rename and move to trash
+- folder sync
+- update prompts
+- an in-app log window for stdout, stderr, and package logs
+
+Config and auth tokens are stored through `IdriveStorage` in the app's local data directory.
+
+## API Usage
 
 ```python
 from idrive_toolkit.iDrive import Client
@@ -45,50 +87,9 @@ folder.move_to_trash()
 folder.restore_from_trash()
 ```
 
-## Remote Browser GUI
+## Upload And Download
 
-The remote browser provides login, browsing, upload/download, remote rename/trash actions, folder sync, cached auth, logout.
-
-```powershell
-idrive-gui
-```
-
-The browser stores UI config and auth tokens through `IdriveStorage`, under the app's local data directory.
-
-## WebSocket Events
-
-Every `Client` owns a `WebsocketManager` at `client.websocket`. It connects to the authenticated `/user` WebSocket endpoint, sends `PONG` replies for server `PING` messages, reconnects after WebSocket errors, and dispatches parsed `WebsocketEvent` objects to registered callbacks.
-
-```python
-from idrive_toolkit.iDrive import Client
-
-client = Client.login("https://idrive.pamparampam.dev/api", "username", "password")
-
-def on_event(event):
-    print(event.type, event)
-
-client.websocket.register_callback(on_event)
-client.websocket.start_websocket()
-
-if client.websocket.wait_until_connected(timeout=5):
-    client.websocket.send_json({"type": "hello"})
-
-# Keep the process alive if this is your main worker.
-client.websocket.run_forever()
-```
-
-Stop the listener when you no longer need it:
-
-```python
-client.websocket.stop_websocket()
-```
-
-If the backend sends a `FORCE_LOGOUT` event, the manager shuts the listener down gracefully.
-
-## Upload and Download
-
-Use the client factories so worker limits and account settings are loaded from the backend.
-Video metadata, thumbnail, and subtitle extraction require FFmpeg tools (`ffmpeg` and `ffprobe`) to be installed and available on `PATH`.
+Use the client factory methods so account settings and worker limits are loaded from the backend.
 
 ```python
 from pathlib import Path
@@ -104,6 +105,8 @@ downloader.download(client.get_file("remote_file_id"), target_dir=Path("download
 downloader.join()
 ```
 
+Video metadata, thumbnails, subtitle extraction, and playback use FFmpeg tools. Make sure `ffmpeg`, `ffprobe`, and `ffplay` are available on `PATH` for the features that need them.
+
 ## Sync GUI
 
 ```python
@@ -114,8 +117,53 @@ syncer = client.get_syncer()
 syncer.sync_gui(Path("local_folder"), remote_root)
 ```
 
+The sync UI can compare local and remote folders, sync all entries, sync selected entries, resolve changed files, and handle detected renames.
+
+## WebSocket Events
+
+Every `Client` has a `WebsocketManager` at `client.websocket`.
+
+```python
+from idrive_toolkit.iDrive import Client
+
+client = Client.login("https://idrive.pamparampam.dev/api", "username", "password")
+
+def on_event(event):
+    print(event.type, event)
+
+client.websocket.register_callback(on_event)
+client.websocket.start_websocket()
+
+if client.websocket.wait_until_connected(timeout=5):
+    client.websocket.send_json({"type": "hello"})
+
+client.websocket.run_forever()
+```
+
+Stop the listener when done:
+
+```python
+client.websocket.stop_websocket()
+```
+
+If the backend sends a `FORCE_LOGOUT` event, the WebSocket listener shuts down.
+
+## Build
+
+Build the Python package locally:
+
+```powershell
+python -m build
+```
+
+If `python -m build` is shadowed by a local `build/` directory, run it from outside the repository and pass the project path:
+
+```powershell
+python -m build D:\Projects\iDriveApiWrapper
+```
+
 ## Notes
 
-- Folder/file passwords can be passed to `get_file()` and `get_folder()` when needed.
-- Video files expose `file.play()`, which uses `ffplay` and requires it to be available on `PATH`.
-- WebSocket callbacks run in daemon threads; keep callback code thread-safe.
+- Folder and file passwords can be passed to `get_file()` and `get_folder()` when needed.
+- `file.play()` uses `ffplay`.
+- WebSocket callbacks run in daemon threads; callback code should be thread-safe.

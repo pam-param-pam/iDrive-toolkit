@@ -23,11 +23,12 @@ def _print_state(uploader: UltraUploader):
     total = len(states)
     completed = sum(1 for s in states.values() if s.status == FileUploadStatus.COMPLETED)
     failed = sum(1 for s in states.values() if s.status == FileUploadStatus.FAILED)
+    aborted = sum(1 for s in states.values() if s.status == FileUploadStatus.ABORTED)
     saving = sum(1 for s in states.values() if s.status == FileUploadStatus.SAVING)
 
     print(
         f"[STATE] total={total} completed={completed} saving={saving} "
-        f"failed={failed} paused={uploader.ctx.is_paused()}"
+        f"failed={failed} aborted={aborted} paused={uploader.ctx.is_paused()}"
     )
 
     for file_id, s in sorted(states.items()):

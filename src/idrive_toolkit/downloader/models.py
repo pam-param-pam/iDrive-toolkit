@@ -15,6 +15,7 @@ class FileDownloadStatus(Enum):
     RETRYING = "retrying"
     COMPLETED = "completed"
     FAILED = "failed"
+    ABORTED = "aborted"
     QUEUED = "queued"
     SAVING = "saving"
 

@@ -16,6 +16,12 @@ from ..utils.ffmpeg import require_media_tool
 logger = logging.getLogger("iDrive")
 
 
+def _media_creationflags() -> int:
+    if sys.platform == "win32":
+        return subprocess.CREATE_NO_WINDOW
+    return 0
+
+
 def get_file_extension(filename: str) -> str:
     if "." not in filename or filename.endswith("."):
         return ".txt"
@@ -24,9 +30,6 @@ def get_file_extension(filename: str) -> str:
 
 def _run_media(cmd: List[str], timeout: int, text: bool = False) -> subprocess.CompletedProcess:
     require_media_tool(cmd[0])
-    creationflags = 0
-    if sys.platform == "win32":
-        creationflags = subprocess.CREATE_NO_WINDOW
 
     return subprocess.run(
         cmd,
@@ -38,7 +41,7 @@ def _run_media(cmd: List[str], timeout: int, text: bool = False) -> subprocess.C
         text=text,
         encoding="utf-8" if text else None,
         errors="replace" if text else None,
-        creationflags=creationflags,
+        creationflags=_media_creationflags(),
     )
 
 def _run(cmd: List[str]) -> subprocess.CompletedProcess:
@@ -77,6 +80,7 @@ def _run_ffprobe(path: str, extensions, extension) -> Dict[str, Any]:
         text=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=_media_creationflags(),
     )
 
     if proc.returncode != 0:
@@ -293,6 +297,7 @@ def extract_subtitles_if_needed(extensions: Mapping[str, list[str]], extension: 
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,   # <-- don’t hide errors blindly
                 timeout=5,
+                creationflags=_media_creationflags(),
             )
 
             if proc.returncode != 0:
@@ -337,7 +342,13 @@ def _get_video_duration(path: Path) -> Optional[float]:
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(path),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            creationflags=_media_creationflags(),
+        )
         return float(proc.stdout.strip())
     except Exception:
         return None

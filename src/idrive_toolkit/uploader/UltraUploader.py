@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 import uuid
 from pathlib import Path
 from queue import Queue, Full, Empty
@@ -84,6 +85,10 @@ class UltraUploader:
         self._response_consumer_threads: list[threading.Thread] = []
         self._file_saver_threads: list[threading.Thread] = []
         self._scaler_thread: Optional[threading.Thread] = None
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._monitor_stop_event = threading.Event()
+        self._spawn_upload_worker = None
+        self._kill_upload_worker = None
 
         self._prepare_workers = 1
         self._response_consumers = 1
@@ -97,12 +102,16 @@ class UltraUploader:
     # ------------------------------------------------------------------
 
     def _start_queue_monitor(self, interval: float = 1.0):
+        if self._monitor_thread is not None and self._monitor_thread.is_alive():
+            return
+
+        self._monitor_stop_event.clear()
+
         def monitor():
             last_uploaded = 0
             last_time = time.perf_counter()
 
-            while True:
-                time.sleep(interval)
+            while not self._monitor_stop_event.wait(interval):
 
                 now = time.perf_counter()
 
@@ -133,9 +142,12 @@ class UltraUploader:
 
         t = threading.Thread(target=monitor, daemon=True)
         t.start()
+        self._monitor_thread = t
 
     def _start_workers(self) -> None:
         if self._started:
+            self._start_scaler()
+            self._start_queue_monitor()
             return
 
         # request prepare workers
@@ -184,10 +196,36 @@ class UltraUploader:
         for _ in range(self.policy.get_initial_workers()):
             spawn_one()
 
-        self._scaler_thread = self.scaler.start(spawn_one, kill_one)
+        self._spawn_upload_worker = spawn_one
+        self._kill_upload_worker = kill_one
+        self._start_scaler()
 
         self._started = True
         self._start_queue_monitor()
+
+    def _start_scaler(self) -> None:
+        if self._scaler_thread is not None and self._scaler_thread.is_alive():
+            return
+
+        spawn_one = getattr(self, "_spawn_upload_worker", None)
+        kill_one = getattr(self, "_kill_upload_worker", None)
+        if spawn_one is None or kill_one is None:
+            return
+
+        self.scaler.stop_flag = False
+        self.scaler._stop_event.clear()
+        self.scaler.resume()
+        self._scaler_thread = self.scaler.start(spawn_one, kill_one)
+
+    def _stop_scaler(self) -> None:
+        self.scaler.stop()
+        if self._scaler_thread is not None and self._scaler_thread.is_alive():
+            self._scaler_thread.join()
+
+    def _stop_queue_monitor(self) -> None:
+        self._monitor_stop_event.set()
+        if self._monitor_thread is not None and self._monitor_thread.is_alive():
+            self._monitor_thread.join()
 
     def _start_upload_thread(self) -> threading.Thread:
         worker = UploadWorker(
@@ -232,10 +270,14 @@ class UltraUploader:
         self._put_input_task(UploadInput(path=path, parent=parent, lock_from_id=lock_from))
 
     def join(self) -> None:
-        self._input_queue.join()
-        self._upload_queue.join()
-        self._response_queue.join()
-        self._ready_files_queue.join()
+        try:
+            self._input_queue.join()
+            self._upload_queue.join()
+            self._response_queue.join()
+            self._ready_files_queue.join()
+        finally:
+            self._stop_scaler()
+            self._stop_queue_monitor()
 
     def pause_all(self) -> None:
         self.ctx.pause_all()
@@ -259,9 +301,8 @@ class UltraUploader:
             self.ctx.stop_requested.set()
 
         self.ctx.global_pause.set()
-        self.scaler.stop()
-        if self._scaler_thread:
-            self._scaler_thread.join()
+        self._stop_scaler()
+        self._stop_queue_monitor()
 
         if not cancel_pending:
             self.join()
@@ -327,13 +368,11 @@ class UltraUploader:
                 queue.task_done()
 
     def _mark_unfinished_cancelled(self) -> None:
-        error = RuntimeError("Upload cancelled")
         for state in self.ctx.get_all_states().values():
             with state.lock:
                 if state.is_terminal():
                     continue
-                state.status = FileUploadStatus.FAILED
-                state.error = error
+                state.status = FileUploadStatus.ABORTED
 
     def _check_path(self, path) -> Path:
         path = Path(path).resolve()
