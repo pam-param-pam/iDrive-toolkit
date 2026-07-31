@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import base64
-import json
 from datetime import datetime, timezone
-from pathlib import Path
 
 from .BaseScanner import BaseScanner, Node, NodeKind, NodeOrigin
+from .missing_folder import is_missing_folder_id, missing_folder_info
 from ..models.File import File
 from ..models.Folder import Folder
-
-MISSING_FOLDER_PREFIX = "missing-folder:"
 
 
 class RemoteScanner(BaseScanner):
@@ -26,7 +22,7 @@ class RemoteScanner(BaseScanner):
             return
 
         root_id = self.normalize_id(root_id)
-        if self.is_missing_folder_id(root_id):
+        if is_missing_folder_id(root_id):
             return
 
         folder = self.get_item(root_id)
@@ -75,7 +71,7 @@ class RemoteScanner(BaseScanner):
 
     def get_node(self, node_id: str) -> Node:
         node_id = self.normalize_id(node_id)
-        if self.is_missing_folder_id(node_id):
+        if is_missing_folder_id(node_id):
             return self._missing_folder_node(node_id)
 
         item = self.get_item(node_id)
@@ -83,7 +79,7 @@ class RemoteScanner(BaseScanner):
 
     def get_item(self, item_id: str | Folder | File) -> Folder | File:
         item_id = self.normalize_id(item_id)
-        if self.is_missing_folder_id(item_id):
+        if is_missing_folder_id(item_id):
             raise KeyError(f"Remote item is a missing-folder placeholder: {item_id}")
 
         item = self._items.get(item_id)
@@ -96,7 +92,7 @@ class RemoteScanner(BaseScanner):
         return item
 
     def require_cached_item(self, item_id: str) -> Folder | File:
-        if self.is_missing_folder_id(str(item_id)):
+        if is_missing_folder_id(str(item_id)):
             raise KeyError(f"Remote item is a missing-folder placeholder: {item_id}")
 
         item = self._items.get(str(item_id))
@@ -145,7 +141,7 @@ class RemoteScanner(BaseScanner):
 
     def list_children(self, node_id: str):
         node_id = self.normalize_id(node_id)
-        if self.is_missing_folder_id(node_id):
+        if is_missing_folder_id(node_id):
             return
 
         folder = self._items.get(node_id)
@@ -164,35 +160,19 @@ class RemoteScanner(BaseScanner):
 
     def get_folder_size(self, node_id: str) -> int:
         node_id = self.normalize_id(node_id)
-        if self.is_missing_folder_id(node_id):
+        if is_missing_folder_id(node_id):
             return 0
 
         folder = self.require_cached_folder(node_id)
         return folder.get_usage()['used']
 
-    def missing_folder_id(self, local_path: Path | str, parent_remote_id: str | None = None) -> str:
-        payload = {
-            "path": str(Path(local_path)),
-            "parent": str(parent_remote_id) if parent_remote_id is not None else None,
-        }
-        encoded = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8")).decode("ascii")
-        return f"{MISSING_FOLDER_PREFIX}{encoded}"
-
-    def is_missing_folder_id(self, node_id: str) -> bool:
-        return str(node_id).startswith(MISSING_FOLDER_PREFIX)
-
-    def missing_folder_info(self, node_id: str) -> tuple[Path, str | None]:
-        if not self.is_missing_folder_id(node_id):
-            raise ValueError(f"Not a missing-folder placeholder: {node_id}")
-
-        encoded = str(node_id)[len(MISSING_FOLDER_PREFIX):]
-        payload = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8"))
-        return Path(payload["path"]), payload.get("parent")
-
     def set_item_password(self, item: Folder | File, password: str) -> None:
         item.set_password(password)
         self._remember_password(item)
         self._items[str(item.id)] = item
+
+    def cache_item(self, item: Folder | File) -> None:
+        self._cache_item(item)
 
     def _cache_item(self, item: Folder | File) -> None:
         self._apply_password(item)
@@ -235,7 +215,7 @@ class RemoteScanner(BaseScanner):
         )
 
     def _missing_folder_node(self, node_id: str) -> Node:
-        local_path, parent_remote_id = self.missing_folder_info(node_id)
+        local_path, parent_remote_id = missing_folder_info(node_id)
         return Node(
             uid=node_id,
             parent_uid=parent_remote_id,

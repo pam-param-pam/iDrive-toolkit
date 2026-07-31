@@ -6,10 +6,10 @@ from pathlib import Path
 from queue import Queue
 from typing import List
 
+from exceptions import CrcIntegrityError
 from .Decryptor import Decryptor
 from .DownloadContext import DownloadContext
 from .models import FileDownloadStatus, FileRecord, FileInfo, FragmentInfo
-from ..exceptions import PathDoesntExistError
 from ..models.Enums import EncryptionMethod
 from ..state.Storage import safe_move_src_only, safe_rmtree, safe_open, safe_remove_file
 
@@ -103,10 +103,9 @@ class FinalizeWorker:
                 frag_crc &= 0xFFFFFFFF
                 if frag_crc != frag.crc:
                     safe_remove_file(frag_path)
-                    # print(f"bad crc for frag: {frag.sequence}")
-                    # raise CrcIntegrityError(f"Bad fragment CRC. sequence={frag.sequence}, expected={frag.crc}, got={frag_crc}")
+                    raise CrcIntegrityError(f"Bad fragment CRC. sequence={frag.sequence}, expected={frag.crc}, got={frag_crc}")
 
-        # expected = file_info.crc & 0xFFFFFFFF
-        # actual = overall_crc & 0xFFFFFFFF
-        # if actual != expected:
-        #     raise CrcIntegrityError(f"Final CRC mismatch. Expected={expected}, Actual={actual}") #todo uncomment
+        expected = file_info.crc & 0xFFFFFFFF
+        actual = overall_crc & 0xFFFFFFFF
+        if actual != expected:
+            raise CrcIntegrityError(f"Final CRC mismatch. Expected={expected}, Actual={actual}")

@@ -19,14 +19,10 @@ class LocalScanner(BaseScanner):
     def __init__(self, state):
         self.state = state
         self._folder_hash_cache: dict[Path, str] = {}
-        self._hash_trace_dir: Path | None = self._get_hash_trace_dir()
         self._progress_callback: DiffProgressCallback | None = None
         self._hash_progress: dict[str, int] | None = None
         self._hash_progress_lock = threading.Lock()
         self._state_lock = threading.Lock()
-
-    def set_hash_trace_dir(self, output_dir: Path | str | None) -> None:
-        self._hash_trace_dir = Path(output_dir).resolve() if output_dir else None
 
     def set_progress_callback(self, callback: DiffProgressCallback | None) -> None:
         self._progress_callback = callback
@@ -269,8 +265,6 @@ class LocalScanner(BaseScanner):
 
         digest = h.hexdigest()
         self._folder_hash_cache[root] = digest
-        folder_entries = [(name, path) for name, _digest, path in child_hash_entries]
-        self._write_folder_hash_trace(root, digest, file_entries, folder_entries)
         self._increment_folder_hash_progress()
         return digest, all_files, all_dirs
 
@@ -329,75 +323,6 @@ class LocalScanner(BaseScanner):
 
     def _to_dt(self, ts: float) -> datetime:
         return datetime.fromtimestamp(ts, tz=timezone.utc)
-
-    def _get_hash_trace_dir(self) -> Path | None:
-        output_dir = os.environ.get("IDRIVE_SYNC_HASH_TRACE_DIR")
-        return Path(output_dir).resolve() if output_dir else None
-
-    def _write_folder_hash_trace(
-        self,
-        root: Path,
-        digest: str,
-        file_entries: list[tuple[str, int, Path]],
-        folder_entries: list[tuple[str, Path]],
-    ) -> None:
-        if self._hash_trace_dir is None:
-            return
-
-        self._hash_trace_dir.mkdir(parents=True, exist_ok=True)
-
-        updates = []
-        files = []
-        folders = []
-        update_index = 0
-
-        for order, (name, crc, path) in enumerate(file_entries):
-            files.append({
-                "order": order,
-                "name": name,
-                "crc": crc,
-                "source_name": path.name,
-                "path": str(path),
-            })
-            updates.append({"order": update_index, "kind": "file_name", "value": name})
-            update_index += 1
-            updates.append({"order": update_index, "kind": "file_crc", "value": crc})
-            update_index += 1
-
-        for order, (name, path) in enumerate(folder_entries):
-            folders.append({
-                "order": order,
-                "name": name,
-                "source_name": path.name,
-                "path": str(path),
-            })
-            updates.append({"order": update_index, "kind": "folder_name", "value": name})
-            update_index += 1
-
-        trace = {
-            "schema": "idrive-folder-hash-trace-v1",
-            "source": "local",
-            "folder": {
-                "name": remote_resource_name(root.name),
-                "source_name": root.name,
-                "path": str(root),
-            },
-            "hash": digest,
-            "counts": {
-                "files": len(files),
-                "folders": len(folders),
-                "updates": len(updates),
-            },
-            "files": files,
-            "folders": folders,
-            "updates": updates,
-        }
-
-        trace_id = hashlib.sha1(str(root).encode("utf-8")).hexdigest()
-        trace_path = self._hash_trace_dir / f"{trace_id}.json"
-        with open(trace_path, "w", encoding="utf-8") as f:
-            json.dump(trace, f, indent=2, ensure_ascii=False)
-            f.write("\n")
 
     def _crc32(self, path: Path) -> int:
         crc = 0

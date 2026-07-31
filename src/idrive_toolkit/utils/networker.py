@@ -38,7 +38,6 @@ def make_request(method: str, endpoint: str, data: dict = None, headers: dict = 
 
     try:
         response = httpxClient.request(method, url, headers=headers, json=data, params=params, files=files, timeout=20)
-        logger.debug(f"Response: status={response.status_code}")
 
     except httpx.TimeoutException as e:
         raise BackendServerTimeout(cause=e) from e

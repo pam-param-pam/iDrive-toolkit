@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import shutil
-import threading
-import time
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -12,19 +10,18 @@ from .DiffEngine import DiffEngine, DiffEntry, DiffResult, NodeStatus
 from .LocalScanner import LocalScanner
 from .RemoteScanner import RemoteScanner
 from .formatting import conflict_summary
+from .missing_folder import is_missing_folder_id, missing_folder_id, missing_folder_info
 from .progress import (
     DiffProgressCallback,
-    TransferProgress,
     TransferProgressCallback,
     TransferProgressDirection,
-    TransferProgressPhase,
 )
 from .state import StateStore
+from .transfer import TransferMonitor
 from ..models.File import File
 from ..models.Folder import Folder
 from ..models.Item import Item
 from ..utils import common
-from ..gui.transfer_errors import raise_transfer_errors
 
 
 UploadTask = tuple[Path, Folder]
@@ -49,17 +46,11 @@ class SyncConflictError(RuntimeError):
     pass
 
 
-class SyncTransferCancelled(RuntimeError):
-    pass
-
-
 class SyncBoundaryError(RuntimeError):
     pass
 
 
 class Syncer:
-    TRANSFER_SPEED_SMOOTHING = 0.12
-
     def __init__(self, get_uploader: Callable[[], object], get_downloader: Callable[[], object]):
         self._uploader_factory = get_uploader
         self._downloader_factory = get_downloader
@@ -70,15 +61,8 @@ class Syncer:
         self.local = LocalScanner(self.state)
         self.remote = RemoteScanner()
         self.diff_engine = DiffEngine(self.local, self.remote)
-        self._transfer_progress_callback: TransferProgressCallback | None = None
+        self._transfer_monitor = TransferMonitor()
         self._status_callback: Callable[[str], None] | None = None
-        self._active_transfer = None
-        self._active_transfer_direction: TransferProgressDirection | None = None
-        self._last_transfer = None
-        self._last_transfer_direction: TransferProgressDirection | None = None
-        self._active_transfer_cancel_thread: threading.Thread | None = None
-        self._active_transfer_lock = threading.Lock()
-        self._transfer_cancel_requested = threading.Event()
         self._boundary_local_root: Path | None = None
         self._boundary_remote_root_id: str | None = None
 
@@ -98,7 +82,7 @@ class Syncer:
         self.remote.clear_memory_cache(remote_root)
 
     def set_transfer_progress_callback(self, callback: TransferProgressCallback | None) -> None:
-        self._transfer_progress_callback = callback
+        self._transfer_monitor.set_progress_callback(callback)
 
     def set_status_callback(self, callback: Callable[[str], None] | None) -> None:
         self._status_callback = callback
@@ -112,51 +96,19 @@ class Syncer:
         self._boundary_remote_root_id = None
 
     def abort_current_transfer(self) -> None:
-        self._transfer_cancel_requested.set()
-        with self._active_transfer_lock:
-            active_transfer = self._active_transfer
-        if active_transfer is not None:
-            cancel_thread = threading.Thread(
-                target=lambda: active_transfer.shutdown(cancel_pending=True),
-                daemon=True,
-            )
-            with self._active_transfer_lock:
-                if self._active_transfer is active_transfer and self._active_transfer_cancel_thread is None:
-                    self._active_transfer_cancel_thread = cancel_thread
-                    cancel_thread.start()
+        self._transfer_monitor.abort_current_transfer()
 
     def pause_current_transfer(self) -> bool:
-        with self._active_transfer_lock:
-            active_transfer = self._active_transfer
-        if active_transfer is None:
-            return False
-        pause = getattr(active_transfer, "pause_all", None)
-        if not callable(pause):
-            return False
-        pause()
-        return True
+        return self._transfer_monitor.pause_current_transfer()
 
     def resume_current_transfer(self) -> bool:
-        with self._active_transfer_lock:
-            active_transfer = self._active_transfer
-        if active_transfer is None:
-            return False
-        resume = getattr(active_transfer, "resume_all", None)
-        if not callable(resume):
-            return False
-        resume()
-        return True
+        return self._transfer_monitor.resume_current_transfer()
 
     def get_current_transfer(self) -> tuple[str | None, object | None]:
-        with self._active_transfer_lock:
-            direction = self._active_transfer_direction or self._last_transfer_direction
-            transfer = self._active_transfer if self._active_transfer is not None else self._last_transfer
-            return direction.value if direction is not None else None, transfer
+        return self._transfer_monitor.get_current_transfer()
 
     def get_active_transfer(self) -> tuple[str | None, object | None]:
-        with self._active_transfer_lock:
-            direction = self._active_transfer_direction
-            return direction.value if direction is not None else None, self._active_transfer
+        return self._transfer_monitor.get_active_transfer()
 
     def diff(self, local_root: Path, remote_root: Folder | str, progress: DiffProgressCallback | None = None) -> DiffResult:
         temporary_boundary = self._ensure_sync_boundary(local_root, remote_root)
@@ -190,7 +142,7 @@ class Syncer:
                 renamed_strategy=renamed_strategy,
             )
             for entry in result.renamed:
-                self._handle_renamed(entry, renamed_strategy)
+                self._apply_renamed(entry, renamed_strategy)
             self._trash_remote_items(changed_remote_replacements)
             self._upload_many_and_invalidate(
                 only_local_uploads + changed_uploads,
@@ -205,78 +157,7 @@ class Syncer:
             if temporary_boundary:
                 self.clear_sync_boundary()
 
-    def sync_gui(self, local_root: Path, remote_root: Folder | str) -> None:
-        from ..gui.SyncGui import SyncGui
-        SyncGui(self, local_root, remote_root).run()
-
-
-    # -------------------------
-    # Diff handlers
-    # -------------------------
-
-    def _handle_only_local(self, entry: DiffEntry) -> None:
-        local_path, remote_parent, remote_parent_id = self._plan_only_local_upload(entry)
-        self._upload_many_and_invalidate([(local_path, remote_parent)], [remote_parent_id])
-
-    def _handle_only_local_many(self, entries: list[DiffEntry]) -> None:
-        uploads, remote_parent_ids = self._plan_only_local_uploads(entries)
-        self._upload_many_and_invalidate(uploads, remote_parent_ids)
-
-    def _handle_only_remote(self, entry: DiffEntry) -> None:
-        self._download_many([self._plan_only_remote_download(entry)])
-
-    def _handle_only_remote_many(self, entries: list[DiffEntry]) -> None:
-        self._download_many(self._plan_only_remote_downloads(entries))
-
-    def _handle_changed(
-        self,
-        entry: DiffEntry,
-        strategy: ChangedFileStrategy,
-        renamed_strategy: RenamedFileStrategy = RenamedFileStrategy.USE_LOCAL_NAME,
-    ) -> None:
-        self._require_status(entry, NodeStatus.CHANGED)
-
-        if entry.is_folder:
-            local_path = self._require_local_path(entry)
-            remote_id = self._require_remote_id(entry)
-            self.sync_one_level(local_path, remote_id, strategy=strategy, renamed_strategy=renamed_strategy)
-            return
-
-        if strategy == ChangedFileStrategy.ERROR:
-            raise SyncConflictError(f"Changed file requires an explicit strategy: {self._require_local_path(entry)}")
-
-        if strategy == ChangedFileStrategy.SKIP:
-            return
-
-        if strategy == ChangedFileStrategy.NEWER:
-            strategy = self._newer_file_strategy(entry)
-
-        if strategy == ChangedFileStrategy.UPLOAD_LOCAL:
-            self._replace_remote_with_local(entry)
-            return
-
-        if strategy == ChangedFileStrategy.DOWNLOAD_REMOTE:
-            self._replace_local_with_remote(entry)
-            return
-
-        raise ValueError(f"Unsupported changed file strategy: {strategy}")
-
-    def _handle_changed_many(
-        self,
-        entries: list[DiffEntry],
-        strategy: ChangedFileStrategy,
-        renamed_strategy: RenamedFileStrategy = RenamedFileStrategy.USE_LOCAL_NAME,
-    ) -> None:
-        uploads, upload_parent_ids, downloads, remote_replacements = self._plan_changed_transfers(
-            entries,
-            strategy=strategy,
-            renamed_strategy=renamed_strategy,
-        )
-        self._trash_remote_items(remote_replacements)
-        self._upload_many_and_invalidate(uploads, upload_parent_ids)
-        self._download_many(downloads)
-
-    def _handle_entries_many(
+    def sync_entries(
         self,
         entries: list[DiffEntry],
         strategy: ChangedFileStrategy | None = None,
@@ -292,7 +173,7 @@ class Syncer:
         if renamed and renamed_strategy is None:
             raise ValueError("Renamed entries require a renamed-file strategy")
 
-        only_local_uploads, only_local_parent_ids = self._plan_only_local_uploads(only_local)
+        uploads, upload_parent_ids = self._plan_only_local_uploads(only_local)
         changed_uploads: list[UploadTask] = []
         changed_upload_parent_ids: list[str] = []
         changed_downloads: list[DownloadTask] = []
@@ -305,16 +186,59 @@ class Syncer:
             )
 
         for entry in renamed:
-            self._handle_renamed(entry, renamed_strategy or RenamedFileStrategy.USE_LOCAL_NAME)
+            self._apply_renamed(entry, renamed_strategy or RenamedFileStrategy.USE_LOCAL_NAME)
 
         self._trash_remote_items(changed_remote_replacements)
-        self._upload_many_and_invalidate(
-            only_local_uploads + changed_uploads,
-            only_local_parent_ids + changed_upload_parent_ids,
-        )
+        self._upload_many_and_invalidate(uploads + changed_uploads, upload_parent_ids + changed_upload_parent_ids)
         self._download_many(self._plan_only_remote_downloads(only_remote) + changed_downloads)
 
-    def _handle_renamed(self, entry: DiffEntry, strategy: RenamedFileStrategy) -> None:
+    def upload_local_entries(self, entries: list[DiffEntry]) -> None:
+        self.sync_entries(entries)
+
+    def download_remote_entries(self, entries: list[DiffEntry]) -> None:
+        self.sync_entries(entries)
+
+    def resolve_changed_entries(
+        self,
+        entries: list[DiffEntry],
+        strategy: ChangedFileStrategy,
+        renamed_strategy: RenamedFileStrategy = RenamedFileStrategy.USE_LOCAL_NAME,
+    ) -> None:
+        self.sync_entries(entries, strategy=strategy, renamed_strategy=renamed_strategy)
+
+    def delete_local_entries(self, entries: list[DiffEntry]) -> None:
+        for entry in entries:
+            self._delete_local_entry(entry)
+
+    def trash_remote_entries(self, entries: list[DiffEntry]) -> None:
+        self._delete_remote_entries(entries)
+
+    def create_remote_folder(self, entry: DiffEntry) -> Folder:
+        self._require_status(entry, NodeStatus.ONLY_LOCAL)
+        if not entry.is_folder:
+            raise ValueError("Remote folder creation requires a local-only folder entry")
+
+        local_path = self._require_local_path(entry)
+        parent_remote_id = self._require_parent_remote_id(entry)
+        if self.is_missing_remote_folder(parent_remote_id):
+            raise ValueError(f"Cannot create remote folder under missing parent: {parent_remote_id}")
+
+        parent = self.remote.require_cached_folder(parent_remote_id)
+        created = parent.create_subfolder(local_path.name)
+        self.remote.invalidate(parent_remote_id)
+        self.remote.cache_item(created)
+        return created
+
+    def missing_remote_folder_id(self, local_path: Path | str, parent_remote_id: str | None = None) -> str:
+        return missing_folder_id(local_path, parent_remote_id)
+
+    def is_missing_remote_folder(self, remote_id: str) -> bool:
+        return is_missing_folder_id(remote_id)
+
+    def missing_remote_folder_info(self, remote_id: str) -> tuple[Path, str | None]:
+        return missing_folder_info(remote_id)
+
+    def _apply_renamed(self, entry: DiffEntry, strategy: RenamedFileStrategy) -> None:
         self._require_status(entry, NodeStatus.RENAMED)
 
         if strategy == RenamedFileStrategy.USE_LOCAL_NAME:
@@ -331,9 +255,6 @@ class Syncer:
     # Transfer operations
     # -------------------------
 
-    def _upload(self, local_path: Path, remote_parent: Folder) -> None:
-        self._upload_many([(local_path, remote_parent)])
-
     def _upload_many(self, uploads: list[UploadTask]) -> None:
         if not uploads:
             return
@@ -342,7 +263,7 @@ class Syncer:
         try:
             for local_path, remote_parent in uploads:
                 uploader.upload(local_path, parent=remote_parent)
-            self._join_transfer_with_progress(uploader, TransferProgressDirection.UPLOAD)
+            self._transfer_monitor.join(uploader, TransferProgressDirection.UPLOAD)
         finally:
             uploader.shutdown()
 
@@ -350,9 +271,6 @@ class Syncer:
         self._upload_many(uploads)
         for remote_parent_id in remote_parent_ids:
             self.remote.invalidate(remote_parent_id)
-
-    def _download(self, remote_item: Folder | File, target_dir: Path) -> None:
-        self._download_many([(remote_item, target_dir, None)])
 
     def _download_many(self, downloads: list[DownloadTask]) -> None:
         if not downloads:
@@ -364,180 +282,9 @@ class Syncer:
                 if replace_local_path is not None and replace_local_path.exists():
                     replace_local_path.unlink()
                 downloader.download(data=remote_item, target_dir=target_dir)
-            self._join_transfer_with_progress(downloader, TransferProgressDirection.DOWNLOAD)
+            self._transfer_monitor.join(downloader, TransferProgressDirection.DOWNLOAD)
         finally:
             downloader.shutdown()
-
-    def _join_transfer_with_progress(self, transfer, direction: TransferProgressDirection) -> None:
-        error: list[BaseException] = []
-        cancelled = False
-        last_bytes = 0
-        last_time = time.monotonic()
-        smoothed_speed = 0.0
-
-        with self._active_transfer_lock:
-            self._active_transfer = transfer
-            self._active_transfer_direction = direction
-            self._last_transfer = transfer
-            self._last_transfer_direction = direction
-            self._active_transfer_cancel_thread = None
-        self._transfer_cancel_requested.clear()
-
-        def wait_for_transfer() -> None:
-            try:
-                transfer.join()
-            except BaseException as exc:
-                error.append(exc)
-
-        waiter = threading.Thread(target=wait_for_transfer, daemon=True)
-        waiter.start()
-        self._emit_transfer_progress(transfer, direction, TransferProgressPhase.RUNNING)
-
-        while waiter.is_alive():
-            waiter.join(timeout=0.25)
-            current_bytes, last_bytes, last_time, smoothed_speed = self._sample_transfer_speed(
-                transfer,
-                direction,
-                last_bytes,
-                last_time,
-                smoothed_speed,
-            )
-            if self._transfer_cancel_requested.is_set() and not cancelled:
-                cancelled = True
-                self._emit_transfer_progress(
-                    transfer,
-                    direction,
-                    TransferProgressPhase.CANCELLING,
-                    current_bytes=current_bytes,
-                    bytes_per_second=smoothed_speed,
-                )
-                continue
-
-            phase = TransferProgressPhase.CANCELLING if cancelled else TransferProgressPhase.RUNNING
-            self._emit_transfer_progress(
-                transfer,
-                direction,
-                phase,
-                current_bytes=current_bytes,
-                bytes_per_second=smoothed_speed,
-            )
-
-        try:
-            if error:
-                raise error[0]
-
-            if cancelled:
-                self._wait_for_cancel_shutdown_thread()
-                self._emit_transfer_progress(transfer, direction, TransferProgressPhase.CANCELLED)
-                raise SyncTransferCancelled(f"{direction.value.capitalize()} aborted")
-
-            raise_transfer_errors(transfer, direction.value.capitalize())
-            self._emit_transfer_progress(transfer, direction, TransferProgressPhase.COMPLETE)
-        finally:
-            with self._active_transfer_lock:
-                if self._active_transfer is transfer:
-                    self._active_transfer = None
-                    self._active_transfer_direction = None
-                    self._active_transfer_cancel_thread = None
-            self._transfer_cancel_requested.clear()
-
-    def _wait_for_cancel_shutdown_thread(self) -> None:
-        with self._active_transfer_lock:
-            cancel_thread = self._active_transfer_cancel_thread
-        if cancel_thread is not None and cancel_thread is not threading.current_thread():
-            cancel_thread.join()
-
-    def _emit_transfer_progress(
-        self,
-        transfer,
-        direction: TransferProgressDirection,
-        phase: TransferProgressPhase,
-        current_bytes: int | None = None,
-        bytes_per_second: float = 0.0,
-    ) -> None:
-        callback: Callable[[TransferProgress], None] | None = self._transfer_progress_callback
-        if callback is None:
-            return
-
-        measured_current_bytes, total_bytes = self._transfer_byte_progress(transfer, direction)
-        if current_bytes is None:
-            current_bytes = measured_current_bytes
-        eta_seconds = self._transfer_eta_seconds(current_bytes, total_bytes, bytes_per_second)
-        completed_items, total_items, failed_items = self._transfer_item_progress(transfer, direction)
-        verb = "Uploading" if direction == TransferProgressDirection.UPLOAD else "Downloading"
-        message = f"{verb} files"
-        if phase == TransferProgressPhase.CANCELLING:
-            message = f"Aborting {direction.value}"
-        if phase == TransferProgressPhase.CANCELLED:
-            message = f"{direction.value.capitalize()} aborted"
-        if phase == TransferProgressPhase.COMPLETE:
-            message = f"{verb} complete"
-
-        callback(
-            TransferProgress(
-                direction=direction,
-                phase=phase,
-                message=message,
-                current_bytes=current_bytes,
-                total_bytes=total_bytes,
-                completed_items=completed_items,
-                total_items=total_items,
-                failed_items=failed_items,
-                bytes_per_second=bytes_per_second,
-                eta_seconds=eta_seconds,
-            )
-        )
-
-    def _sample_transfer_speed(
-        self,
-        transfer,
-        direction: TransferProgressDirection,
-        last_bytes: int,
-        last_time: float,
-        smoothed_speed: float,
-    ) -> tuple[int, int, float, float]:
-        current_bytes, _ = self._transfer_byte_progress(transfer, direction)
-        current_time = time.monotonic()
-        elapsed = current_time - last_time
-        if elapsed <= 0:
-            return current_bytes, last_bytes, last_time, smoothed_speed
-
-        instant_speed = max(0.0, (current_bytes - last_bytes) / elapsed)
-        if instant_speed > 0:
-            if smoothed_speed <= 0:
-                smoothed_speed = instant_speed
-            else:
-                alpha = self.TRANSFER_SPEED_SMOOTHING
-                smoothed_speed = alpha * instant_speed + (1.0 - alpha) * smoothed_speed
-        return current_bytes, current_bytes, current_time, smoothed_speed
-
-    def _transfer_eta_seconds(self, current_bytes: int, total_bytes: int, bytes_per_second: float) -> float | None:
-        if total_bytes <= 0 or bytes_per_second <= 0:
-            return None
-        remaining = max(0, total_bytes - current_bytes)
-        return remaining / bytes_per_second
-
-    def _transfer_byte_progress(self, transfer, direction: TransferProgressDirection) -> tuple[int, int]:
-        if direction == TransferProgressDirection.UPLOAD:
-            total_bytes, current_bytes = transfer.ctx.get_sizes()
-            return current_bytes, total_bytes
-        return transfer.get_progress()
-
-    def _transfer_item_progress(self, transfer, direction: TransferProgressDirection) -> tuple[int, int, int]:
-        states = transfer.ctx.get_all_states()
-        total_items = len(states)
-        completed_items = 0
-        failed_items = 0
-
-        for state in states.values():
-            status = getattr(state, "status", None)
-            status_value = getattr(status, "value", status)
-            if status_value in ("completed", "failed", "save_failed", "aborted"):
-                completed_items += 1
-            if status_value in ("failed", "save_failed"):
-                failed_items += 1
-
-        return completed_items, total_items, failed_items
 
     def _plan_only_local_uploads(self, entries: list[DiffEntry]) -> tuple[list[UploadTask], list[str]]:
         uploads: list[UploadTask] = []
@@ -657,19 +404,6 @@ class Syncer:
 
         return remote_item, parent_local_path, local_path
 
-    def _replace_remote_with_local(self, entry: DiffEntry) -> None:
-        upload, remote_parent_id, remote_item = self._plan_replace_remote_with_local(entry)
-        local_path, remote_parent = upload
-        self._trash_remote_items([remote_item])
-        self._upload(local_path, remote_parent)
-        self.remote.invalidate(remote_parent_id)
-
-    def _replace_local_with_remote(self, entry: DiffEntry) -> None:
-        remote_item, parent_local_path, replace_local_path = self._plan_replace_local_with_remote(entry)
-        if replace_local_path is not None and replace_local_path.exists():
-            replace_local_path.unlink()
-        self._download(remote_item, parent_local_path)
-
     def _rename_remote_to_local(self, entry: DiffEntry) -> None:
         local_node = self._require_local_node(entry)
         remote_id = self._require_remote_id(entry)
@@ -700,9 +434,6 @@ class Syncer:
             shutil.rmtree(local_path)
         elif local_path.exists():
             local_path.unlink()
-
-    def _delete_remote_entry(self, entry: DiffEntry) -> None:
-        self._delete_remote_entries([entry])
 
     def _delete_remote_entries(self, entries: list[DiffEntry]) -> None:
         if not entries:
@@ -777,8 +508,8 @@ class Syncer:
         seen: set[str] = set()
         while current_id and current_id not in seen:
             seen.add(current_id)
-            if self.remote.is_missing_folder_id(current_id):
-                _local_path, parent_id = self.remote.missing_folder_info(current_id)
+            if is_missing_folder_id(current_id):
+                _local_path, parent_id = missing_folder_info(current_id)
                 if parent_id == root_id:
                     return
                 current_id = parent_id

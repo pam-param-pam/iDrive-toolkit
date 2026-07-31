@@ -1,7 +1,7 @@
 MAX_RESOURCE_NAME_LENGTH = 75
 
 
-def chop_long_file_name(file_name: str) -> str:
+def remote_resource_name(file_name: str) -> str:
     if len(file_name) <= MAX_RESOURCE_NAME_LENGTH:
         return file_name
 
@@ -20,7 +20,3 @@ def chop_long_file_name(file_name: str) -> str:
         return file_name[:MAX_RESOURCE_NAME_LENGTH]
 
     return file_name_without_extension[:max_base_length] + file_extension
-
-
-def remote_resource_name(local_name: str) -> str:
-    return chop_long_file_name(local_name)

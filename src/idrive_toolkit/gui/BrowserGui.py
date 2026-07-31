@@ -34,7 +34,7 @@ from ..state.Storage import IdriveStorage
 from ..syncer.Syncer import Syncer
 from ..utils import common
 from ..version_check import UpdateInfo, check_for_update
-from .transfer_errors import raise_transfer_errors
+from ..transfer_errors import raise_transfer_errors
 from .BreadcrumbsBar import BreadcrumbsBar
 from .GuiUtils import apply_window_icon, file_icon_key, needs_resource_password, password_prompt_item, prompt_resource_password, safe_item_label, set_windows_app_user_model_id
 from .SyncGui import SyncGui, SyncGuiAlreadyOpenError

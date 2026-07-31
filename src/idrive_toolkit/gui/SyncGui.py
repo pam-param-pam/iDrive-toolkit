@@ -17,9 +17,10 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 from ..exceptions import BackendMissingOrIncorrectResourcePasswordError
 from ..syncer.BaseScanner import Node, NodeKind, NodeOrigin
 from ..syncer.DiffEngine import DiffEntry, DiffResult, NodeStatus
-from ..syncer.Syncer import ChangedFileStrategy, RenamedFileStrategy, SyncConflictError, SyncTransferCancelled
+from ..syncer.Syncer import ChangedFileStrategy, RenamedFileStrategy, SyncConflictError
 from ..syncer.formatting import conflict_summary, entry_local_label, entry_name, entry_remote_label, remote_label
 from ..syncer.progress import DiffProgress, DiffProgressPhase, TransferProgress
+from ..syncer.transfer import SyncTransferCancelled
 from ..models.Item import Item
 from ..models.Folder import Folder
 from .BreadcrumbsBar import BreadcrumbsBar
@@ -607,7 +608,7 @@ class SyncGui:
             return
 
         def work():
-            self.syncer._handle_entries_many(
+            self.syncer.sync_entries(
                 syncable_entries,
                 strategy=strategy,
                 renamed_strategy=renamed_strategy,
@@ -617,7 +618,7 @@ class SyncGui:
 
     def upload_local(self) -> None:
         entries = self._selected_entries() or self.result.only_local
-        self._apply_entries(entries, self.syncer._handle_only_local_many, "Upload selected local-only entries?")
+        self._apply_entries(entries, self.syncer.upload_local_entries, "Upload selected local-only entries?")
 
     def create_selected_remote_folder(self) -> None:
         selected = self._selected_entries()
@@ -629,7 +630,7 @@ class SyncGui:
 
     def download_remote(self) -> None:
         entries = self._selected_entries() or self.result.only_remote
-        self._apply_entries(entries, self.syncer._handle_only_remote_many, "Download selected remote-only entries?")
+        self._apply_entries(entries, self.syncer.download_remote_entries, "Download selected remote-only entries?")
 
     def resolve_changed(self) -> None:
         if not self.result.changed:
@@ -641,7 +642,7 @@ class SyncGui:
         entries = self._selected_entries() or self.result.changed
         self._apply_entries(
             entries,
-            lambda selected_entries: self.syncer._handle_changed_many(selected_entries, strategy=strategy),
+            lambda selected_entries: self.syncer.resolve_changed_entries(selected_entries, strategy=strategy),
             "Resolve selected changed entries?",
         )
 
@@ -653,7 +654,7 @@ class SyncGui:
             return
         if not messagebox.askyesno("Delete Local", f"Delete {len(local_entries)} local entr{'y' if len(local_entries) == 1 else 'ies'}?", parent=self.root):
             return
-        self._run_action("Deleting local entries...", lambda: [self.syncer._delete_local_entry(entry) for entry in local_entries])
+        self._run_action("Deleting local entries...", lambda: self.syncer.delete_local_entries(local_entries))
 
     def trash_remote(self) -> None:
         entries = self._selected_entries() or self.entries
@@ -665,7 +666,7 @@ class SyncGui:
             return
         self._run_action(
             "Moving remote entries to trash...",
-            lambda: self.syncer._delete_remote_entries(remote_entries),
+            lambda: self.syncer.trash_remote_entries(remote_entries),
             password_items=self._remote_items_for_entries(remote_entries),
         )
 
@@ -1028,7 +1029,7 @@ class SyncGui:
                 remote_ids.append(entry.parent_remote_id)
             for remote_id in remote_ids:
                 remote_id = str(remote_id)
-                if self.syncer.remote.is_missing_folder_id(remote_id):
+                if self.syncer.is_missing_remote_folder(remote_id):
                     continue
                 if remote_id in seen:
                     continue
@@ -1124,7 +1125,7 @@ class SyncGui:
 
     def _confirm_single_upload(self, entry: DiffEntry) -> None:
         if messagebox.askyesno("Upload", f"Upload {entry_name(entry)}?", parent=self.root):
-            self._run_action("Uploading selected entry...", lambda: self.syncer._handle_only_local(entry))
+            self._run_action("Uploading selected entry...", lambda: self.syncer.upload_local_entries([entry]))
 
     def _confirm_create_remote_folder(self, entry: DiffEntry) -> None:
         if messagebox.askyesno("Create Remote Folder", f"Create remote folder {entry_name(entry)}?", parent=self.root):
@@ -1138,39 +1139,33 @@ class SyncGui:
         if not self._can_create_remote_folder(entry):
             raise ValueError(f"Cannot create remote folder for {entry_name(entry)}")
 
-        local_path = Path(entry.local_path)
-        parent_remote_id = str(entry.parent_remote_id)
-        parent = self.syncer.remote.require_cached_folder(parent_remote_id)
-        created = parent.create_subfolder(local_path.name)
-        self.syncer.remote.invalidate(parent_remote_id)
-        self.syncer.remote._cache_item(created)
-        return created
+        return self.syncer.create_remote_folder(entry)
 
     def _can_create_remote_folder(self, entry: DiffEntry) -> bool:
         if entry.status != NodeStatus.ONLY_LOCAL or not entry.is_folder:
             return False
         if entry.local_path is None or entry.parent_remote_id is None:
             return False
-        return not self.syncer.remote.is_missing_folder_id(str(entry.parent_remote_id))
+        return not self.syncer.is_missing_remote_folder(str(entry.parent_remote_id))
 
     def _confirm_single_download(self, entry: DiffEntry) -> None:
         if messagebox.askyesno("Download", f"Download {entry_name(entry)}?", parent=self.root):
-            self._run_action("Downloading selected entry...", lambda: self.syncer._handle_only_remote(entry))
+            self._run_action("Downloading selected entry...", lambda: self.syncer.download_remote_entries([entry]))
 
     def _confirm_single_resolve(self, entry: DiffEntry) -> None:
         strategy = self._ask_changed_strategy()
         if strategy and messagebox.askyesno("Resolve", f"Resolve {entry_name(entry)} with {strategy.value}?", parent=self.root):
-            self._run_action("Resolving selected entry...", lambda: self.syncer._handle_changed(entry, strategy=strategy))
+            self._run_action("Resolving selected entry...", lambda: self.syncer.resolve_changed_entries([entry], strategy=strategy))
 
     def _confirm_single_delete_local(self, entry: DiffEntry) -> None:
         if messagebox.askyesno("Delete Local", f"Delete local {entry_name(entry)}?", parent=self.root):
-            self._run_action("Deleting local entry...", lambda: self.syncer._delete_local_entry(entry))
+            self._run_action("Deleting local entry...", lambda: self.syncer.delete_local_entries([entry]))
 
     def _confirm_single_trash_remote(self, entry: DiffEntry) -> None:
         if messagebox.askyesno("Trash Remote", f"Move remote {entry_name(entry)} to trash?", parent=self.root):
             self._run_action(
                 "Moving remote entry to trash...",
-                lambda: self.syncer._delete_remote_entry(entry),
+                lambda: self.syncer.trash_remote_entries([entry]),
                 password_items=self._remote_items_for_entries([entry]),
             )
 
@@ -1182,7 +1177,7 @@ class SyncGui:
                 return False
 
             _local_root, remote_root = self.stack[-1]
-            return not self.syncer.remote.is_missing_folder_id(self.syncer.remote.normalize_id(remote_root))
+            return not self.syncer.is_missing_remote_folder(self.syncer.remote.normalize_id(remote_root))
         return entry.local is not None or entry.remote is not None
 
     def _open_entry(self, entry: DiffEntry) -> None:
@@ -1207,19 +1202,19 @@ class SyncGui:
         if remote_id is None:
             _current_local_root, current_remote_root = self.stack[-1]
             current_remote_id = self.syncer.remote.normalize_id(current_remote_root)
-            if self.syncer.remote.is_missing_folder_id(current_remote_id):
+            if self.syncer.is_missing_remote_folder(current_remote_id):
                 messagebox.showinfo("Open", "Create the parent remote folder before opening deeper local-only folders.", parent=self.root)
                 return
 
-            remote_id = self.syncer.remote.missing_folder_id(local_path, entry.parent_remote_id)
+            remote_id = self.syncer.missing_remote_folder_id(local_path, entry.parent_remote_id)
 
         self.stack.append((Path(local_path), remote_id))
         self._load_current_level(clear_cache=False, password_items=password_items or None)
 
     def _parent_remote_root(self, remote_root: Folder | str, parent_local_root: Path) -> Folder | str:
         remote_id = self.syncer.remote.normalize_id(remote_root)
-        if self.syncer.remote.is_missing_folder_id(remote_id):
-            _local_path, parent_remote_id = self.syncer.remote.missing_folder_info(remote_id)
+        if self.syncer.is_missing_remote_folder(remote_id):
+            _local_path, parent_remote_id = self.syncer.missing_remote_folder_info(remote_id)
             return parent_remote_id if parent_remote_id is not None else remote_root
 
         try:
@@ -1241,8 +1236,8 @@ class SyncGui:
         if local_root.parent == local_root:
             return False
 
-        if self.syncer.remote.is_missing_folder_id(remote_id):
-            _local_path, parent_remote_id = self.syncer.remote.missing_folder_info(remote_id)
+        if self.syncer.is_missing_remote_folder(remote_id):
+            _local_path, parent_remote_id = self.syncer.missing_remote_folder_info(remote_id)
             return parent_remote_id is not None
 
         try:
@@ -1461,8 +1456,8 @@ class SyncGui:
 
     def _current_sync_breadcrumbs(self, remote_root: Folder | str):
         remote_id = self.syncer.remote.normalize_id(remote_root)
-        if self.syncer.remote.is_missing_folder_id(remote_id):
-            local_path, parent_remote_id = self.syncer.remote.missing_folder_info(remote_id)
+        if self.syncer.is_missing_remote_folder(remote_id):
+            local_path, parent_remote_id = self.syncer.missing_remote_folder_info(remote_id)
             if parent_remote_id is None:
                 return [(remote_id, local_path.name)]
             return [*self._current_sync_breadcrumbs(parent_remote_id), (remote_id, local_path.name)]
@@ -1671,7 +1666,7 @@ class SyncGui:
         return item if isinstance(item, Folder) else None
 
     def _remote_item_by_id(self, remote_id: str) -> Item | None:
-        if self.syncer.remote.is_missing_folder_id(str(remote_id)):
+        if self.syncer.is_missing_remote_folder(str(remote_id)):
             return None
 
         try:

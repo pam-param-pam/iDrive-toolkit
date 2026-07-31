@@ -135,12 +135,7 @@ class DiffEngine:
         self.local_scanner = local_scanner
         self.remote_scanner = remote_scanner
 
-    def diff_one_level(
-        self,
-        local_root_id: Path,
-        remote_root_id: Folder | str,
-        progress: DiffProgressCallback | None = None,
-    ) -> DiffResult:
+    def diff_one_level(self, local_root_id: Path, remote_root_id: Folder | str, progress: DiffProgressCallback | None = None) -> DiffResult:
         emit_progress(progress, DiffProgressPhase.PREPARING, "Preparing diff")
         local_root_id = self.local_scanner.normalize_id(local_root_id)
         remote_root_id = self.remote_scanner.normalize_id(remote_root_id)
