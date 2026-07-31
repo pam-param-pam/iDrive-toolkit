@@ -229,7 +229,7 @@ class DiffEngine:
                 unit="files",
             )
 
-        self._detect_renamed_files(result, local_parent, remote_parent)
+        self._detect_renamed_items(result, local_parent, remote_parent)
 
         # -------------------------
         # FINAL SORT (deterministic)
@@ -424,12 +424,12 @@ class DiffEngine:
 
         return local.size == remote.size and local.hash == remote.hash
 
-    def _detect_renamed_files(self, result: DiffResult, local_parent: Node, remote_parent: Node) -> None:
+    def _detect_renamed_items(self, result: DiffResult, local_parent: Node, remote_parent: Node) -> None:
         if not result.only_local or not result.only_remote:
             return
 
-        local_by_signature = self._unique_files_by_signature(result.only_local, local=True)
-        remote_by_signature = self._unique_files_by_signature(result.only_remote, local=False)
+        local_by_signature = self._unique_items_by_signature(result.only_local, local=True)
+        remote_by_signature = self._unique_items_by_signature(result.only_remote, local=False)
         signatures = sorted(set(local_by_signature.keys()) & set(remote_by_signature.keys()))
 
         renamed_pairs: list[tuple[DiffEntry, DiffEntry]] = []
@@ -459,13 +459,18 @@ class DiffEngine:
                 )
             )
 
-    def _unique_files_by_signature(self, entries: list[DiffEntry], *, local: bool) -> dict[tuple[int, str], DiffEntry]:
-        unique: dict[tuple[int, str], DiffEntry | None] = {}
+    def _unique_items_by_signature(self, entries: list[DiffEntry], *, local: bool) -> dict[tuple[str, str] | tuple[str, int, str], DiffEntry]:
+        unique: dict[tuple[str, str] | tuple[str, int, str], DiffEntry | None] = {}
         for entry in entries:
             node = entry.local if local else entry.remote
-            if node is None or node.kind != NodeKind.FILE or node.size is None or node.hash is None:
+            if node is None or node.hash is None:
                 continue
-            signature = (node.size, str(node.hash))
+            if node.kind == NodeKind.FOLDER:
+                signature = (node.kind.value, str(node.hash))
+            elif node.size is not None:
+                signature = (node.kind.value, node.size, str(node.hash))
+            else:
+                continue
             if signature in unique:
                 unique[signature] = None
             else:

@@ -28,9 +28,25 @@ logger = logging.getLogger("iDrive")
 logger.setLevel(logging.DEBUG)
 
 
+class SafeStreamHandler(logging.StreamHandler):
+    def emit(self, record: logging.LogRecord) -> None:
+        if self.stream is None:
+            return
+        try:
+            super().emit(record)
+        except (AttributeError, ValueError):
+            if self.stream is not None:
+                self.handleError(record)
+
+
+for handler in list(logger.handlers):
+    if isinstance(handler, logging.StreamHandler) and getattr(handler, "stream", None) is None:
+        logger.removeHandler(handler)
+
+
 
 if not logger.handlers:
-    console_handler = logging.StreamHandler()
+    console_handler = SafeStreamHandler()
     console_handler.setLevel(logging.DEBUG)
 
     formatter = CapitalizeModuleFormatter("[%(module_upper)s] %(message)s")

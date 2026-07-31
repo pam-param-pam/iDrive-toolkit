@@ -70,12 +70,46 @@ def needs_resource_password(item: Item) -> bool:
     return item.is_locked and not item.password
 
 
-def password_prompt_item(items: Iterable[Item | None], fallback: Item | None = None) -> Item | None:
-    present = [item for item in items if item is not None]
-    for item in present:
-        if item.is_locked:
+def password_prompt_item(
+    error: BackendMissingOrIncorrectResourcePasswordError,
+    items: Iterable[Item | None] = (),
+) -> Item | None:
+    required = _required_password_folder(error)
+    if required is None:
+        return None
+
+    required_id, required_name = required
+    for item in items:
+        if item is not None and str(getattr(item, "_id", item.id)) == required_id:
+            item._name = getattr(item, "_name", None) or required_name
+            item._is_locked = True
+            item._lock_from = getattr(item, "_lock_from", None) or required_id
             return item
-    return present[0] if present else fallback
+
+    from ..models.Folder import Folder
+
+    item = Folder(required_id)
+    item._name = required_name
+    item._is_locked = True
+    item._lock_from = required_id
+    return item
+
+
+def _required_password_folder(error: BackendMissingOrIncorrectResourcePasswordError) -> tuple[str, str] | None:
+    data = error.json()
+    if not isinstance(data, dict):
+        return None
+
+    required = data.get("requiredFolderPasswords")
+    if not isinstance(required, list) or not required:
+        return None
+
+    folder = required[0]
+    if not isinstance(folder, dict) or not folder.get("id"):
+        return None
+
+    folder_id = str(folder["id"])
+    return folder_id, str(folder.get("name") or folder_id)
 
 
 def prompt_resource_password(parent: tk.Misc, item: Item, remember: Callable[[Item, str], None]) -> bool:

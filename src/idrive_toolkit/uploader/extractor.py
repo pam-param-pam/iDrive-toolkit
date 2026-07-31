@@ -29,21 +29,37 @@ def get_file_extension(filename: str) -> str:
     return "." + filename.rsplit(".", 1)[1]
 
 
-def _run_media(cmd: List[str], timeout: int, text: bool = False) -> subprocess.CompletedProcess:
+def _run_media(cmd: List[str], timeout: int, text: bool = False, check: bool = True) -> subprocess.CompletedProcess:
     require_media_tool(cmd[0])
 
-    return subprocess.run(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=True,
-        text=text,
-        encoding="utf-8" if text else None,
-        errors="replace" if text else None,
-        creationflags=_media_creationflags(),
-    )
+    max_retries = 3
+    attempt = 0
+    while True:
+        try:
+            return subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=check,
+                text=text,
+                encoding="utf-8" if text else None,
+                errors="replace" if text else None,
+                creationflags=_media_creationflags(),
+            )
+        except subprocess.TimeoutExpired:
+            if attempt >= max_retries:
+                raise
+            attempt += 1
+            logger.warning(
+                "%s timed out after %ss; retrying (%d/%d): %s",
+                cmd[0],
+                timeout,
+                attempt,
+                max_retries,
+                " ".join(str(part) for part in cmd),
+            )
 
 def _run(cmd: List[str]) -> subprocess.CompletedProcess:
     return _run_media(cmd, timeout=5, text=True)
@@ -72,16 +88,11 @@ def _run_ffprobe(path: str, extensions, extension) -> Dict[str, Any]:
         path,
     ]
 
-    proc = subprocess.run(
+    proc = _run_media(
         cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
         timeout=5,
         text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=_media_creationflags(),
+        check=False,
     )
 
     if proc.returncode != 0:
@@ -291,14 +302,10 @@ def extract_subtitles_if_needed(extensions: Mapping[str, list[str]], extension: 
         ]
 
         try:
-            require_media_tool("ffmpeg")
-            proc = subprocess.run(
+            proc = _run_media(
                 cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,   # <-- don’t hide errors blindly
                 timeout=20,
-                creationflags=_media_creationflags(),
+                check=False,
             )
 
             if proc.returncode != 0:
@@ -478,7 +485,6 @@ def _normalize_subtitle_text(value: str) -> str:
 
 def _get_video_duration(path: Path) -> Optional[float]:
     try:
-        require_media_tool("ffprobe")
         cmd = [
             "ffprobe",
             "-v", "error",
@@ -487,12 +493,11 @@ def _get_video_duration(path: Path) -> Optional[float]:
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(path),
         ]
-        proc = subprocess.run(
+        proc = _run_media(
             cmd,
-            capture_output=True,
             text=True,
-            timeout=3,
-            creationflags=_media_creationflags(),
+            timeout=5,
+            check=False,
         )
         return float(proc.stdout.strip())
     except Exception:

@@ -22,12 +22,14 @@ from .progress import (
 from .state import StateStore
 from ..models.File import File
 from ..models.Folder import Folder
+from ..models.Item import Item
+from ..utils import common
 from ..gui.transfer_errors import raise_transfer_errors
 
 
 UploadTask = tuple[Path, Folder]
 DownloadTask = tuple[Folder | File, Path, Path | None]
-ChangedTransferPlan = tuple[list[UploadTask], list[str], list[DownloadTask]]
+ChangedTransferPlan = tuple[list[UploadTask], list[str], list[DownloadTask], list[Item]]
 
 
 class ChangedFileStrategy(Enum):
@@ -182,13 +184,14 @@ class Syncer:
                 raise SyncConflictError(conflict_summary(result.conflicts))
 
             only_local_uploads, only_local_parent_ids = self._plan_only_local_uploads(result.only_local)
-            changed_uploads, changed_upload_parent_ids, changed_downloads = self._plan_changed_transfers(
+            changed_uploads, changed_upload_parent_ids, changed_downloads, changed_remote_replacements = self._plan_changed_transfers(
                 result.changed,
                 strategy=strategy,
                 renamed_strategy=renamed_strategy,
             )
             for entry in result.renamed:
                 self._handle_renamed(entry, renamed_strategy)
+            self._trash_remote_items(changed_remote_replacements)
             self._upload_many_and_invalidate(
                 only_local_uploads + changed_uploads,
                 only_local_parent_ids + changed_upload_parent_ids,
@@ -215,8 +218,15 @@ class Syncer:
         local_path, remote_parent, remote_parent_id = self._plan_only_local_upload(entry)
         self._upload_many_and_invalidate([(local_path, remote_parent)], [remote_parent_id])
 
+    def _handle_only_local_many(self, entries: list[DiffEntry]) -> None:
+        uploads, remote_parent_ids = self._plan_only_local_uploads(entries)
+        self._upload_many_and_invalidate(uploads, remote_parent_ids)
+
     def _handle_only_remote(self, entry: DiffEntry) -> None:
         self._download_many([self._plan_only_remote_download(entry)])
+
+    def _handle_only_remote_many(self, entries: list[DiffEntry]) -> None:
+        self._download_many(self._plan_only_remote_downloads(entries))
 
     def _handle_changed(
         self,
@@ -251,10 +261,61 @@ class Syncer:
 
         raise ValueError(f"Unsupported changed file strategy: {strategy}")
 
+    def _handle_changed_many(
+        self,
+        entries: list[DiffEntry],
+        strategy: ChangedFileStrategy,
+        renamed_strategy: RenamedFileStrategy = RenamedFileStrategy.USE_LOCAL_NAME,
+    ) -> None:
+        uploads, upload_parent_ids, downloads, remote_replacements = self._plan_changed_transfers(
+            entries,
+            strategy=strategy,
+            renamed_strategy=renamed_strategy,
+        )
+        self._trash_remote_items(remote_replacements)
+        self._upload_many_and_invalidate(uploads, upload_parent_ids)
+        self._download_many(downloads)
+
+    def _handle_entries_many(
+        self,
+        entries: list[DiffEntry],
+        strategy: ChangedFileStrategy | None = None,
+        renamed_strategy: RenamedFileStrategy | None = None,
+    ) -> None:
+        only_local = [entry for entry in entries if entry.status == NodeStatus.ONLY_LOCAL]
+        only_remote = [entry for entry in entries if entry.status == NodeStatus.ONLY_REMOTE]
+        changed = [entry for entry in entries if entry.status == NodeStatus.CHANGED]
+        renamed = [entry for entry in entries if entry.status == NodeStatus.RENAMED]
+
+        if changed and strategy is None:
+            raise ValueError("Changed entries require a changed-file strategy")
+        if renamed and renamed_strategy is None:
+            raise ValueError("Renamed entries require a renamed-file strategy")
+
+        only_local_uploads, only_local_parent_ids = self._plan_only_local_uploads(only_local)
+        changed_uploads: list[UploadTask] = []
+        changed_upload_parent_ids: list[str] = []
+        changed_downloads: list[DownloadTask] = []
+        changed_remote_replacements: list[Item] = []
+        if changed:
+            changed_uploads, changed_upload_parent_ids, changed_downloads, changed_remote_replacements = self._plan_changed_transfers(
+                changed,
+                strategy=strategy,
+                renamed_strategy=renamed_strategy or RenamedFileStrategy.USE_LOCAL_NAME,
+            )
+
+        for entry in renamed:
+            self._handle_renamed(entry, renamed_strategy or RenamedFileStrategy.USE_LOCAL_NAME)
+
+        self._trash_remote_items(changed_remote_replacements)
+        self._upload_many_and_invalidate(
+            only_local_uploads + changed_uploads,
+            only_local_parent_ids + changed_upload_parent_ids,
+        )
+        self._download_many(self._plan_only_remote_downloads(only_remote) + changed_downloads)
+
     def _handle_renamed(self, entry: DiffEntry, strategy: RenamedFileStrategy) -> None:
         self._require_status(entry, NodeStatus.RENAMED)
-        if entry.is_folder:
-            raise SyncConflictError("Folder rename sync is not supported")
 
         if strategy == RenamedFileStrategy.USE_LOCAL_NAME:
             self._rename_remote_to_local(entry)
@@ -520,9 +581,10 @@ class Syncer:
         uploads: list[UploadTask] = []
         upload_parent_ids: list[str] = []
         downloads: list[DownloadTask] = []
+        remote_replacements: list[Item] = []
 
         for entry in entries:
-            upload_task, upload_parent_id, download_task = self._plan_changed_transfer(
+            upload_task, upload_parent_id, download_task, remote_replacement = self._plan_changed_transfer(
                 entry,
                 strategy=strategy,
                 renamed_strategy=renamed_strategy,
@@ -532,42 +594,44 @@ class Syncer:
                 upload_parent_ids.append(upload_parent_id)
             if download_task is not None:
                 downloads.append(download_task)
+            if remote_replacement is not None:
+                remote_replacements.append(remote_replacement)
 
-        return uploads, upload_parent_ids, downloads
+        return uploads, upload_parent_ids, downloads, remote_replacements
 
     def _plan_changed_transfer(
         self,
         entry: DiffEntry,
         strategy: ChangedFileStrategy,
         renamed_strategy: RenamedFileStrategy,
-    ) -> tuple[UploadTask | None, str | None, DownloadTask | None]:
+    ) -> tuple[UploadTask | None, str | None, DownloadTask | None, Item | None]:
         self._require_status(entry, NodeStatus.CHANGED)
 
         if entry.is_folder:
             local_path = self._require_local_path(entry)
             remote_id = self._require_remote_id(entry)
             self.sync_one_level(local_path, remote_id, strategy=strategy, renamed_strategy=renamed_strategy)
-            return None, None, None
+            return None, None, None, None
 
         if strategy == ChangedFileStrategy.ERROR:
             raise SyncConflictError(f"Changed file requires an explicit strategy: {self._require_local_path(entry)}")
 
         if strategy == ChangedFileStrategy.SKIP:
-            return None, None, None
+            return None, None, None, None
 
         if strategy == ChangedFileStrategy.NEWER:
             strategy = self._newer_file_strategy(entry)
 
         if strategy == ChangedFileStrategy.UPLOAD_LOCAL:
-            upload_task, remote_parent_id = self._plan_replace_remote_with_local(entry)
-            return upload_task, remote_parent_id, None
+            upload_task, remote_parent_id, remote_item = self._plan_replace_remote_with_local(entry)
+            return upload_task, remote_parent_id, None, remote_item
 
         if strategy == ChangedFileStrategy.DOWNLOAD_REMOTE:
-            return None, None, self._plan_replace_local_with_remote(entry)
+            return None, None, self._plan_replace_local_with_remote(entry), None
 
         raise ValueError(f"Unsupported changed file strategy: {strategy}")
 
-    def _plan_replace_remote_with_local(self, entry: DiffEntry) -> tuple[UploadTask, str]:
+    def _plan_replace_remote_with_local(self, entry: DiffEntry) -> tuple[UploadTask, str, Item]:
         local_path = self._require_local_path(entry)
         remote_id = self._require_remote_id(entry)
         remote_parent_id = self._require_parent_remote_id(entry)
@@ -577,10 +641,7 @@ class Syncer:
         if entry.is_folder:
             raise SyncConflictError("Folder replacement must be handled by recursive sync")
 
-        remote_item.move_to_trash()
-        self.remote.forget(remote_id)
-        self.remote.invalidate(remote_parent_id)
-        return (local_path, remote_parent), remote_parent_id
+        return (local_path, remote_parent), remote_parent_id, remote_item
 
     def _plan_replace_local_with_remote(self, entry: DiffEntry) -> DownloadTask:
         local_path = self._require_local_path(entry)
@@ -597,8 +658,9 @@ class Syncer:
         return remote_item, parent_local_path, local_path
 
     def _replace_remote_with_local(self, entry: DiffEntry) -> None:
-        upload, remote_parent_id = self._plan_replace_remote_with_local(entry)
+        upload, remote_parent_id, remote_item = self._plan_replace_remote_with_local(entry)
         local_path, remote_parent = upload
+        self._trash_remote_items([remote_item])
         self._upload(local_path, remote_parent)
         self.remote.invalidate(remote_parent_id)
 
@@ -624,7 +686,7 @@ class Syncer:
         target_path = local_path.with_name(remote_node.name)
 
         if target_path.exists():
-            raise FileExistsError(f"Cannot rename local file because target exists: {target_path}")
+            raise FileExistsError(f"Cannot rename local entry because target exists: {target_path}")
         self._emit_status(f"Renamed {remote_node.name}")
         local_path.rename(target_path)
 
@@ -640,13 +702,42 @@ class Syncer:
             local_path.unlink()
 
     def _delete_remote_entry(self, entry: DiffEntry) -> None:
-        remote_id = self._require_remote_id(entry)
-        remote_item = self.remote.require_cached_item(remote_id)
-        parent_remote_id = entry.parent_remote_id
+        self._delete_remote_entries([entry])
 
-        remote_item.move_to_trash()
-        self.remote.forget_tree(remote_id)
-        if parent_remote_id is not None:
+    def _delete_remote_entries(self, entries: list[DiffEntry]) -> None:
+        if not entries:
+            return
+
+        remote_items: list[Item] = []
+        parent_remote_ids: list[str] = []
+        remote_ids: list[str] = []
+
+        for entry in entries:
+            remote_id = self._require_remote_id(entry)
+            remote_item = self.remote.require_cached_item(remote_id)
+            remote_items.append(remote_item)
+            remote_ids.append(remote_id)
+            if entry.parent_remote_id is not None:
+                parent_remote_ids.append(entry.parent_remote_id)
+
+        if not remote_items:
+            return
+
+        common.move_to_trash(remote_items)
+        for remote_id in remote_ids:
+            self.remote.forget_tree(remote_id)
+        for parent_remote_id in set(parent_remote_ids):
+            self.remote.invalidate(parent_remote_id)
+
+    def _trash_remote_items(self, remote_items: list[Item]) -> None:
+        if not remote_items:
+            return
+
+        parent_remote_ids = [str(item.parent_id) for item in remote_items if item.parent_id is not None]
+        common.move_to_trash(remote_items)
+        for item in remote_items:
+            self.remote.forget_tree(str(item.id))
+        for parent_remote_id in set(parent_remote_ids):
             self.remote.invalidate(parent_remote_id)
 
     # -------------------------

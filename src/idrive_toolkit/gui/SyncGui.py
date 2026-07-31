@@ -607,25 +607,17 @@ class SyncGui:
             return
 
         def work():
-            for entry in syncable_entries:
-                if entry.status == NodeStatus.ONLY_LOCAL:
-                    self.syncer._handle_only_local(entry)
-                elif entry.status == NodeStatus.ONLY_REMOTE:
-                    self.syncer._handle_only_remote(entry)
-                elif entry.status == NodeStatus.CHANGED:
-                    if strategy is None:
-                        raise ValueError("Changed entry requires a changed-file strategy")
-                    self.syncer._handle_changed(entry, strategy=strategy)
-                elif entry.status == NodeStatus.RENAMED:
-                    if renamed_strategy is None:
-                        raise ValueError("Renamed entry requires a renamed-file strategy")
-                    self.syncer._handle_renamed(entry, strategy=renamed_strategy)
+            self.syncer._handle_entries_many(
+                syncable_entries,
+                strategy=strategy,
+                renamed_strategy=renamed_strategy,
+            )
 
         self._run_action("Syncing selected entries...", work, password_items=self._remote_items_for_entries(syncable_entries, include_parent=True))
 
     def upload_local(self) -> None:
         entries = self._selected_entries() or self.result.only_local
-        self._apply_entries(entries, self.syncer._handle_only_local, "Upload selected local-only entries?")
+        self._apply_entries(entries, self.syncer._handle_only_local_many, "Upload selected local-only entries?")
 
     def create_selected_remote_folder(self) -> None:
         selected = self._selected_entries()
@@ -637,7 +629,7 @@ class SyncGui:
 
     def download_remote(self) -> None:
         entries = self._selected_entries() or self.result.only_remote
-        self._apply_entries(entries, self.syncer._handle_only_remote, "Download selected remote-only entries?")
+        self._apply_entries(entries, self.syncer._handle_only_remote_many, "Download selected remote-only entries?")
 
     def resolve_changed(self) -> None:
         if not self.result.changed:
@@ -649,7 +641,7 @@ class SyncGui:
         entries = self._selected_entries() or self.result.changed
         self._apply_entries(
             entries,
-            lambda entry: self.syncer._handle_changed(entry, strategy=strategy),
+            lambda selected_entries: self.syncer._handle_changed_many(selected_entries, strategy=strategy),
             "Resolve selected changed entries?",
         )
 
@@ -673,7 +665,7 @@ class SyncGui:
             return
         self._run_action(
             "Moving remote entries to trash...",
-            lambda: [self.syncer._delete_remote_entry(entry) for entry in remote_entries],
+            lambda: self.syncer._delete_remote_entries(remote_entries),
             password_items=self._remote_items_for_entries(remote_entries),
         )
 
@@ -994,11 +986,7 @@ class SyncGui:
         if not messagebox.askyesno("Confirm", prompt, parent=self.root):
             return
 
-        def work():
-            for entry in entries:
-                handler(entry)
-
-        self._run_action("Applying entries...", work, password_items=self._remote_items_for_entries(entries, include_parent=True))
+        self._run_action("Applying entries...", lambda: handler(entries), password_items=self._remote_items_for_entries(entries, include_parent=True))
 
     def _selected_entries(self) -> list[DiffEntry]:
         selected = []
@@ -1622,8 +1610,8 @@ class SyncGui:
                 self._safe_after(lambda exc=exc: self._worker_failed("Sync conflict", exc))
             except SyncTransferCancelled as exc:
                 self._safe_after(lambda exc=exc: self._worker_cancelled(exc))
-            except BackendMissingOrIncorrectResourcePasswordError:
-                self._safe_after(lambda: self._worker_password_required(status, work, done, password_items))
+            except BackendMissingOrIncorrectResourcePasswordError as exc:
+                self._safe_after(lambda exc=exc: self._worker_password_required(status, work, done, password_items, exc))
             except Exception as exc:
                 logger.exception("Something failed.", exc_info=exc)
                 self._safe_after(lambda exc=exc: self._worker_failed("Error", exc))
@@ -1652,13 +1640,24 @@ class SyncGui:
             return
         self._set_busy(False, str(exc))
 
-    def _worker_password_required(self, status: str, work, done, password_items: list[Item] | None = None) -> None:
+    def _worker_password_required(
+        self,
+        status: str,
+        work,
+        done,
+        password_items: list[Item] | None = None,
+        exc: BackendMissingOrIncorrectResourcePasswordError | None = None,
+    ) -> None:
         if not self._window_alive():
             return
         self._set_busy(False, "Password required")
-        item = password_prompt_item(password_items or [], self._current_remote_folder())
+        if exc is None:
+            messagebox.showerror("Folder Password", "Password is required, but the backend did not provide password details.", parent=self.root)
+            return
+
+        item = password_prompt_item(exc, password_items or [])
         if item is None:
-            messagebox.showerror("Folder Password", "Password is required, but the current remote folder is not available.", parent=self.root)
+            messagebox.showerror("Folder Password", str(exc), parent=self.root)
             return
 
         if self._prompt_resource_password(item):

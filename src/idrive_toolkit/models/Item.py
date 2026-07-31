@@ -39,7 +39,7 @@ class Item(Resource, ABC):
         raise NotImplementedError
 
     def _fetch_more_data(self) -> None:
-        data = make_request("GET", f"items/{self.id}/moreinfo", headers=self._get_password_header())
+        data = make_request("GET", f"items/{self.id}/more-info", headers=self._get_password_header())
         self._set_more_data(data)
 
     def _set_data(self, json_data: dict) -> Optional[dict]:
@@ -121,7 +121,6 @@ class Item(Resource, ABC):
             raise ValueError("Root folder has no parent!")
 
         self._parent = Folder(self.parent_id)
-        self._parent.inherit_password_from(self)
         return self._parent
 
     def check_password(self, password: str):

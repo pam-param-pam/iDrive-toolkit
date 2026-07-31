@@ -32,6 +32,7 @@ from ..models.Folder import Folder
 from ..models.Item import Item
 from ..state.Storage import IdriveStorage
 from ..syncer.Syncer import Syncer
+from ..utils import common
 from ..version_check import UpdateInfo, check_for_update
 from .transfer_errors import raise_transfer_errors
 from .BreadcrumbsBar import BreadcrumbsBar
@@ -40,6 +41,7 @@ from .SyncGui import SyncGui, SyncGuiAlreadyOpenError
 from .TransferStatusBar import TransferStatusBar
 
 logger = logging.getLogger("iDrive")
+TK_STOP_EVENT = "break"
 
 
 class _GuiStream:
@@ -448,8 +450,8 @@ class BrowserGuiApp:
         self._set_busy(True, f"Moving {len(selected)} item(s) to trash...")
 
         def work():
+            common.move_to_trash(selected)
             for item in selected:
-                item.move_to_trash()
                 self.syncer.remote.forget_tree(str(item.id))
             self.syncer.remote.invalidate(str(self.current_folder.id))
 
@@ -745,6 +747,7 @@ class BrowserGuiApp:
                 menu.add_separator()
             self._menu_command(menu, "Download", self.download_selected, "action_download", state="normal" if selected else "disabled")
             menu.add_separator()
+            self._menu_command(menu, "Info", self.show_selected_info, "action_details", state="normal" if len(selected) == 1 else "disabled")
             self._menu_command(menu, "Rename", self.rename_selected, "action_rename", state="normal" if len(selected) == 1 else "disabled")
             self._menu_command(menu, "Move to Trash", self.trash_selected, "action_trash", state="normal" if selected else "disabled")
             menu.add_separator()
@@ -772,6 +775,28 @@ class BrowserGuiApp:
         if self._widget_exists(getattr(self, "trash_button", None)):
             self.trash_button.configure(state="normal" if selected and not self._busy else "disabled")
 
+    def show_selected_info(self) -> None:
+        if self._busy:
+            return
+
+        selected = self._selected_items()
+        if len(selected) != 1:
+            messagebox.showinfo("Info", "Select exactly one item to inspect.", parent=self.root)
+            return
+
+        item = selected[0]
+        self._set_busy(True, f"Loading info for {safe_item_label(item)}...")
+
+        def work():
+            item.refresh()
+            return self._build_item_info_text(item)
+
+        def done(text: str) -> None:
+            self._set_busy(False, "Ready")
+            self._show_copyable_details("Info", text)
+
+        self._run_password_retryable_worker(work, done, [item])
+
     def _operation_done(self, message: str, *, refresh: bool = False) -> None:
         if self._transfer_cancelled:
             message = "Transfer aborted"
@@ -798,7 +823,7 @@ class BrowserGuiApp:
 
         self._reset_transfer_progress()
         self._set_busy(False, "Password required")
-        item = password_prompt_item(items, self.current_folder)
+        item = password_prompt_item(exc, items)
         if item is None or self.syncer is None:
             messagebox.showerror("Password required", str(exc), parent=self.root)
             return
@@ -1216,6 +1241,204 @@ class BrowserGuiApp:
         finally:
             menu.grab_release()
 
+    def _build_item_info_text(self, item: Item) -> str:
+        details = [
+            f"Kind: {'Folder' if isinstance(item, Folder) else 'File'}",
+            f"ID: {item.id}",
+            f"Name: {self._value_or_dash(item.name)}",
+            f"Parent ID: {self._value_or_dash(item.parent_id)}",
+            f"Created: {self._value_or_dash(item.created_at)}",
+            f"Last Modified: {self._value_or_dash(item.last_modified_at)}",
+            f"In Trash Since: {self._value_or_dash(self._nullable_datetime(item, 'in_trash_since'))}",
+            f"Locked: {item.is_locked}",
+            f"Lock From: {self._value_or_dash(item.lock_from)}",
+        ]
+
+        if isinstance(item, File):
+            details.extend(self._file_info_details(item))
+        elif isinstance(item, Folder):
+            details.extend(self._folder_info_details(item))
+
+        return "\n".join(details)
+
+    def _file_info_details(self, item: File) -> list[str]:
+        details = [
+            "",
+            "File:",
+            f"Size: {self._format_bytes(item.size)} ({self._value_or_dash(item.size)} bytes)",
+            f"Extension: {self._value_or_dash(item.extension)}",
+            f"Type: {self._value_or_dash(item.type)}",
+            f"Encryption Method: {self._value_or_dash(item.encryption_method)}",
+            f"CRC: {self._value_or_dash(item.crc)}",
+            f"Duration: {self._value_or_dash(self._nullable_attr(item, 'duration'))}",
+            f"Video Position: {self._value_or_dash(item.video_position)}",
+            f"Media Position: {self._value_or_dash(getattr(item, '_media_position', None))}",
+            f"Thumbnail URL: {self._value_or_dash(item.thumbnail_url)}",
+            f"Download URL: {self._value_or_dash(item.download_url)}",
+            f"View URL: {self._value_or_dash(item.view_url if item.download_url else None)}",
+            f"Has Video Metadata: {item.isVideoMetadata}",
+            f"Has RAW Metadata: {item.isRawMetadata}",
+            f"Has Photo Metadata: {item.isPhotoMetadata}",
+            f"Has Subtitles: {self._value_or_dash(getattr(item, '_hasSubtitles', None))}",
+            f"Encryption Key: {self._value_or_dash(getattr(item, '_encryption_key', None))}",
+            f"Encryption IV: {self._value_or_dash(getattr(item, '_encryption_iv', None))}",
+        ]
+
+        raw_metadata = self._nullable_attr(item, "rawMetadata")
+        if raw_metadata is not None:
+            details.extend(("", "RAW Metadata:", *self._object_fields(raw_metadata)))
+
+        photo_metadata = self._nullable_attr(item, "photoMetadata")
+        if photo_metadata is not None:
+            details.extend(("", "Photo Metadata:", *self._object_fields(photo_metadata)))
+
+        video_metadata = self._nullable_attr(item, "videoMetadata")
+        if video_metadata is not None:
+            details.extend(("", "Video Metadata:", *self._video_metadata_fields(video_metadata)))
+
+        details.extend(("", "Tags:", *self._collection_fields(self._nullable_collection(item, "tags"))))
+        details.extend(("", "Moments:", *self._collection_fields(self._nullable_collection(item, "moments"))))
+        details.extend(("", "Subtitles:", *self._collection_fields(self._nullable_collection(item, "subtitles"))))
+
+        return details
+
+    def _folder_info_details(self, item: Folder) -> list[str]:
+        details = [
+            "",
+            "Folder:",
+            f"Folder Size: {self._format_bytes(item.folder_size)} ({self._value_or_dash(item.folder_size)} bytes)",
+            f"File Count: {self._value_or_dash(item.file_count)}",
+            f"Folder Count: {self._value_or_dash(item.folder_count)}",
+            f"Hash: {self._value_or_dash(item.hash)}",
+            f"Children: {len(item.children) if item.children is not None else 0}",
+        ]
+
+        details.extend(("", "Breadcrumbs:"))
+        if item.breadcrumbs:
+            for breadcrumb in item.breadcrumbs:
+                details.append(f"- {breadcrumb.name} | ID: {breadcrumb.id} | Lock From: {self._value_or_dash(breadcrumb.lockFrom)}")
+        else:
+            details.append("-")
+
+        try:
+            stats = item.get_stats()
+            details.extend(("", "Stats:", f"Total: {stats.total}", f"Used: {stats.used}"))
+        except Exception as exc:
+            details.extend(("", "Stats:", f"Error: {exc}"))
+
+        try:
+            usage = item.get_usage()
+            details.extend(("", "Usage:", *self._dict_fields(usage)))
+        except Exception as exc:
+            details.extend(("", "Usage:", f"Error: {exc}"))
+
+        return details
+
+    def _show_copyable_details(self, title: str, text: str) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.geometry("760x500")
+        dialog.minsize(520, 320)
+        dialog.transient(self.root)
+
+        frame = ttk.Frame(dialog, padding=10)
+        frame.grid(row=0, column=0, sticky="nsew")
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        details_text = tk.Text(frame, wrap="word", font=("Consolas", 10), undo=False)
+        details_text.grid(row=0, column=0, sticky="nsew")
+        details_scroll = ttk.Scrollbar(frame, orient="vertical", command=details_text.yview)
+        details_scroll.grid(row=0, column=1, sticky="ns")
+        details_text.configure(yscrollcommand=details_scroll.set)
+        details_text.insert("1.0", text)
+        details_text.configure(state="disabled")
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=1, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Copy All", command=lambda: self._copy_text_to_clipboard(text)).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Close", command=dialog.destroy).pack(side="left")
+
+        details_text.bind("<Control-a>", lambda _event: self._select_all_text(details_text))
+        details_text.bind("<Control-A>", lambda _event: self._select_all_text(details_text))
+        details_text.focus_set()
+
+    def _copy_text_to_clipboard(self, text: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    def _select_all_text(self, widget: tk.Text) -> str:
+        widget.tag_add("sel", "1.0", "end-1c")
+        widget.mark_set("insert", "1.0")
+        widget.see("insert")
+        return TK_STOP_EVENT
+
+    def _nullable_datetime(self, item: Item, attr_name: str):
+        try:
+            return getattr(item, attr_name)
+        except (TypeError, ValueError):
+            return None
+
+    def _nullable_attr(self, item: object, attr_name: str):
+        try:
+            return getattr(item, attr_name)
+        except AttributeError:
+            return None
+
+    def _nullable_collection(self, item: object, attr_name: str):
+        try:
+            return getattr(item, attr_name)
+        except Exception as exc:
+            return [f"Error: {exc}"]
+
+    def _object_fields(self, value: object) -> list[str]:
+        data = getattr(value, "__dict__", None)
+        if not data:
+            return [str(value)]
+        return [f"{key.lstrip('_')}: {self._value_or_dash(field_value)}" for key, field_value in data.items()]
+
+    def _dict_fields(self, value: dict) -> list[str]:
+        if not value:
+            return ["-"]
+        return [f"{key}: {self._value_or_dash(field_value)}" for key, field_value in value.items()]
+
+    def _collection_fields(self, values) -> list[str]:
+        if not values:
+            return ["Count: 0"]
+
+        details = [f"Count: {len(values)}"]
+        for index, value in enumerate(values, start=1):
+            if isinstance(value, str):
+                details.append(value)
+                continue
+            details.extend((f"Item {index}:", *self._object_fields(value)))
+        return details
+
+    def _video_metadata_fields(self, value: object) -> list[str]:
+        details = [
+            f"Brands: {self._value_or_dash(value.brands)}",
+            f"MIME: {self._value_or_dash(value.mime)}",
+            f"Has IOD: {self._value_or_dash(value.has_IOD)}",
+            f"Has MOOV: {self._value_or_dash(value.has_moov)}",
+            f"Progressive: {self._value_or_dash(value.is_progressive)}",
+            f"Fragmented: {self._value_or_dash(value.is_fragmented)}",
+            f"Video Tracks: {len(value.video_tracks)}",
+            f"Audio Tracks: {len(value.audio_tracks)}",
+            f"Subtitle Tracks: {len(value.subtitle_tracks)}",
+        ]
+        for label, tracks in (("Video Track", value.video_tracks), ("Audio Track", value.audio_tracks), ("Subtitle Track", value.subtitle_tracks)):
+            for index, track in enumerate(tracks, start=1):
+                details.extend((f"{label} {index}:", *self._object_fields(track)))
+        return details
+
+    @staticmethod
+    def _value_or_dash(value) -> str:
+        if value is None or value == "":
+            return "-"
+        return str(value)
+
     def _install_log_capture(self) -> None:
         self._stdout_proxy = _GuiStream(self._original_stdout, self._enqueue_log, "STDOUT")
         self._stderr_proxy = _GuiStream(self._original_stderr, self._enqueue_log, "STDERR")
@@ -1299,7 +1522,7 @@ class BrowserGuiApp:
         entry_level = levels.get(level_name)
         if selected_level is None or entry_level is None:
             return False
-        return entry_level <= selected_level
+        return entry_level >= selected_level
 
     def _clear_logs(self) -> None:
         with self._log_buffer_lock:
@@ -1478,6 +1701,7 @@ class BrowserGuiApp:
             "action_upload": self._create_action_icon("upload"),
             "action_upload_folder": self._create_action_icon("upload_folder"),
             "action_open": self._create_action_icon("open"),
+            "action_details": self._create_action_icon("details"),
             "action_rename": self._create_action_icon("rename"),
             "action_trash": self._create_action_icon("trash"),
             "action_cancel": self._create_action_icon("cancel"),
@@ -1551,6 +1775,10 @@ class BrowserGuiApp:
             draw.rectangle((4, 6, 14, 15), outline=blue, width=2)
             draw.line((8, 10, 15, 3), fill=blue, width=2)
             draw.polygon([(15, 3), (15, 8), (10, 3)], fill=blue)
+        elif kind == "details":
+            draw.ellipse((8, 3, 10, 5), fill=blue)
+            draw.line((9, 8, 9, 14), fill=blue, width=2)
+            draw.ellipse((3, 3, 15, 15), outline=gray, width=2)
         elif kind == "rename":
             draw.line((4, 14, 14, 4), fill=blue, width=2)
             draw.polygon([(13, 3), (15, 5), (14, 7), (11, 4)], fill=blue)

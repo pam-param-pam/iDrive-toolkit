@@ -234,11 +234,13 @@ class LocalScanner(BaseScanner):
         child_dirs, files = tree.get(root, ([], []))
         all_files = list(files)
         all_dirs = []
+        child_hash_entries = []
 
         for child_dir in child_dirs:
-            _, child_files, child_subdirs = self._cache_folder_tree_hash(child_dir, tree, file_hashes)
+            child_digest, child_files, child_subdirs = self._cache_folder_tree_hash(child_dir, tree, file_hashes)
             all_files.extend(child_files)
             all_dirs.extend(child_subdirs)
+            child_hash_entries.append((remote_resource_name(child_dir.name), child_digest, child_dir))
 
         all_dirs.append(root)
 
@@ -246,24 +248,28 @@ class LocalScanner(BaseScanner):
 
         file_entries = [
             (remote_resource_name(f.name), file_hashes[f], f)
-            for f in all_files
+            for f in files
         ]
         file_entries.sort(key=lambda entry: (entry[0], entry[1]))
 
         for name, crc, _ in file_entries:
+            h.update(b"file\0")
             h.update(name.encode("utf-8"))
+            h.update(b"\0")
             h.update(str(crc).encode())
+            h.update(b"\0")
 
-        folder_entries = [
-            (remote_resource_name(d.name), d)
-            for d in all_dirs
-        ]
-        folder_entries.sort(key=lambda entry: entry[0])
-        for name, _ in folder_entries:
+        child_hash_entries.sort(key=lambda entry: (entry[0], entry[1]))
+        for name, digest, _ in child_hash_entries:
+            h.update(b"folder\0")
             h.update(name.encode("utf-8"))
+            h.update(b"\0")
+            h.update(digest.encode("utf-8"))
+            h.update(b"\0")
 
         digest = h.hexdigest()
         self._folder_hash_cache[root] = digest
+        folder_entries = [(name, path) for name, _digest, path in child_hash_entries]
         self._write_folder_hash_trace(root, digest, file_entries, folder_entries)
         self._increment_folder_hash_progress()
         return digest, all_files, all_dirs
