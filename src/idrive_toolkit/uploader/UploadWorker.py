@@ -1,10 +1,11 @@
 import logging
-from queue import Queue
+import time
+from queue import Queue, Empty
 from typing import Dict
 
 import httpx
 
-from .UploadContext import UploadContext
+from .UploadContext import UploadContext, WebhookCooldown
 from .models import DiscordRequest, UploadFileState, FileUploadStatus, ResponsePayload
 from ..downloader.models import ThrottleState
 from ..exceptions import DiscordRateLimitError, DiscordServerTimeout, DiscordHttpError
@@ -24,69 +25,56 @@ class UploadWorker:
     # Main loop
     # -------------------------------------------------
 
-    def run(self) -> None:
+    def run(self, retire=None) -> None:
         try:
             while True:
-                request = self.request_queue.get()
+                if retire is not None and retire.is_set():
+                    break
+                try:
+                    request = self.request_queue.get(timeout=0.2)
+                except Empty:
+                    continue
                 if request is None:
                     self.request_queue.task_done()
                     break
 
                 try:
-                    while not self.ctx.stop_requested.is_set():  # retry loop for THIS request
-                        try:
-                            if not self._wait_until_can_upload():
-                                self._mark_cancelled(request)
-                                break
-                            if not self.ctx.wait_for_discord_retry_gate():
-                                self._mark_cancelled(request)
-                                break
-
-                            self._mark_uploading(request)
-                            self._upload(request)
-                            break  # success -> exit retry loop
-
-                        except DiscordRateLimitError as e:
-                            self.throttle.signal_error()
-
-                            if request.retries >= self.max_retries:
-                                self._fail_states(request, e)
-                                break
-
-                            logger.warning(f"[UploadWorker] Throttled ({e.__class__.__name__}) -> retrying in {e.wait}s (retry {request.retries})")
-
-                            self._mark_retrying(request)
-                            if self.ctx.stop_requested.wait(e.wait):
-                                self._mark_cancelled(request)
-                                break
-                            request.retries += 1
-                            continue  # retry SAME request
-
-                        except DiscordServerTimeout as e:
-                            self.throttle.signal_error()
-                            self._mark_retrying(request)
-                            wait = self.ctx.record_discord_transient_failure()
-
-                            logger.warning(
-                                "[UploadWorker] Discord transient failure (%s) -> shared retry gate %.1fs "
-                                "(retry %s)",
-                                e.__class__.__name__,
-                                wait,
-                                request.retries,
-                            )
-
-                            if self.ctx.stop_requested.wait(wait):
-                                self._mark_cancelled(request)
-                                break
-                            request.retries += 1
-
-                            if request.retries >= self.max_retries:
-                                self._fail_states(request, e)
-                                break
-
-                            continue  # retry SAME request
-                    else:
+                    if not self._wait_until_can_upload():
                         self._mark_cancelled(request)
+                        continue
+                    if not request.first_attempt_at:
+                        request.first_attempt_at = time.monotonic()
+                    # Fragments of already failed files must not be retried.
+                    if all(state.is_terminal() for state in self._get_states_from_request(request).values()):
+                        continue
+                    self._mark_uploading(request)
+                    self._upload(request)
+
+                except WebhookCooldown as cooldown:
+                    if time.monotonic() + cooldown.wait - request.first_attempt_at > 180:
+                        self._fail_states(request, cooldown)
+                    else:
+                        self._mark_retrying(request)
+                        self.request_queue.defer(request, cooldown.wait)
+                except (DiscordRateLimitError, DiscordServerTimeout) as error:
+                    self.throttle.signal_error()
+                    delay = (error.wait if isinstance(error, DiscordRateLimitError)
+                             else min(60.0, 5.0 * 2 ** min(request.retries, 4)))
+                    if isinstance(error, DiscordRateLimitError):
+                        self.ctx.defer_webhook(request.webhook, delay,
+                            global_limit=error.response.headers.get("x-ratelimit-global", "").lower() == "true")
+                    if request.retries >= self.max_retries or time.monotonic() + delay - request.first_attempt_at > 180:
+                        self._fail_states(request, error)
+                    else:
+                        request.retries += 1
+                        for state in self._get_states_from_request(request).values():
+                            with state.lock:
+                                if not state.is_terminal():
+                                    state.status = FileUploadStatus.RETRYING
+                                    state.error = error
+                        logger.warning("Upload request deferred %.1fs after %s (attempt %s)",
+                                       delay, type(error).__name__, request.retries)
+                        self.request_queue.defer(request, delay)
 
                 except Exception as e:
                     logger.exception("[UploadWorker] Unexpected failure")
@@ -99,6 +87,7 @@ class UploadWorker:
 
     def _upload(self, request: DiscordRequest) -> None:
         webhook = self.ctx.pick_webhook()
+        request.webhook = webhook
         url = webhook.url
 
         try:
@@ -119,7 +108,6 @@ class UploadWorker:
 
             response.raise_for_status()
 
-            self.ctx.record_discord_success()
             self._add_bytes(request)
             uploaded_bytes = sum(len(att.data) for att in request.attachments)
             self.throttle.signal_bytes(uploaded_bytes)

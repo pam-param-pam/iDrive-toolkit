@@ -526,53 +526,45 @@ def _extract_frame(path: Path, timestamp: float) -> Optional[bytes]:
 
     proc = _run_media(cmd, timeout=8)
 
-    if not proc.stdout or len(proc.stdout) < 100:
+    if not proc.stdout:
         return None
 
     return proc.stdout
 
 
+def _is_dark_thumbnail(data: bytes) -> bool:
+    """Check a tiny luminance histogram instead of iterating full-size pixels."""
+    with Image.open(BytesIO(data)) as image:
+        image.thumbnail((64, 64), Image.Resampling.BOX)
+        histogram = image.convert("L").histogram()
+    pixels = sum(histogram)
+    # Also reject mostly black frames with a small bright logo or subtitle.
+    return (sum(level * count for level, count in enumerate(histogram)) <= 12 * pixels
+            or sum(histogram[:25]) >= 0.98 * pixels)
+
+
 def _extract_video_thumbnail(path: Path) -> Optional[ExtractedThumbnail]:
-    try:
-        file_size = path.stat().st_size
-
-        # small file → old behavior
-        if file_size < 300 * 1024 * 1024:
-            data = _extract_frame(path, 1.0)
-            return ExtractedThumbnail(data=data) if data else None
-
-        # large file → multi-sampling
+    def timestamps():
+        initial = 1.0
+        yield from (initial, initial + 5, initial + 10, initial + 15)
+        # Avoid an extra ffprobe process for the usual, non-dark first frame.
         duration = _get_video_duration(path)
-        if not duration or duration <= 0:
-            return None
+        if duration and duration > 0:
+            yield duration / 2
 
-        percentages = [0.0, 0.05]
-
-        best = None
-        best_size = 0
-
-        for p in percentages:
-            ts = duration * p
-            frame = _extract_frame(path, ts)
-
-            if frame:
-                size = len(frame)
-                if size > best_size:
-                    best = frame
-                    best_size = size
-
-        if best:
-            return ExtractedThumbnail(data=best)
-
-        return None
-
-    except subprocess.CalledProcessError as e:
-        logger.error(
-            "Video thumbnail extraction failed for %s\nffmpeg stderr:\n%s",
-            path,
-            e.stderr.decode(errors="ignore") if isinstance(e.stderr, bytes) else e.stderr,
-        )
-        return None
+    last = None
+    for timestamp in timestamps():
+        try:
+            frame = _extract_frame(path, timestamp)
+            if not frame:
+                continue
+            dark = _is_dark_thumbnail(frame)
+            last = frame
+            if not dark:
+                break
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError) as error:
+            logger.warning("Video thumbnail extraction failed for %s at %.2fs: %s", path, timestamp, error)
+    return ExtractedThumbnail(data=last) if last is not None else None
 
 
 def _encode_webp_thumbnail(img: Image.Image, quality: int = 70) -> Optional[ExtractedThumbnail]:

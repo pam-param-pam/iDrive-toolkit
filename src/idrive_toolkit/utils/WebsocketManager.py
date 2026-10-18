@@ -15,7 +15,8 @@ logger = logging.getLogger("iDrive")
 
 
 class WebsocketManager:
-    def __init__(self):
+    def __init__(self, config: APIConfig):
+        self.config = config
         self._ws_thread = None
         self._stop_ws = threading.Event()
         self._connected = threading.Event()
@@ -103,8 +104,8 @@ class WebsocketManager:
         while not self._stop_ws.is_set():
             try:
                 async with websockets.connect(
-                    APIConfig.base_ws + '/user',
-                    additional_headers={"Authorization": f"Bearer {APIConfig.token}"}
+                    self.config.base_ws + '/user',
+                    additional_headers={"Authorization": f"Bearer {self.config.token}"}
                 ) as ws:
 
                     self._ws = ws

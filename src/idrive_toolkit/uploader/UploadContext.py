@@ -11,6 +11,12 @@ class UploadContextState(Enum):
     RUNNING = auto()
     PAUSED = auto()
 
+
+class WebhookCooldown(Exception):
+    def __init__(self, wait):
+        self.wait = wait
+        super().__init__(f"All Discord upload routes are cooling down for {wait:.1f}s")
+
 class UploadContext:
     def __init__(self):
         self.attachment_name: Optional[str] = None
@@ -23,15 +29,16 @@ class UploadContext:
         self.lock = threading.RLock()
         self.states: Dict[str, UploadFileState] = {}
         self.errors: list[Exception] = []
+        self.retry_inputs = {}
+        self.backend_files = {}
 
         self.state = UploadContextState.RUNNING
 
         self.global_pause = threading.Event()
         self.global_pause.set()
         self.stop_requested = threading.Event()
-        self._discord_retry_lock = threading.Lock()
-        self._discord_retry_until = 0.0
-        self._discord_retry_failures = 0
+        self._webhook_cooldowns = {}
+        self._discord_global_until = 0.0
 
         self.total_size: int = 0
         self.processed_size: int = 0
@@ -123,6 +130,14 @@ class UploadContext:
         with self.lock:
             return dict(self.states)
 
+    def remove_state(self, file_id: str) -> bool:
+        """Remove a file state from the context. Returns True if the state was removed."""
+        with self.lock:
+            if file_id in self.states:
+                del self.states[file_id]
+                return True
+            return False
+
     def get_failed_states(self) -> Dict[str, UploadFileState]:
         with self.lock:
             return {
@@ -150,38 +165,29 @@ class UploadContext:
             self.global_pause.set()
 
     def pick_webhook(self):
-        webhook = self.webhooks[self._webhook_idx]
-        self._webhook_idx = (self._webhook_idx + 1) % len(self.webhooks)
-        return webhook
+        with self.lock:
+            if not self.webhooks:
+                raise RuntimeError("No Discord upload webhooks are configured")
+            now = time.monotonic()
+            if self._discord_global_until > now:
+                raise WebhookCooldown(self._discord_global_until - now)
+            for _ in self.webhooks:
+                webhook = self.webhooks[self._webhook_idx]
+                self._webhook_idx = (self._webhook_idx + 1) % len(self.webhooks)
+                if self._webhook_cooldowns.get(webhook.url, 0) <= now:
+                    return webhook
+            raise WebhookCooldown(min(self._webhook_cooldowns[webhook.url] for webhook in self.webhooks) - now)
+
+    def defer_webhook(self, webhook, wait, global_limit=False):
+        with self.lock:
+            until = time.monotonic() + wait
+            if global_limit:
+                self._discord_global_until = max(self._discord_global_until, until)
+            elif webhook is not None:
+                self._webhook_cooldowns[webhook.url] = max(self._webhook_cooldowns.get(webhook.url, 0), until)
 
     def is_paused(self) -> bool:
         return self.state == UploadContextState.PAUSED
-
-    def wait_for_discord_retry_gate(self) -> bool:
-        while not self.stop_requested.is_set():
-            with self._discord_retry_lock:
-                now = time.monotonic()
-                remaining = self._discord_retry_until - now
-                if remaining <= 0 and self._discord_retry_failures > 0:
-                    self._discord_retry_until = now + 0.75
-                    return True
-            if remaining <= 0:
-                return True
-            if self.stop_requested.wait(min(remaining, 0.5)):
-                return False
-        return False
-
-    def record_discord_transient_failure(self) -> float:
-        with self._discord_retry_lock:
-            self._discord_retry_failures += 1
-            wait = min(60.0, 5.0 * (2 ** min(self._discord_retry_failures - 1, 4)))
-            self._discord_retry_until = max(self._discord_retry_until, time.monotonic() + wait)
-            return wait
-
-    def record_discord_success(self) -> None:
-        with self._discord_retry_lock:
-            self._discord_retry_failures = 0
-            self._discord_retry_until = 0.0
 
     # -------------------------------------------------
     # Size tracking

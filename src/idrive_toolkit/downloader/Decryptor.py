@@ -1,5 +1,5 @@
 from ..models.Enums import EncryptionMethod
-from ..utils.StreamCipherBase import StreamCipherBase
+from ..utils.transfer.StreamCipherBase import StreamCipherBase
 
 
 class Decryptor(StreamCipherBase):

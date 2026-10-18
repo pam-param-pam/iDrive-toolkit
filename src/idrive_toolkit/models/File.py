@@ -1,5 +1,6 @@
 import logging
 import os
+from pathlib import Path
 from typing import Optional
 
 from overrides import overrides
@@ -13,18 +14,16 @@ from .Tag import Tag
 from ..models.Item import Item
 from ..utils.decorators import autoFetchProperty
 from ..utils.ffmpeg import require_media_tool
-from ..utils.networker import make_request
 
 logger = logging.getLogger("iDrive")
 
 
 class File(Item):
 
-    def __init__(self, file_id):
-        super().__init__(file_id)
+    def __init__(self, file_id, session=None):
+        super().__init__(file_id, session=session)
         # _fetch_data
         self._thumbnail_url: Optional[str] = None
-        self._size: Optional[int] = None
         self._extension: Optional[str] = None
         self._type: Optional[str] = None
         self._encryption_method: Optional[int] = None
@@ -166,58 +165,62 @@ class File(Item):
     def __repr__(self):
         return str(self)
 
-    @overrides
     def _set_more_data(self, data): #todo we need to know what to set, not set to all XD
         self._videoMetadata = data
         self._rawMetadata = data
         self._photoMetadata = data
 
+    def _fetch_more_data(self) -> None:
+        data = self.session.make_request("GET", f"items/{self.id}/more-info", headers=self._get_password_header())
+        self._set_more_data(data)
+
     @overrides
     def _fetch_data(self):
-        data = make_request("GET", f"files/{self.id}", headers=self._get_password_header())
+        data = self.session.make_request("GET", f"files/{self.id}", headers=self._get_password_header())
         self._set_data(data)
 
     def _fetch_tags(self):
-        data = make_request("GET", f"files/{self.id}/tags", headers=self._get_password_header())
+        data = self.session.make_request("GET", f"files/{self.id}/tags", headers=self._get_password_header())
         self._tags = []
         for element in data:
-            tag = Tag(**element, file_id=self.id)
+            tag = Tag(session=self.session, **element, file_id=self.id)
             if self.is_locked and self.password:
                 tag.set_password(self.password)
             tag.file_id = self.id
             self._tags.append(tag)
 
     def _fetch_moments(self):
-        data = make_request("GET", f"files/{self.id}/moments", headers=self._get_password_header())
+        data = self.session.make_request("GET", f"files/{self.id}/moments", headers=self._get_password_header())
         self._moments = []
         for element in data:
-            moment = Moment(**element)
+            moment = Moment(session=self.session, **element)
             if self.is_locked and self.password:
                 moment.set_password(self.password)
             self._moments.append(moment)
 
     def _fetch_subtitles(self):
-        data = make_request("GET", f"files/{self.id}/subtitles", headers=self._get_password_header())
+        data = self.session.make_request("GET", f"files/{self.id}/subtitles", headers=self._get_password_header())
         self._subtitles = []
         for element in data:
-            subtitle = Subtitle(**element)
+            subtitle = Subtitle(session=self.session, **element)
             if self.is_locked and self.password:
                 subtitle.set_password(self.password)
             self._subtitles.append(subtitle)
 
     def add_tag(self, name: str) -> Tag:
-        data = make_request("POST", f"files/{self.id}/tags", data={"tag_name": name}, headers=self._get_password_header())
-        return Tag(id=data["id"], name=data["name"], file_id=self.id)
+        data = self.session.make_request("POST", f"files/{self.id}/tags", data={"tag_name": name}, headers=self._get_password_header())
+        return Tag(session=self.session, id=data["id"], name=data["name"], file_id=self.id)
 
     def create_moment(self, timestamp) -> Moment:
         raise NotImplemented()
 
-    def create_subtitles(self, timestamp) -> Subtitle:
-        raise NotImplemented()
+    def upload_subtitle(self, path: str | Path, language: str, is_forced: bool = False) -> Subtitle:
+        from ..utils.transfer.subtitle_upload import upload_subtitle
+        return upload_subtitle(self, path, language, is_forced)
 
     def _fetch_fragments(self):
-        res_data = make_request("POST", f"items/ultraDownload/items/{self.id}", headers=self._get_password_header())
-        fragments = [Fragment(**frag) for frag in res_data[0]['fragments']]
+        res_data = self.session.make_request("POST", f"items/ultraDownload/items/{self.id}", headers=self._get_password_header())
+        fragments = [Fragment(session=self.session, **frag) for frag in res_data[0]['fragments']]
         if self.is_locked:
             for frag in fragments:
                 frag.set_password(self.password)
@@ -233,9 +236,7 @@ class File(Item):
     def _set_data(self, json_data: dict) -> None:
         json_data = super()._set_data(json_data)
         for key, value in json_data.items():
-            if key == "size":
-                self._size = value
-            elif key == "extension":
+            if key == "extension":
                 self._extension = value
             elif key == "type":
                 self._type = value

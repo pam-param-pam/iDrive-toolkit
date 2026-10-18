@@ -1,12 +1,15 @@
 import logging
 import threading
-import time
 import uuid
 from pathlib import Path
 from queue import Queue, Full, Empty
 from typing import Optional, Union, Dict
 
 from .FileSaverWorker import FileSaverWorker
+from ..utils.transfer.retry import RetryableTransfer
+from ..utils.transfer.scheduled_queue import ScheduledQueue
+from ..utils.transfer.worker_pool import WorkerPool
+from ..utils.transfer.speed import TransferSpeed
 from .ResponseConsumerWorker import ResponseConsumerWorker
 from ..downloader.models import ThrottleState
 from ..exceptions import UploadNotAllowedError, PathDoesntExistError
@@ -17,9 +20,8 @@ from .PrepareRequestWorker import PrepareRequestWorker
 from .UploadContext import UploadContext
 from .UploadWorker import UploadWorker
 from .models import BackendFile, UploadInput, DiscordRequest, UploadFileState, ResponsePayload, FileUploadStatus
-from ..utils.networker import make_request
-from ..utils.autoScaler.AutoScalePolicy import AutoScalePolicy
-from ..utils.autoScaler.AutoScaler import AutoScaler
+from ..utils.transfer.autoScaler.AutoScalePolicy import AutoScalePolicy
+from ..utils.transfer.autoScaler.AutoScaler import AutoScaler
 
 DOWNLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
     scale_up_step=1,
@@ -43,7 +45,7 @@ DOWNLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
 
 logger = logging.getLogger("iDrive")
 
-class UltraUploader:
+class UltraUploader(RetryableTransfer):
     def __init__(
         self,
         max_message_size: int,
@@ -51,8 +53,11 @@ class UltraUploader:
         encryption_method: EncryptionMethod,
         min_workers: int,
         max_workers: int,
-        initial_workers: Optional[int] = None,
+        session, initial_workers: Optional[int] = None,
+        max_retries: int = 20,
+
     ):
+        self.session = session
         self._max_message_size = max_message_size
         self._max_attachments = max_attachments
         self._encryption_method = encryption_method
@@ -66,14 +71,17 @@ class UltraUploader:
         )
         self.scaler = AutoScaler(throttle_state=self.throttle, policy=self.policy)
 
-        self.MAX_RETRIES = 20
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
+        self.MAX_RETRIES = max_retries
+        self._init_retry()
 
         # Persistent queues
         self._input_queue: Queue[UploadInput] = Queue()
-        self._upload_queue: Queue[DiscordRequest] = Queue(maxsize=25)
+        self._upload_queue = ScheduledQueue(maxsize=25)
         self._response_queue: Queue[ResponsePayload] = Queue()
 
-        self._ready_files_queue: Queue[BackendFile] = Queue()
+        self._ready_files_queue = ScheduledQueue()
 
         self._file_states: Dict[uuid.UUID, UploadFileState] = {}
         self._global_pause = threading.Event()
@@ -82,7 +90,9 @@ class UltraUploader:
 
         # Workers
         self._prepare_threads: list[threading.Thread] = []
-        self._upload_threads: list[threading.Thread] = []
+        self._upload_pool = WorkerPool(self._create_upload_worker, "discord-upload")
+        self.scaler.live_workers = self._upload_pool.available_workers
+        self.scaler.backlog = self._upload_queue.ready_count
         self._response_consumer_threads: list[threading.Thread] = []
         self._file_saver_threads: list[threading.Thread] = []
         self._scaler_thread: Optional[threading.Thread] = None
@@ -109,25 +119,21 @@ class UltraUploader:
         self._monitor_stop_event.clear()
 
         def monitor():
-            last_uploaded = 0
-            last_time = time.perf_counter()
+            meter = TransferSpeed(self.get_transferred_bytes())
 
             while not self._monitor_stop_event.wait(interval):
-
-                now = time.perf_counter()
 
                 input_q = self._input_queue.qsize()
                 upload_q = self._upload_queue.qsize()
                 response_q = self._response_queue.qsize()
                 ready_q = self._ready_files_queue.qsize()
 
-                # throughput (bytes)
-                total_uploaded = self.ctx.processed_size
-
-                delta_bytes = total_uploaded - last_uploaded
-                delta_time = now - last_time
-
-                speed = delta_bytes / delta_time if delta_time > 0 else 0
+                transferred = self.get_transferred_bytes()
+                if not self.ctx.global_pause.is_set():
+                    meter.reset(transferred)
+                    speed = 0.0
+                else:
+                    speed = meter.update(transferred)
 
                 logger.debug(
                     f"[MON] "
@@ -137,9 +143,6 @@ class UltraUploader:
                     f"ready={ready_q:4d} "
                     f"| speed={speed / 1024 / 1024:.2f} MiB/s"
                 )
-
-                last_uploaded = total_uploaded
-                last_time = now
 
         t = threading.Thread(target=monitor, daemon=True)
         t.start()
@@ -172,8 +175,10 @@ class UltraUploader:
         # file saver workers
         for _ in range(self._file_savers):
             worker = FileSaverWorker(
+                session=self.session,
                 ready_files_queue=self._ready_files_queue,
                 ctx=self.ctx,
+                max_retries=self.MAX_RETRIES,
             )
             t = threading.Thread(target=worker.run, daemon=True)
             t.start()
@@ -184,15 +189,10 @@ class UltraUploader:
         # ------------------------------
 
         def spawn_one():
-            t = self._start_upload_thread()
-            self._upload_threads.append(t)
+            return self._upload_pool.spawn()
 
         def kill_one():
-            try:
-                self._upload_queue.put(None, timeout=0.25)
-            except Full:
-                return False
-            return True
+            return self._upload_pool.retire_one()
 
         for _ in range(self.policy.get_initial_workers()):
             spawn_one()
@@ -235,17 +235,14 @@ class UltraUploader:
         if self._monitor_thread is not None and self._monitor_thread.is_alive():
             self._monitor_thread.join()
 
-    def _start_upload_thread(self) -> threading.Thread:
-        worker = UploadWorker(
+    def _create_upload_worker(self):
+        return UploadWorker(
             request_queue=self._upload_queue,
             response_queue=self._response_queue,
             ctx=self.ctx,
             max_retries=self.MAX_RETRIES,
             throttle=self.throttle,
         )
-        t = threading.Thread(target=worker.run, daemon=True)
-        t.start()
-        return t
 
     def compute_total_size(self, path: Path) -> int:
         if path.is_file():
@@ -262,10 +259,13 @@ class UltraUploader:
     # Public API
     # ------------------------------------------------------------------
 
-    def upload(self, path: Union[str, Path], parent: Folder) -> None:
+    def upload(self, path: Union[str, Path], parent: Folder, name: str | None = None,
+               file_id: str | None = None) -> str | None:
         if self._shutdown:
             raise RuntimeError("Uploader has been shut down")
+        self._retry_ready = False
 
+        self.session.require_owner(parent)
         self._start_workers()
 
         path = self._check_path(path)
@@ -278,17 +278,68 @@ class UltraUploader:
         self.ctx.add_total_size(total_size)
 
         self.ctx.reserve_upload_request()
-        self._put_input_task(UploadInput(path=path, parent=parent, lock_from_id=lock_from))
+        frontend_id = None if path.is_dir() else file_id or str(uuid.uuid4())
+        if frontend_id is not None:
+            self.ctx.register(frontend_id, UploadFileState(
+                status=FileUploadStatus.QUEUED, name=name or path.name, path=str(path)))
+        self._put_input_task(UploadInput(path=path, parent=parent, lock_from_id=lock_from,
+                                         name=name, frontend_id=frontend_id))
+        return frontend_id
+
+    def restore_backend_save(self, file, state):
+        state.status = FileUploadStatus.SAVING
+        state.error = None
+        self.ctx.register(file.frontend_id, state)
+        self._start_workers()
+        self._ready_files_queue.put(file)
+
+    def record_failure(self, file_id, node, error):
+        with self.ctx.lock:
+            state = self.ctx.states.get(file_id)
+            if state is None:
+                state = UploadFileState(name=node.name)
+                self.ctx.states[file_id] = state
+            with state.lock:
+                state.error = error
+                if state.status != FileUploadStatus.SAVE_FAILED:
+                    state.status = FileUploadStatus.FAILED
+
+    def _retry_files(self, keys):
+        # All queues have drained, so old responses cannot update replacement states.
+        tasks = []
+        saves = []
+        errors = []
+        for key in keys:
+            state = self.ctx.states[key]
+            errors.append(state.error)
+            if state.status == FileUploadStatus.SAVE_FAILED:
+                if state.backend_file is None:
+                    raise RuntimeError("Saved upload metadata is unavailable for retry")
+                saves.append(state.backend_file)
+                state.status = FileUploadStatus.SAVING
+                state.error = None
+            else:
+                tasks.append(self.ctx.retry_inputs[key])
+                with self.ctx._size_lock:
+                    self.ctx.processed_size = max(0, self.ctx.processed_size - state.bytes_uploaded)
+                self.ctx.backend_files.pop(key, None)
+                self.ctx.states.pop(key)
+        self.ctx.errors[:] = [error for error in self.ctx.errors
+                              if all(error is not old for old in errors)]
+        self._start_workers()
+        for file in saves:
+            self._ready_files_queue.put(file)
+        for task in tasks:
+            self.ctx.reserve_upload_request()
+            self._put_input_task(task)
 
     def join(self) -> None:
-        try:
+        def drain():
             self._input_queue.join()
             self._upload_queue.join()
             self._response_queue.join()
             self._ready_files_queue.join()
-        finally:
-            self._stop_scaler()
-            self._stop_queue_monitor()
+        self._wait_for_attempts(drain)
 
     def pause_all(self) -> None:
         self.ctx.pause_all()
@@ -338,11 +389,7 @@ class UltraUploader:
             t.join()
 
         # upload workers
-        live_upload_threads = [t for t in self._upload_threads if t.is_alive()]
-        for _ in live_upload_threads:
-            self._upload_queue.put(None)
-        for t in live_upload_threads:
-            t.join()
+        self._upload_pool.close()
 
         # response consumers
         live_response_consumer_threads = [t for t in self._response_consumer_threads if t.is_alive()]
@@ -374,6 +421,9 @@ class UltraUploader:
         raise RuntimeError("Upload cancelled")
 
     def _drain_queue(self, queue: Queue) -> None:
+        if isinstance(queue, ScheduledQueue):
+            queue.discard_pending()
+            return
         while True:
             try:
                 queue.get_nowait()
@@ -396,13 +446,14 @@ class UltraUploader:
         return path
 
     def _check_can_upload(self, parent: Folder) -> Optional[str]:
+        self.session.require_owner(parent)
         cache_key = (str(parent.id), parent.password if parent.is_locked else None)
         if cache_key in self._can_upload_cache:
             return self._can_upload_cache[cache_key]
 
-        data = make_request("GET", f"user/can-upload/{parent.id}", headers=parent._get_password_header())
+        data = self.session.make_request("GET", f"user/can-upload/{parent.id}", headers=parent._get_password_header())
         self.ctx.configure(
-            webhooks=[Webhook(**hook) for hook in data["webhooks"]],
+            webhooks=[Webhook(session=self.session, **hook) for hook in data["webhooks"]],
             extensions=dict(data["extensions"]),
             attachment_name=str(data["attachment_name"]),
             max_attachments=self._max_attachments,

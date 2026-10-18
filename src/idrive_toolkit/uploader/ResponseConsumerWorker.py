@@ -14,7 +14,7 @@ class ResponseConsumerWorker:
         self.response_queue = response_queue
         self.ready_files_queue = ready_files_queue
         self.ctx = ctx
-        self._backend_state: Dict[str, BackendFile] = {}
+        self._backend_state = ctx.backend_files
 
     def run(self) -> None:
         while True:
@@ -25,7 +25,14 @@ class ResponseConsumerWorker:
 
             try:
                 self._handle_response(payload)
-            except Exception:
+            except Exception as error:
+                ids = ([payload.frontend_id] if payload.is_empty else
+                       {attachment.frontend_id for attachment in payload.request.attachments})
+                for file_id in ids:
+                    state = self.ctx.get_state(file_id)
+                    with state.lock:
+                        state.status = FileUploadStatus.FAILED
+                        state.error = error
                 logger.exception("[ResponseConsumerWorker] Failed processing response")
             finally:
                 self.response_queue.task_done()

@@ -1,7 +1,7 @@
 from typing import Literal
 
 from ..models.Enums import EncryptionMethod, ClientsideDecryptionMethod
-from ..utils.networker import make_request
+from .SessionBound import SessionBound
 
 
 class SettingsBuilder:
@@ -63,10 +63,10 @@ class SettingsBuilder:
 
     def save(self) -> "Settings":
         data = {**self._settings.to_dict(), **self._changes}
-        make_request("PUT", f"user/settings", data=data)
-        return Settings(**data)
+        self._settings.session.make_request("PUT", f"user/settings", data=data)
+        return Settings(session=self._settings.session, **data)
 
-class Settings:
+class Settings(SessionBound):
     def __init__(
         self,
         locale: str,
@@ -83,7 +83,9 @@ class Settings:
         popupPreview: bool,
         itemInfoShortcut: bool,
         clientsideDecryptionMethod: int,
+        session=None,
     ):
+        super().__init__(session=session)
         self.locale = locale
         self.hideLockedFolders = hideLockedFolders
         self.dateFormat = dateFormat

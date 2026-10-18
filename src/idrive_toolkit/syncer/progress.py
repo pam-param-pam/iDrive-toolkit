@@ -7,12 +7,13 @@ from typing import Callable
 
 class DiffProgressPhase(Enum):
     PREPARING = "preparing"
-    LOCAL_ROOT = "local_root"
-    REMOTE_ROOT = "remote_root"
-    LOCAL_SCAN = "local_scan"
-    REMOTE_SCAN = "remote_scan"
+    LEFT_ROOT = "left_root"
+    RIGHT_ROOT = "right_root"
+    LEFT_SCAN = "left_scan"
+    RIGHT_SCAN = "right_scan"
     LOCAL_CRC_HASH = "local_crc_hash"
     LOCAL_FOLDER_HASH = "local_folder_hash"
+    FOLDER_HASH = "folder_hash"
     COMPARE_FOLDERS = "compare_folders"
     COMPARE_FILES = "compare_files"
     SORT = "sort"
@@ -38,6 +39,7 @@ class DiffProgress:
     current: int | None = None
     total: int | None = None
     unit: str | None = None
+    side: str | None = None
 
 
 @dataclass(frozen=True)

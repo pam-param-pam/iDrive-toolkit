@@ -4,14 +4,15 @@ from typing import Optional
 
 from ..exceptions import BackendHttpError, BackendInternalServerError, BackendRateLimitError, BackendServerTimeout, BackendServiceUnavailableError
 from ..models.Item import Item
-from ..utils.networker import make_request
 
 logger = logging.getLogger("iDrive")
 
 
 class MetadataFetcher:
-    def __init__(self, max_retries: int = 5):
+    def __init__(self, session, max_retries: int = 5, recursive_folder_listing: bool = False):
+        self.session = session
         self.max_retries = max_retries
+        self.recursive_folder_listing = recursive_folder_listing
 
     def _build_folder_passwords_payload(self, passwords: dict | None) -> dict:
         if not passwords:
@@ -30,17 +31,37 @@ class MetadataFetcher:
         if passwords is None:
             passwords = {}
 
+        self.session.require_owner(item)
         if item.is_locked and item.password:
             passwords[item.lock_from] = item.password
 
         resource_passwords = self._build_folder_passwords_payload(passwords)
-        res_data = self._request_with_retries("GET", f"ultraDownload/items/{item.id}", data=resource_passwords)
-        return self._inject_passwords(res_data, passwords)
+        if not self.recursive_folder_listing:
+            res_data = self._request_with_retries("GET", f"ultraDownload/items/{item.id}", data=resource_passwords)
+            return self._inject_passwords(res_data, passwords)
+
+        files = []
+        pending_ids = [item.id]
+        visited_ids = set()
+        while pending_ids:
+            item_id = pending_ids.pop()
+            if item_id in visited_ids:
+                continue
+            visited_ids.add(item_id)
+            res_data = self._request_with_retries("GET", f"ultraDownload/items/{item_id}", data=resource_passwords)
+            if not item.is_dir and item_id == item.id and isinstance(res_data, list):
+                return self._inject_passwords(res_data, passwords)
+            if not isinstance(res_data, dict):
+                raise TypeError(f"Expected structured ultraDownload/items response for {item_id}")
+            files.extend(res_data["files"])
+            pending_ids.extend(folder["id"] for folder in reversed(res_data.get("folders", [])))
+
+        return self._inject_passwords(files, passwords)
 
     def _request_with_retries(self, method: str, endpoint: str, data: dict = None, headers: dict = None) -> dict:
         for attempt in range(self.max_retries + 1):
             try:
-                return make_request(method, endpoint, data=data, headers=headers)
+                return self.session.make_request(method, endpoint, data=data, headers=headers)
             except (BackendRateLimitError, BackendServerTimeout, BackendServiceUnavailableError, BackendInternalServerError, BackendHttpError) as e:
                 if not self._is_retryable(e) or attempt >= self.max_retries:
                     raise

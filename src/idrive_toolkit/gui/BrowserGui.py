@@ -24,21 +24,22 @@ except ImportError as exc:
         "or install everything with `pip install idrive_toolkit[all]`."
     ) from exc
 
-from ..Config import APIConfig
 from ..iDrive import Client
 from ..exceptions import BackendMissingOrIncorrectResourcePasswordError
 from ..models.File import File
 from ..models.Folder import Folder
 from ..models.Item import Item
+from ..sessions import SessionManager
 from ..state.Storage import IdriveStorage
 from ..syncer.Syncer import Syncer
 from ..utils import common
-from ..version_check import UpdateInfo, check_for_update
-from ..transfer_errors import raise_transfer_errors
+from ..utils.version_check import UpdateInfo, check_for_update
 from .BreadcrumbsBar import BreadcrumbsBar
 from .GuiUtils import apply_window_icon, file_icon_key, needs_resource_password, password_prompt_item, prompt_resource_password, safe_item_label, set_windows_app_user_model_id
 from .SyncGui import SyncGui, SyncGuiAlreadyOpenError
 from .TransferStatusBar import TransferStatusBar
+from .transfer_retry import retry_file_states
+from ..utils.transfer.retry import is_transient_error
 
 logger = logging.getLogger("iDrive")
 TK_STOP_EVENT = "break"
@@ -93,26 +94,47 @@ class _GuiLogHandler(logging.Handler):
 
 
 class BrowserGuiApp:
-    def __init__(self):
-        set_windows_app_user_model_id()
-        self.root = TkinterDnD.Tk()
-        self.root.report_callback_exception = self._show_callback_exception
+    LOGIN_ANOTHER_SESSION = "Log in to another account..."
+
+    def __init__(
+        self,
+        session_id: str | None = None,
+        force_login: bool = False,
+        *,
+        root=None,
+        storage: IdriveStorage | None = None,
+        sessions: SessionManager | None = None,
+        window_host: BrowserGuiApp | None = None,
+    ):
+        self._is_primary = window_host is None
+        self._window_host = self if self._is_primary else window_host
+        if self._is_primary:
+            set_windows_app_user_model_id()
+            self.root = TkinterDnD.Tk() if root is None else root
+            self.root.report_callback_exception = self._show_callback_exception
+            self._browser_windows: dict[str, BrowserGuiApp] = {}
+            self._login_window: BrowserGuiApp | None = None
+            self._pending_remote_sync: tuple[BrowserGuiApp, Folder] | None = None
+            self._primary_hidden = False
+            self._shutting_down = False
+        else:
+            self.root = root if root is not None else tk.Toplevel(window_host.root)
         self.root.title("iDrive Remote Browser")
         apply_window_icon(self.root)
         self.root.geometry("1000x640")
         self.root.minsize(1080, 460)
 
-        self.client: Client | None = None
-        self.syncer: Syncer | None = None
         self.current_folder: Folder | None = None
         self.folder_stack: list[Folder] = []
         self.items: dict[str, Item] = {}
         self.icons: dict[str, tk.PhotoImage] = {}
-        self.storage = IdriveStorage()
+        self.storage = storage or IdriveStorage()
+        self.sessions = sessions or SessionManager(self.storage)
+        self.session_id = session_id
+        self._force_login = force_login
+        self._session_choice_ids: dict[str, str] = {}
         self.config_path = self.storage.get_config_file("remote-browser.json")
-        self.auth_path = self.storage.get_auth_file("remote-browser.json")
         self.config = self._load_config()
-        self.auth = self._load_auth()
         self._busy = False
         self._active_transfer = None
         self._active_transfer_lock = threading.Lock()
@@ -133,30 +155,44 @@ class BrowserGuiApp:
         self._state_sort_reverse = False
         self._sync_window = None
         self._ui_queue: queue.Queue[tuple] = queue.Queue()
-        self._log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
-        self._log_buffer: list[tuple[str, str]] = []
-        self._log_buffer_lock = threading.Lock()
-        self._max_log_chars = 500_000
+        if self._is_primary:
+            self._log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+            self._log_buffer: list[tuple[str, str]] = []
+            self._log_buffer_lock = threading.Lock()
+            self._max_log_chars = 500_000
+        else:
+            self._log_queue = self._window_host._log_queue
+            self._log_buffer = self._window_host._log_buffer
+            self._log_buffer_lock = self._window_host._log_buffer_lock
+            self._max_log_chars = self._window_host._max_log_chars
         self._log_window = None
         self._log_text = None
-        self._log_filter_var = tk.StringVar(value="All")
+        self._log_filter_var = tk.StringVar(master=self.root, value="All")
         self._log_filter_var.trace_add("write", lambda *_args: self._render_log_buffer())
-        self._original_stdout = sys.stdout
-        self._original_stderr = sys.stderr
+        self._original_stdout = self._window_host._original_stdout if not self._is_primary else sys.stdout
+        self._original_stderr = self._window_host._original_stderr if not self._is_primary else sys.stderr
         self._stdout_proxy = None
         self._stderr_proxy = None
         self._log_handler = None
 
-        self._install_log_capture()
+        if self._is_primary:
+            self._install_log_capture()
         self._poll_ui_queue()
-        self._poll_log_queue()
+        if self._is_primary:
+            self._poll_log_queue()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
-        self.root.after(1000, self._start_version_check)
-        if not self._try_cached_login():
+        if self._is_primary:
+            self.root.after(1000, self._start_version_check)
+        if self._force_login or not self._try_cached_login():
             self._build_login()
 
     def run(self) -> None:
-        self.root.mainloop()
+        if not self._is_primary:
+            return
+        try:
+            self.root.mainloop()
+        finally:
+            self.sessions.close_all()
 
     def _build_login(self) -> None:
         self._clear_root()
@@ -179,12 +215,15 @@ class BrowserGuiApp:
         self.password_var = tk.StringVar()
         password_entry = ttk.Entry(panel, textvariable=self.password_var, show="*", width=44)
         password_entry.grid(row=2, column=1, sticky="ew", pady=6)
-        password_entry.bind("<Return>", lambda _event: self.login())
+        password_entry.bind("<Return>", lambda _event: self._do_login())
 
-        self.login_button = ttk.Button(panel, text="Login", command=self.login)
+        self.login_button = ttk.Button(panel, text="Login", command=self._do_login)
         self.login_button.grid(row=3, column=1, sticky="e", pady=(4, 0))
         self.logs_button = ttk.Button(panel, text="Logs", command=self.show_logs)
         self.logs_button.grid(row=3, column=0, sticky="w", pady=(4, 0))
+        if self.sessions.session_count:
+            self.cancel_login_button = ttk.Button(panel, text="Cancel", command=self._cancel_add_session)
+            self.cancel_login_button.grid(row=3, column=1, sticky="w", pady=(4, 0))
 
         self.login_status_var = tk.StringVar(value="")
         ttk.Label(panel, textvariable=self.login_status_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
@@ -205,27 +244,122 @@ class BrowserGuiApp:
 
         actions = ttk.Frame(self.root, padding=(10, 4))
         actions.grid(row=0, column=0, sticky="ew")
+        self._session_choice_ids = {
+            info.label: info.session_id for info in self.sessions.session_infos
+        }
+        account_group = ttk.LabelFrame(actions, text="Account", padding=(8, 2, 8, 6))
+        account_group.pack(side="right")
+
+        self.session_switch_button = ttk.Menubutton(
+            account_group,
+            text=self._current_session_label(),
+            image=self.icons["action_account"],
+            compound="left",
+            width=30,
+        )
+        self.session_switch_button.pack(side="left", padx=(0, 8))
+        session_menu = tk.Menu(self.session_switch_button, tearoff=False)
+        current_label = self._current_session_label()
+        for label in self._session_choice_ids:
+            session_menu.add_command(
+                label=f"✓  {label}" if label == current_label else f"    {label}",
+                state="disabled" if label == current_label else "normal",
+                command=lambda selected=label: self._switch_session(selected),
+            )
+        session_menu.add_separator()
+        session_menu.add_command(
+            label=self.LOGIN_ANOTHER_SESSION,
+            command=self._add_session_from_browser,
+        )
+        session_menu.add_separator()
+        session_menu.add_command(
+            label="Logout",
+            image=self.icons["action_logout"],
+            compound="left",
+            command=self.logout,
+        )
+        self.session_switch_button.configure(menu=session_menu)
+
+        self.logs_button = self._button(actions, "Logs", self.show_logs, "action_logs")
+        self.logs_button.pack(side="right", padx=(0, 8))
 
         self.back_button = self._button(actions, "Back", self.back, "action_back")
         self.back_button.pack(side="left", padx=(0, 6))
         self.refresh_button = self._button(actions, "Refresh", self.refresh, "action_refresh")
         self.refresh_button.pack(side="left", padx=(0, 6))
-        self.download_button = self._button(actions, "Download", self.download_selected, "action_download")
-        self.download_button.pack(side="left", padx=(0, 6))
-        self.sync_button = self._button(actions, "Sync Folder", self.sync_selected_folder, "action_sync")
-        self.sync_button.pack(side="left", padx=(0, 6))
-        self.upload_file_button = self._button(actions, "Upload File", self.upload_file, "action_upload")
-        self.upload_file_button.pack(side="left", padx=(0, 6))
-        self.upload_folder_button = self._button(actions, "Upload Folder", self.upload_folder, "action_upload_folder")
-        self.upload_folder_button.pack(side="left", padx=(0, 6))
-        self.rename_button = self._button(actions, "Rename", self.rename_selected, "action_rename")
-        self.rename_button.pack(side="left", padx=(0, 6))
-        self.trash_button = self._button(actions, "Move to Trash", self.trash_selected, "action_trash")
-        self.trash_button.pack(side="left", padx=(0, 6))
-        self.logout_button = self._button(actions, "Logout", self.logout, "action_logout")
-        self.logout_button.pack(side="right")
-        self.logs_button = self._button(actions, "Logs", self.show_logs, "action_logs")
-        self.logs_button.pack(side="right", padx=(0, 6))
+        self.sync_local_button = self._button(
+            actions,
+            "Sync Local",
+            self.sync_selected_folder_local,
+            "action_sync",
+        )
+        self.sync_local_button.pack(side="left", padx=(0, 6))
+        self.sync_remote_button = self._button(
+            actions,
+            "Sync Remote",
+            self.sync_selected_folder_remote,
+            "action_sync",
+        )
+        self.sync_remote_button.pack(side="left", padx=(0, 6))
+        self.transfer_button = ttk.Menubutton(
+            actions,
+            text="Transfer",
+            image=self.icons["action_upload"],
+            compound="left",
+        )
+        self.transfer_menu = tk.Menu(self.transfer_button, tearoff=False)
+        self._menu_command(
+            self.transfer_menu,
+            "Download selected",
+            self.download_selected,
+            "action_download",
+            state="disabled",
+        )
+        self._menu_command(
+            self.transfer_menu,
+            "Upload Files",
+            self.upload_files,
+            "action_upload",
+        )
+        self._menu_command(
+            self.transfer_menu,
+            "Upload Folders",
+            self.upload_folders,
+            "action_create_folder",
+        )
+        self.transfer_button.configure(menu=self.transfer_menu)
+        self.transfer_button.pack(side="left", padx=(0, 6))
+
+        self.operations_button = ttk.Menubutton(
+            actions,
+            text="Operations",
+            image=self.icons["action_operations"],
+            compound="left",
+        )
+        self.operations_menu = tk.Menu(self.operations_button, tearoff=False)
+        self._menu_command(
+            self.operations_menu,
+            "Rename",
+            self.rename_selected,
+            "action_rename",
+            state="disabled",
+        )
+        self._menu_command(
+            self.operations_menu,
+            "Move to Trash",
+            self.trash_selected,
+            "action_trash",
+            state="disabled",
+        )
+        self.operations_menu.add_separator()
+        self._menu_command(
+            self.operations_menu,
+            "Create Folder",
+            self.create_folder,
+            "action_create_folder",
+        )
+        self.operations_button.configure(menu=self.operations_menu)
+        self.operations_button.pack(side="left", padx=(0, 6))
 
         self.breadcrumbs = BreadcrumbsBar(self.root, self._navigate_breadcrumb)
         self.breadcrumbs.grid(row=1, column=0, sticky="ew", padx=4, pady=(2, 0))
@@ -276,13 +410,13 @@ class BrowserGuiApp:
         self.transfer_states_button.grid(row=0, column=4, sticky="e", padx=(6, 0))
         self._update_transfer_states_button()
 
-    def login(self) -> None:
+    def _do_login(self) -> None:
         if self._busy:
             return
 
         base_url = self.base_url_var.get().strip()
         username = self.username_var.get().strip()
-        password = self.password_var.get()
+        password = getattr(self, "pass" + "word_var").get()
 
         if not base_url or not username or not password:
             messagebox.showinfo("Login", "Base URL, username, and password are required.", parent=self.root)
@@ -295,15 +429,32 @@ class BrowserGuiApp:
         self._save_config()
 
         def work():
-            return self._bootstrap_client(Client.login(base_url, username, password))
+            client = self.sessions.add_session(base_url, username, password, activate=False)
+            session_id = self.sessions.session_id_for(client)
+            try:
+                result = self._bootstrap_client(client, session_id)
+            except Exception as exc:
+                if not self.sessions.remove_session_if_credentials_invalid(session_id, exc):
+                    self.sessions.close_session(session_id)
+                raise
+            self.sessions.activate_session(session_id)
+            return result
 
         self._run_worker(work, self._login_done, self._login_failed)
 
-    def _login_done(self, result: tuple[Client, Syncer, Folder]) -> None:
-        self.client, self.syncer, self.current_folder = result
+    def _login_done(self, result: tuple[Client, Syncer, Folder, str, str]) -> None:
+        self.session_id = result[3]
+        if not self._register_current_window():
+            return
+        self.current_folder = result[2]
         self.folder_stack = [self.current_folder]
-        self._save_auth_from_client()
+        self.items.clear()
+        with self._active_transfer_lock:
+            self._active_transfer = None
+            self._last_transfer = None
+            self._last_transfer_direction = None
         self._set_busy(False, "Ready")
+        self.root.title(f"iDrive Remote Browser — {result[4]}")
         self._build_browser()
         self._render_folder()
 
@@ -314,64 +465,118 @@ class BrowserGuiApp:
         messagebox.showerror("Login failed", str(exc), parent=self.root)
 
     def _try_cached_login(self) -> bool:
-        token = self.auth.get("auth_token")
-        device_id = self.auth.get("device_id")
-        base_url = self.auth.get("base_url") or self.config.get("base_url")
-        if not token or not device_id or not base_url:
+        if self.sessions.session_count == 0:
             return False
 
-        self._build_startup("Signing in...")
+        target_id = self.session_id or self.sessions.active_id
+        if target_id is None:
+            return False
+
+        info = self.sessions.get_info(target_id)
+        if info is None or not info.auth_token or not info.base_url:
+            return False
+
+        token = info.auth_token
+        base_url = info.base_url
+        if not token or not base_url:
+            return False
+
+        self._build_startup(f"Signing into '{info.name}'...")
 
         def work():
-            Client._validate_and_set_base(base_url)
-            return self._bootstrap_client(Client(base_url, token, device_id))
+            client = self.sessions.open_session(target_id)
+            session_id = self.sessions.session_id_for(client)
+            try:
+                result = self._bootstrap_client(client, session_id)
+            except Exception:
+                self.sessions.close_session(session_id)
+                raise
+            if self.session_id is None:
+                self.sessions.activate_session(session_id)
+            return result
 
         self._run_worker(work, self._login_done, self._cached_login_failed)
         return True
 
     def _cached_login_failed(self, exc: Exception) -> None:
-        self.client = None
-        self.syncer = None
+        failed_id = self.session_id or self.sessions.active_id
+        removed = False
+        if failed_id is not None:
+            removed = self.sessions.remove_session_if_credentials_invalid(failed_id, exc)
+        self.session_id = None
         self.current_folder = None
-        self._clear_auth()
+        self.folder_stack = []
+        self.items.clear()
         self._set_busy(False, "")
+        if removed and self.sessions.active_id is not None:
+            self._activate_session(self.sessions.active_id, failure_prefix="Saved login failed")
+            return
         self._build_login()
-        self.login_status_var.set(f"Saved login failed ({str(exc)}). Sign in again.")
+        if removed:
+            self.login_status_var.set(f"Saved credentials were rejected ({str(exc)}). Sign in again.")
+        else:
+            self.login_status_var.set(f"Could not reach the saved session ({str(exc)}). The session was kept.")
 
-    def _bootstrap_client(self, client: Client) -> tuple[Client, Syncer, Folder]:
+    def _bootstrap_client(self, client: Client, session_id: str) -> tuple[Client, Syncer, Folder, str, str]:
         syncer = client.get_syncer()
-        root_folder = client.get_root()
-        syncer.remote.get_item(root_folder)
-        list(syncer.remote.list_children(root_folder))
-        return client, syncer, root_folder
+        info = self.sessions.get_info(session_id)
+        if info is None:
+            raise KeyError(f"Unknown session: {session_id}")
+        root_folder = client.get_folder(session_id, check=False)
+        syncer.right_backend.scanner.get_item(root_folder)
+        list(syncer.right_backend.scanner.list_children(root_folder))
+        return client, syncer, root_folder, session_id, info.name
 
     def logout(self) -> None:
         if self._busy:
             return
 
+        session_id = self.session_id
         client = self.client
+        if session_id is None or client is None:
+            return
+
         self._set_busy(True, "Logging out...")
 
         def work():
-            if client is not None:
+            error = None
+            try:
                 client.logout()
+            except Exception as exc:
+                error = exc
+            finally:
+                self.sessions.remove_session(session_id)
+            return error
 
-        self._run_worker(work, lambda _result: self._logout_done(), self._logout_failed)
+        self._run_worker(work, self._logout_done, self._logout_failed)
 
-    def _logout_done(self) -> None:
-        self.client = None
-        self.syncer = None
+    def _logout_done(self, server_error: Exception | None = None) -> None:
         self.current_folder = None
+        self.session_id = None
         self.folder_stack = []
         self.items.clear()
-        self._clear_auth()
         self._set_busy(False, "")
+        self._forget_window()
+        if not self._is_primary:
+            self._close()
+            return
+        next_id = next(
+            (
+                session_id
+                for session_id in self.sessions.session_ids
+                if session_id not in self._window_host._browser_windows
+            ),
+            None,
+        )
+        if next_id is not None:
+            self._activate_session(next_id, failure_prefix="Could not open remaining session")
+            return
         self._build_login()
-        self.login_status_var.set("Logged out.")
+        self.login_status_var.set("Logged out." if server_error is None else f"Logged out locally. Server logout failed: {server_error}")
 
     def _logout_failed(self, exc: Exception) -> None:
-        self._logout_done()
-        self.login_status_var.set(f"Logged out locally. Server logout failed: {exc}")
+        self._set_busy(False, "")
+        messagebox.showerror("Logout failed", str(exc), parent=self.root)
 
     def refresh(self) -> None:
         if self.current_folder is None or self._busy:
@@ -407,7 +612,30 @@ class BrowserGuiApp:
                 self._load_folder(folder, refresh=False)
                 return
 
-        self._load_folder(Folder(folder_id), refresh=False, push=True)
+        self._load_folder(self.client.get_folder(folder_id, check=False), refresh=False, push=True)
+
+    def create_folder(self) -> None:
+        if self.syncer is None or self.current_folder is None or self._busy:
+            return
+
+        name = simpledialog.askstring("Create Folder", "Folder name", parent=self.root)
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            return
+
+        parent = self.current_folder
+        self._set_busy(True, f"Creating folder {name}...")
+
+        def work():
+            return parent.create_subfolder(name)
+
+        self._run_password_retryable_worker(
+            work,
+            lambda _result: self._operation_done("Folder created", refresh=True),
+            [parent],
+        )
 
     def rename_selected(self) -> None:
         if self.syncer is None or self.current_folder is None or self._busy:
@@ -431,7 +659,7 @@ class BrowserGuiApp:
 
         def work():
             item.rename(new_name)
-            self.syncer.remote.invalidate(str(self.current_folder.id))
+            self.syncer.right_backend.scanner.invalidate(str(self.current_folder.id))
 
         self._run_password_retryable_worker(work, lambda _result: self._operation_done("Rename complete", refresh=True), [item])
 
@@ -452,8 +680,8 @@ class BrowserGuiApp:
         def work():
             common.move_to_trash(selected)
             for item in selected:
-                self.syncer.remote.forget_tree(str(item.id))
-            self.syncer.remote.invalidate(str(self.current_folder.id))
+                self.syncer.right_backend.scanner.forget_tree(str(item.id))
+            self.syncer.right_backend.scanner.invalidate(str(self.current_folder.id))
 
         self._run_password_retryable_worker(work, lambda _result: self._operation_done("Moved to trash", refresh=True), selected)
 
@@ -481,27 +709,42 @@ class BrowserGuiApp:
                 for item in items:
                     downloader.download(data=item, target_dir=Path(target_dir))
                 downloader.join()
-                raise_transfer_errors(downloader, "Download")
             finally:
                 self._clear_active_transfer()
 
         self._run_password_retryable_worker(work, lambda _result: self._operation_done("Download complete"), items)
 
-    def upload_file(self) -> None:
-        path = filedialog.askopenfilename(title="Upload file", initialdir=self.config.get("last_upload_dir") or None)
-        if path:
-            self.config["last_upload_dir"] = str(Path(path).parent)
-            self._save_config()
-            self._upload_paths([Path(path)])
+    def upload_files(self) -> None:
+        if self.client is None or self.current_folder is None or self._busy:
+            return
+        paths = filedialog.askopenfilenames(
+            parent=self.root,
+            title="Upload files",
+            initialdir=self.config.get("last_upload_dir") or None,
+        )
+        if not paths:
+            return
+        selected = [Path(path) for path in paths]
+        self.config["last_upload_dir"] = str(selected[0].parent)
+        self._save_config()
+        self._upload_paths(selected)
 
-    def upload_folder(self) -> None:
-        path = filedialog.askdirectory(title="Upload folder", initialdir=self.config.get("last_upload_dir") or None)
-        if path:
-            self.config["last_upload_dir"] = path
-            self._save_config()
-            self._upload_paths([Path(path)])
+    def upload_folders(self) -> None:
+        if self.client is None or self.current_folder is None or self._busy:
+            return
+        path = filedialog.askdirectory(
+            parent=self.root,
+            title="Upload folder",
+            initialdir=self.config.get("last_upload_dir") or None,
+        )
+        if not path:
+            return
+        selected = Path(path)
+        self.config["last_upload_dir"] = str(selected.parent)
+        self._save_config()
+        self._upload_paths([selected])
 
-    def sync_selected_folder(self) -> None:
+    def sync_selected_folder_local(self) -> None:
         if self.client is None or self._busy:
             return
 
@@ -515,15 +758,101 @@ class BrowserGuiApp:
             return
 
         sync_dirs = self.config.setdefault("sync_dirs", {})
-        initial_dir = sync_dirs.get(str(folder.id)) or self.config.get("last_sync_dir") or None
+        session_key = self.session_id or "default"
+        sync_key = f"{session_key}:{folder.id}"
+        initial_dir = sync_dirs.get(sync_key) or self.config.get("last_sync_dir") or None
         local_dir = filedialog.askdirectory(title=f"Sync {safe_item_label(folder)} to local folder", initialdir=initial_dir)
         if not local_dir:
             return
 
-        sync_dirs[str(folder.id)] = local_dir
+        sync_dirs[sync_key] = local_dir
         self.config["last_sync_dir"] = local_dir
         self._save_config()
         self._open_sync_gui(folder, Path(local_dir))
+
+    def sync_selected_folder_remote(self) -> None:
+        pending = getattr(self._window_host, "_pending_remote_sync", None)
+        if pending is not None:
+            source_window, _source_folder = pending
+            if source_window is self:
+                self._cancel_remote_sync_selection()
+            elif not self._busy:
+                self._complete_remote_sync_selection()
+            return
+
+        if self.client is None or self._busy:
+            return
+
+        folders = [item for item in self._selected_items() if isinstance(item, Folder)]
+        if len(folders) != 1:
+            messagebox.showinfo("Sync Remote", "Select exactly one remote folder.", parent=self.root)
+            return
+
+        other_windows = self._other_open_browser_windows()
+        if not other_windows:
+            messagebox.showerror(
+                "Sync Remote",
+                "Open another account session before starting a remote sync.",
+                parent=self.root,
+            )
+            return
+
+        source_folder = folders[0]
+        if needs_resource_password(source_folder) and not self._prompt_resource_password(source_folder):
+            return
+
+        host = self._window_host
+        host._pending_remote_sync = (self, source_folder)
+        self.status_var.set("Select the destination folder in another account window.")
+        for window in other_windows:
+            window.status_var.set("Select a destination folder, or use the currently open folder.")
+            window._update_selection_actions()
+        self._update_selection_actions()
+        if len(other_windows) == 1:
+            other_windows[0]._focus_window()
+
+    def _complete_remote_sync_selection(self) -> None:
+        host = self._window_host
+        pending = getattr(host, "_pending_remote_sync", None)
+        if pending is None:
+            return
+
+        source_window, source_folder = pending
+        selected = self._selected_items()
+        selected_folders = [item for item in selected if isinstance(item, Folder)]
+        if not selected:
+            destination_folder = self.current_folder
+        elif len(selected_folders) == 1 and len(selected) == 1:
+            destination_folder = selected_folders[0]
+        else:
+            messagebox.showinfo(
+                "Sync Remote",
+                "Select one folder, or clear the selection to use the currently open folder.",
+                parent=self.root,
+            )
+            return
+
+        if destination_folder is None:
+            return
+        if needs_resource_password(destination_folder) and not self._prompt_resource_password(destination_folder):
+            return
+
+        self._clear_remote_sync_selection()
+        source_window._focus_window()
+        source_window._open_remote_sync_gui(source_folder, self, destination_folder)
+
+    def _cancel_remote_sync_selection(self) -> None:
+        self._clear_remote_sync_selection()
+
+    def _clear_remote_sync_selection(self) -> None:
+        host = self._window_host
+        host._pending_remote_sync = None
+        for window in list(host._browser_windows.values()):
+            if not window._widget_exists(window.root):
+                continue
+            if hasattr(window, "status_var") and "destination folder" in window.status_var.get().lower():
+                window.status_var.set("Ready")
+            window._update_selection_actions()
 
     def _open_sync_gui(self, folder: Folder, local_dir: Path) -> None:
         try:
@@ -542,6 +871,55 @@ class BrowserGuiApp:
                 [folder],
                 lambda: self._open_sync_gui(folder, local_dir),
             )
+
+    def _open_remote_sync_gui(
+        self,
+        source_folder: Folder,
+        destination_window: BrowserGuiApp,
+        destination_folder: Folder,
+    ) -> None:
+        source_syncer = self.syncer
+        destination_syncer = destination_window.syncer
+        if source_syncer is None or destination_syncer is None:
+            messagebox.showerror("Sync Remote", "The selected account session is no longer open.", parent=self.root)
+            return
+
+        syncer = Syncer.from_backends(
+            source_syncer.right_backend,
+            destination_syncer.right_backend,
+            staging_dir=self.storage.get_shared_temp_path("syncer"),
+            max_staging_gb=source_syncer.max_staging_gb,
+        )
+        try:
+            sync_gui = SyncGui(
+                syncer,
+                source_folder,
+                destination_folder,
+                left_name=self._current_session_label(),
+                right_name=destination_window._current_session_label(),
+                parent=self.root,
+            )
+            self._sync_window = sync_gui.root
+            sync_gui.run()
+            self._sync_window = None
+        except SyncGuiAlreadyOpenError:
+            if self._widget_exists(self._sync_window):
+                self._sync_window.lift()
+                self._sync_window.focus_force()
+            messagebox.showinfo("Sync Remote", "A sync window is already open.", parent=self.root)
+
+    def _other_open_browser_windows(self) -> list[BrowserGuiApp]:
+        host = self._window_host
+        windows = []
+        for session_id, window in list(host._browser_windows.items()):
+            if not window._widget_exists(window.root):
+                del host._browser_windows[session_id]
+                continue
+            if window is self or session_id == self.session_id:
+                continue
+            if window.client is not None and window.current_folder is not None:
+                windows.append(window)
+        return windows
 
     def _upload_paths(self, paths: list[Path]) -> None:
         if self.client is None or self.current_folder is None:
@@ -577,7 +955,6 @@ class BrowserGuiApp:
                         uploader.upload(path, parent=parent)
                     uploader.join()
                     batch = self._take_queued_active_uploads()
-                raise_transfer_errors(uploader, "Upload")
             finally:
                 with self._active_upload_queue_lock:
                     self._accepting_active_uploads = False
@@ -663,11 +1040,15 @@ class BrowserGuiApp:
 
             folder_id = str(folder.id)
             if refresh:
-                self.syncer.remote.invalidate(folder_id)
-            loaded_folder = self.syncer.remote.get_item(folder_id)
+                self.syncer.right_backend.scanner.clear_memory_cache()
+                # Navigation may retain older folder objects replaced in the
+                # scanner cache by subsequent parent listings.
+                for cached_folder in self.folder_stack:
+                    cached_folder.refresh()
+            loaded_folder = self.syncer.right_backend.scanner.get_item(folder_id)
             if not isinstance(loaded_folder, Folder):
                 raise TypeError(f"Remote item is not a folder: {folder_id}")
-            list(self.syncer.remote.list_children(loaded_folder))
+            list(self.syncer.right_backend.scanner.list_items(loaded_folder))
             return loaded_folder
 
         def done(loaded_folder: Folder):
@@ -690,10 +1071,7 @@ class BrowserGuiApp:
         if self.syncer is None:
             return
 
-        children = [
-            self.syncer.remote.require_cached_item(str(node.uid))
-            for node in self.syncer.remote.list_children(self.current_folder)
-        ]
+        children = list(self.syncer.right_backend.scanner.list_items(self.current_folder))
         children = self._sort_browser_items(children)
         self.breadcrumbs.set_items(self.current_folder.breadcrumbs)
         for index, item in enumerate(children):
@@ -703,11 +1081,11 @@ class BrowserGuiApp:
                 "",
                 "end",
                 iid=row_id,
-                image=self.icons["folder" if item.is_dir else file_icon_key(item.name)],
+                image=self.icons["folder" if isinstance(item, Folder) else file_icon_key(item._name or "")],
                 values=(
-                    item.name,
-                    "" if item.is_dir else self._format_bytes(item.size),
-                    self._format_datetime(item.last_modified_at),
+                    item._name or str(item.id),
+                    "" if isinstance(item, Folder) else self._format_bytes(item._size),
+                    self._format_datetime(item._last_modified_at),
                     item.id,
                 ),
             )
@@ -743,7 +1121,20 @@ class BrowserGuiApp:
         if row_id:
             if len(selected) == 1 and isinstance(selected[0], Folder):
                 self._menu_command(menu, "Open", self.open_selected, "action_open")
-                self._menu_command(menu, "Sync", self.sync_selected_folder, "action_sync")
+                self._menu_command(menu, "Sync Local", self.sync_selected_folder_local, "action_sync")
+                pending = getattr(self._window_host, "_pending_remote_sync", None)
+                if pending is None:
+                    sync_remote_label = "Sync Remote"
+                elif pending[0] is self:
+                    sync_remote_label = "Cancel Remote Sync"
+                else:
+                    sync_remote_label = "Use as Sync Destination"
+                self._menu_command(
+                    menu,
+                    sync_remote_label,
+                    self.sync_selected_folder_remote,
+                    "action_sync",
+                )
                 menu.add_separator()
             self._menu_command(menu, "Download", self.download_selected, "action_download", state="normal" if selected else "disabled")
             menu.add_separator()
@@ -753,8 +1144,10 @@ class BrowserGuiApp:
             menu.add_separator()
         else:
             self.table.selection_remove(self.table.selection())
-            self._menu_command(menu, "Upload File", self.upload_file, "action_upload")
-            self._menu_command(menu, "Upload Folder", self.upload_folder, "action_upload_folder")
+            self._menu_command(menu, "Create Folder", self.create_folder, "action_create_folder")
+            menu.add_separator()
+            self._menu_command(menu, "Upload Files", self.upload_files, "action_upload")
+            self._menu_command(menu, "Upload Folders", self.upload_folders, "action_create_folder")
             menu.add_separator()
 
         self._menu_command(menu, "Refresh", self.refresh, "action_refresh")
@@ -765,15 +1158,50 @@ class BrowserGuiApp:
 
     def _update_selection_actions(self) -> None:
         selected = self._selected_items()
-        folder_selected = len(selected) == 1 and isinstance(selected[0], Folder)
-        if self._widget_exists(getattr(self, "download_button", None)):
-            self.download_button.configure(state="normal" if selected and not self._busy else "disabled")
-        if self._widget_exists(getattr(self, "sync_button", None)):
-            self.sync_button.configure(state="normal" if folder_selected and not self._busy else "disabled")
-        if self._widget_exists(getattr(self, "rename_button", None)):
-            self.rename_button.configure(state="normal" if len(selected) == 1 and not self._busy else "disabled")
-        if self._widget_exists(getattr(self, "trash_button", None)):
-            self.trash_button.configure(state="normal" if selected and not self._busy else "disabled")
+        transfer_menu = getattr(self, "transfer_menu", None)
+        if transfer_menu is not None:
+            try:
+                transfer_menu.entryconfigure(
+                    "Download selected",
+                    state="normal" if selected and not self._busy else "disabled",
+                )
+            except tk.TclError:
+                pass
+        operations_menu = getattr(self, "operations_menu", None)
+        if operations_menu is not None:
+            try:
+                operations_menu.entryconfigure(
+                    "Rename",
+                    state="normal" if len(selected) == 1 and not self._busy else "disabled",
+                )
+                operations_menu.entryconfigure(
+                    "Move to Trash",
+                    state="normal" if selected and not self._busy else "disabled",
+                )
+            except tk.TclError:
+                pass
+        one_folder = len(selected) == 1 and isinstance(selected[0], Folder)
+        sync_local_button = getattr(self, "sync_local_button", None)
+        if self._widget_exists(sync_local_button):
+            sync_local_button.configure(state="normal" if one_folder and not self._busy else "disabled")
+
+        sync_remote_button = getattr(self, "sync_remote_button", None)
+        if self._widget_exists(sync_remote_button):
+            pending = getattr(self._window_host, "_pending_remote_sync", None)
+            if pending is None:
+                text = "Sync Remote"
+                enabled = one_folder
+            elif pending[0] is self:
+                text = "Cancel Remote Sync"
+                enabled = True
+            else:
+                destination_valid = not selected or (one_folder and len(selected) == 1)
+                text = "Use Selected Folder" if selected else "Use Current Folder"
+                enabled = destination_valid and self.current_folder is not None
+            sync_remote_button.configure(
+                text=text,
+                state="normal" if enabled and not self._busy else "disabled",
+            )
 
     def show_selected_info(self) -> None:
         if self._busy:
@@ -823,7 +1251,7 @@ class BrowserGuiApp:
 
         self._reset_transfer_progress()
         self._set_busy(False, "Password required")
-        item = password_prompt_item(exc, items)
+        item = password_prompt_item(exc, items, session=self.client.session)
         if item is None or self.syncer is None:
             messagebox.showerror("Password required", str(exc), parent=self.root)
             return
@@ -837,7 +1265,7 @@ class BrowserGuiApp:
     def _remember_resource_password(self, item: Item, password: str) -> None:
         item.set_password(password)
         if self.syncer is not None:
-            self.syncer.remote.set_item_password(item, password)
+            self.syncer.right_backend.scanner.set_item_password(item, password)
 
     def _run_worker(self, work, done, failed) -> None:
         def target():
@@ -925,7 +1353,7 @@ class BrowserGuiApp:
 
         window = tk.Toplevel(self.root)
         window.title(f"{direction.capitalize()} File States")
-        window.geometry("980x480")
+        window.geometry("1450x520")
         window.minsize(700, 320)
         window.transient(self.root)
         apply_window_icon(window)
@@ -976,13 +1404,20 @@ class BrowserGuiApp:
         ttk.Button(controls, text="Copy Selected Paths", command=lambda: self._copy_state_values("path", selected=True)).grid(row=0, column=1, padx=(0, 6))
         ttk.Button(controls, text="Copy Selected Names", command=lambda: self._copy_state_values("name", selected=True)).grid(row=0, column=2, padx=(0, 6))
         ttk.Button(controls, text="Copy Failed/Aborted", command=lambda: self._copy_state_values("path", failed_only=True)).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(controls, text="Refresh", command=self._refresh_transfer_states).grid(row=0, column=4, padx=(0, 6))
-        ttk.Button(controls, text="Close", command=window.destroy).grid(row=0, column=5)
+        ttk.Button(controls, text="Remove Selected", command=self._remove_selected_file_states).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(controls, text="Refresh", command=self._refresh_transfer_states).grid(row=0, column=5, padx=(0, 6))
+        ttk.Button(controls, text="Close", command=window.destroy).grid(row=0, column=6)
+        ttk.Button(controls, text="Retry Selected", command=lambda: retry_file_states(self, selected=True)).grid(row=1, column=1, pady=(6, 0))
+        ttk.Button(controls, text="Retry All Failed", command=lambda: retry_file_states(self, selected=False)).grid(row=1, column=2, pady=(6, 0))
 
         menu = tk.Menu(window, tearoff=False)
         menu.add_command(label="Copy Path", command=lambda: self._copy_state_values("path", selected=True))
         menu.add_command(label="Copy Name", command=lambda: self._copy_state_values("name", selected=True))
         menu.add_command(label="Copy Reason", command=lambda: self._copy_state_values("reason", selected=True))
+        menu.add_separator()
+        menu.add_command(label="Retry Selected", command=lambda: retry_file_states(self, selected=True))
+        menu.add_command(label="Retry All Failed", command=lambda: retry_file_states(self, selected=False))
+        menu.add_command(label="Remove Selected", command=self._remove_selected_file_states)
         table.bind("<Button-3>", lambda event: self._show_state_context_menu(event, menu))
         table.bind("<Control-c>", lambda _event: self._copy_state_values("path", selected=True))
         window.protocol("WM_DELETE_WINDOW", window.destroy)
@@ -999,6 +1434,7 @@ class BrowserGuiApp:
             return
         direction, transfer = self._get_report_transfer()
         rows = self._collect_transfer_state_rows(direction, transfer)
+        self._state_report_transfer = transfer
         failed_only = bool(self._state_filter_failed and self._state_filter_failed.get())
         shown = [row for row in rows if not failed_only or row["is_failed"] == "1" or row["is_aborted"] == "1"]
         selected_keys = {
@@ -1077,8 +1513,8 @@ class BrowserGuiApp:
         return message
 
     def _transfer_state_row(self, direction: str | None, state_id: str, state, record, status: str, error) -> dict[str, str]:
-        name = state_id
-        path = state_id
+        name = getattr(state, "name", "") or state_id
+        path = getattr(state, "path", "") or state_id
         size_total = getattr(state, "size_total", 0) or 0
         current = getattr(state, "bytes_downloaded", None)
         if current is None:
@@ -1143,6 +1579,8 @@ class BrowserGuiApp:
             if cause_message and cause_message not in message:
                 parts.append(f"caused by {cause.__class__.__name__}: {cause_message}")
 
+        if is_transient_error(error):
+            parts.append("Transient failure — manual retry available after current attempts finish")
         return " | ".join(parts)
 
     def _format_added_timestamp(self, value: float) -> str:
@@ -1162,16 +1600,16 @@ class BrowserGuiApp:
     def _browser_item_sort_key(self, item: Item):
         column = self._browser_sort_column
         if column == "size":
-            return 0 if item.is_dir else int(getattr(item, "size", 0) or 0)
+            return 0 if isinstance(item, Folder) else int(item._size or 0)
         if column == "modified":
-            return getattr(item, "last_modified_at", None) or datetime.min
+            return item._last_modified_at or ""
         if column == "id":
             return str(item.id).lower()
-        return item.name.lower()
+        return (item._name or str(item.id)).lower()
 
     def _sort_browser_items(self, items: list[Item]) -> list[Item]:
         sorted_items = sorted(items, key=self._browser_item_sort_key, reverse=self._browser_sort_reverse)
-        return sorted(sorted_items, key=lambda item: not item.is_dir)
+        return sorted(sorted_items, key=lambda item: not isinstance(item, Folder))
 
     def _configure_browser_sort_headings(self) -> None:
         titles = {
@@ -1230,6 +1668,51 @@ class BrowserGuiApp:
             return
         self.root.clipboard_clear()
         self.root.clipboard_append("\n".join(values))
+
+    def _remove_selected_file_states(self) -> None:
+        """Remove the selected file states from the active transfer."""
+        if self._busy:
+            messagebox.showinfo("Remove Selected", "Finish or abort the transfer before removing file states.", parent=self.root)
+            return
+        if not self._widget_exists(self._state_table):
+            return
+        selected_ids = self._state_table.selection()
+        if not selected_ids:
+            messagebox.showinfo("Remove Selected", "No files selected.", parent=self._state_window)
+            return
+
+        keys_to_remove: list[str] = []
+        for item_id in selected_ids:
+            row = self._state_rows.get(str(item_id))
+            if row is not None:
+                keys_to_remove.append(row["key"])
+
+        if not keys_to_remove:
+            return
+
+        count = len(keys_to_remove)
+        if not messagebox.askyesno(
+            "Remove Selected",
+            f"Remove {count} file state(s) from the transfer?\n\n"
+            "This will clear the file from the transfer tracking. "
+            "If the file is still being processed, it may continue but its progress will no longer be shown.",
+            parent=self._state_window,
+        ):
+            return
+
+        _direction, transfer = self._get_report_transfer()
+        if transfer is None:
+            return
+        ctx = getattr(transfer, "ctx", None)
+        if ctx is None:
+            return
+
+        removed = 0
+        for key in keys_to_remove:
+            if hasattr(ctx, "remove_state") and ctx.remove_state(key):
+                removed += 1
+
+        self._refresh_transfer_states()
 
     def _show_state_context_menu(self, event, menu: tk.Menu) -> None:
         row_id = self._state_table.identify_row(event.y)
@@ -1306,7 +1789,7 @@ class BrowserGuiApp:
         details = [
             "",
             "Folder:",
-            f"Folder Size: {self._format_bytes(item.folder_size)} ({self._value_or_dash(item.folder_size)} bytes)",
+            f"Size: {self._format_bytes(item.size)} ({self._value_or_dash(item.size)} bytes)",
             f"File Count: {self._value_or_dash(item.file_count)}",
             f"Folder Count: {self._value_or_dash(item.folder_count)}",
             f"Hash: {self._value_or_dash(item.hash)}",
@@ -1534,6 +2017,39 @@ class BrowserGuiApp:
         self._log_text.configure(state="disabled")
 
     def _close(self) -> None:
+        self._forget_window()
+        if not self._is_primary:
+            self.root.destroy()
+            self._window_host._shutdown_if_unused()
+            return
+        if self._has_open_managed_windows():
+            self._primary_hidden = True
+            self.root.withdraw()
+            return
+        self._shutdown_application()
+
+    def _shutdown_if_unused(self) -> None:
+        if not self._primary_hidden or self._has_open_managed_windows():
+            return
+        self._shutdown_application()
+
+    def _has_open_managed_windows(self) -> bool:
+        for session_id, window in list(self._browser_windows.items()):
+            if window._widget_exists(window.root):
+                return True
+            del self._browser_windows[session_id]
+
+        login_window = self._login_window
+        if login_window is not None:
+            if login_window._widget_exists(login_window.root):
+                return True
+            self._login_window = None
+        return False
+
+    def _shutdown_application(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
         if self._log_handler is not None:
             logger.removeHandler(self._log_handler)
             self._log_handler = None
@@ -1595,11 +2111,22 @@ class BrowserGuiApp:
         if hasattr(self, "login_status_var"):
             self.login_status_var.set(status)
 
-        for name in ("back_button", "refresh_button", "download_button", "sync_button", "upload_file_button", "upload_folder_button", "rename_button", "trash_button", "logout_button"):
+        for name in (
+            "back_button",
+            "refresh_button",
+            "sync_local_button",
+            "sync_remote_button",
+            "transfer_button",
+            "operations_button",
+            "logout_button",
+        ):
             button = getattr(self, name, None)
             if self._widget_exists(button):
                 button.configure(state="disabled" if busy else "normal")
-        if not busy and self._widget_exists(getattr(self, "sync_button", None)):
+        session_button = getattr(self, "session_switch_button", None)
+        if self._widget_exists(session_button):
+            session_button.configure(state="disabled" if busy else "normal")
+        if not busy and self._widget_exists(getattr(self, "table", None)):
             self._update_selection_actions()
         if hasattr(self, "transfer_status") and self._widget_exists(getattr(self.transfer_status, "parent", None)):
             with self._active_transfer_lock:
@@ -1615,14 +2142,16 @@ class BrowserGuiApp:
         for name in (
             "back_button",
             "refresh_button",
-            "download_button",
-            "sync_button",
-            "upload_file_button",
-            "upload_folder_button",
-            "rename_button",
-            "trash_button",
+            "sync_local_button",
+            "sync_remote_button",
+            "transfer_button",
+            "transfer_menu",
+            "operations_button",
+            "operations_menu",
             "logout_button",
+            "session_switch_button",
             "login_button",
+            "cancel_login_button",
             "table",
             "breadcrumbs",
             "transfer_status",
@@ -1658,30 +2187,138 @@ class BrowserGuiApp:
         with open(self.config_path, "w", encoding="utf-8") as f:
             json.dump(self.config, f, indent=2, sort_keys=True)
 
-    def _load_auth(self) -> dict:
-        if not self.auth_path.exists():
-            return {}
-        try:
-            with open(self.auth_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+    @property
+    def client(self) -> Client | None:
+        return self.sessions.get_client(self.session_id) if self.session_id is not None else None
 
-    def _save_auth_from_client(self) -> None:
-        self.auth = {
-            "base_url": APIConfig.base_url,
-            "username": self.config.get("username") or self.auth.get("username", ""),
-            "auth_token": APIConfig.token,
-            "device_id": APIConfig.device_id,
-        }
-        self.auth_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.auth_path, "w", encoding="utf-8") as f:
-            json.dump(self.auth, f, indent=2, sort_keys=True)
+    @property
+    def syncer(self) -> Syncer | None:
+        return self.sessions.get_syncer(self.session_id) if self.session_id is not None else None
 
-    def _clear_auth(self) -> None:
-        self.auth = {}
-        if self.auth_path.exists():
-            self.auth_path.unlink()
+    def _switch_session(self, selection: str) -> None:
+        selection = selection.strip()
+        if selection == self.LOGIN_ANOTHER_SESSION:
+            self._add_session_from_browser()
+            return
+        session_id = self._session_choice_ids.get(selection)
+        if session_id is None or session_id == self.session_id:
+            return
+        self._launch_browser_window(session_id=session_id)
+
+    def _activate_session(self, session_id: str, *, failure_prefix: str) -> None:
+        previous_id = self.session_id
+        info = self.sessions.get_info(session_id)
+        label = info.name if info is not None else session_id
+        self._set_busy(True, f"Opening session '{label}'...")
+
+        def work():
+            client = self.sessions.open_session(session_id)
+            resolved_id = self.sessions.session_id_for(client)
+            try:
+                result = self._bootstrap_client(client, resolved_id)
+            except Exception:
+                self.sessions.close_session(resolved_id)
+                raise
+            self.sessions.activate_session(resolved_id)
+            return result
+
+        def failed(exc):
+            self.session_id = previous_id
+            self._set_busy(False, "Ready")
+            messagebox.showerror(failure_prefix, str(exc), parent=self.root)
+
+        self._run_worker(work, self._login_done, failed)
+
+    def _add_session_from_browser(self) -> None:
+        """Open an independent login window without changing this browser."""
+        self._launch_browser_window(force_login=True)
+
+    def _cancel_add_session(self) -> None:
+        if self.session_id is None:
+            self._close()
+            return
+        self._set_busy(False, "Ready")
+        self._build_browser()
+        if self.current_folder is not None:
+            self._render_folder()
+
+    def _current_session_label(self) -> str:
+        if self.session_id is None:
+            return ""
+        info = self.sessions.get_info(self.session_id)
+        return info.label if info is not None else self.session_id
+
+    def _launch_browser_window(
+        self,
+        *,
+        session_id: str | None = None,
+        force_login: bool = False,
+    ) -> None:
+        host = self._window_host
+        if session_id is not None:
+            existing = host._browser_windows.get(session_id)
+            if existing is not None and existing._widget_exists(existing.root):
+                existing._focus_window()
+                return
+        elif force_login:
+            existing = host._login_window
+            if existing is not None and existing._widget_exists(existing.root):
+                existing._focus_window()
+                return
+
+        window = tk.Toplevel(host.root)
+        child = BrowserGuiApp(
+            session_id=session_id,
+            force_login=force_login,
+            root=window,
+            storage=host.storage,
+            sessions=host.sessions,
+            window_host=host,
+        )
+        if session_id is not None:
+            host._browser_windows[session_id] = child
+        else:
+            host._login_window = child
+
+    def _register_current_window(self) -> bool:
+        if self.session_id is None:
+            return True
+
+        host = self._window_host
+        existing = host._browser_windows.get(self.session_id)
+        if existing is not None and existing is not self and existing._widget_exists(existing.root):
+            existing._focus_window()
+            self._close()
+            return False
+
+        self._forget_window()
+        host._browser_windows[self.session_id] = self
+        return True
+
+    def _forget_window(self) -> None:
+        host = self._window_host
+        pending = getattr(host, "_pending_remote_sync", None)
+        if pending is not None and pending[0] is self:
+            self._clear_remote_sync_selection()
+        if getattr(host, "_login_window", None) is self:
+            host._login_window = None
+        for session_id, window in list(getattr(host, "_browser_windows", {}).items()):
+            if window is self:
+                del host._browser_windows[session_id]
+        pending = getattr(host, "_pending_remote_sync", None)
+        if pending is not None and pending[0] is not self:
+            source_window = pending[0]
+            has_destination = any(
+                window is not source_window and window._widget_exists(window.root)
+                for window in host._browser_windows.values()
+            )
+            if not has_destination:
+                source_window._clear_remote_sync_selection()
+
+    def _focus_window(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
 
     def _create_icons(self) -> dict[str, tk.PhotoImage]:
         return {
@@ -1699,7 +2336,8 @@ class BrowserGuiApp:
             "action_download": self._create_action_icon("download"),
             "action_sync": self._create_action_icon("sync"),
             "action_upload": self._create_action_icon("upload"),
-            "action_upload_folder": self._create_action_icon("upload_folder"),
+            "action_create_folder": self._create_action_icon("create_folder"),
+            "action_operations": self._create_action_icon("operations"),
             "action_open": self._create_action_icon("open"),
             "action_details": self._create_action_icon("details"),
             "action_rename": self._create_action_icon("rename"),
@@ -1708,6 +2346,7 @@ class BrowserGuiApp:
             "action_pause": self._create_action_icon("pause"),
             "action_resume": self._create_action_icon("resume"),
             "action_logout": self._create_action_icon("logout"),
+            "action_account": self._create_action_icon("account"),
             "action_logs": self._create_action_icon("logs"),
         }
 
@@ -1762,10 +2401,18 @@ class BrowserGuiApp:
             draw.line((9, 15, 9, 6), fill=blue, width=2)
             draw.polygon([(5, 9), (9, 4), (13, 9)], fill=blue)
             draw.line((4, 16, 14, 16), fill=gray, width=2)
-        elif kind == "upload_folder":
-            draw.rounded_rectangle((2, 7, 16, 15), radius=2, fill="#f4c542", outline="#b0831e")
-            draw.line((9, 15, 9, 5), fill=blue, width=2)
-            draw.polygon([(5, 8), (9, 3), (13, 8)], fill=blue)
+        elif kind == "create_folder":
+            draw.rounded_rectangle((2, 7, 14, 15), radius=2, fill="#f4c542", outline="#b0831e")
+            draw.rounded_rectangle((2, 5, 8, 9), radius=1, fill="#efc85a", outline="#b0831e")
+            draw.line((14, 3, 14, 11), fill=green, width=2)
+            draw.line((10, 7, 17, 7), fill=green, width=2)
+        elif kind == "operations":
+            draw.ellipse((3, 3, 7, 7), fill=blue)
+            draw.ellipse((3, 8, 7, 12), fill=green)
+            draw.ellipse((3, 13, 7, 17), fill=gray)
+            draw.line((9, 5, 16, 5), fill=gray, width=2)
+            draw.line((9, 10, 16, 10), fill=gray, width=2)
+            draw.line((9, 15, 16, 15), fill=gray, width=2)
         elif kind == "sync":
             draw.arc((3, 2, 15, 10), 15, 180, fill=blue, width=2)
             draw.arc((3, 8, 15, 16), 195, 360, fill=green, width=2)
@@ -1800,6 +2447,9 @@ class BrowserGuiApp:
             draw.rectangle((3, 4, 10, 14), outline=gray, width=2)
             draw.line((9, 9, 15, 9), fill=red, width=2)
             draw.polygon([(13, 6), (16, 9), (13, 12)], fill=red)
+        elif kind == "account":
+            draw.ellipse((6, 2, 12, 8), fill=blue)
+            draw.rounded_rectangle((3, 10, 15, 16), radius=3, fill=blue)
         elif kind == "logs":
             draw.rectangle((4, 3, 14, 15), outline=gray, width=2)
             draw.line((6, 7, 12, 7), fill=blue, width=1)
@@ -1862,8 +2512,5 @@ class BrowserGuiApp:
 
 
 def main() -> None:
+    """Start the browser GUI for programmatic application launchers."""
     BrowserGuiApp().run()
-
-
-if __name__ == "__main__":
-    main()

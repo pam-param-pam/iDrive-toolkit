@@ -52,9 +52,6 @@ all = [
 [project.urls]
 Github = "https://github.com/pam-param-pam/iDrive-toolkit"
 
-[project.scripts]
-idrive-gui = "idrive_toolkit.gui.BrowserGui:main"
-
 [tool.setuptools]
 package-dir = {"" = "src"}
 

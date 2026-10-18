@@ -9,7 +9,7 @@ from urllib.request import Request, urlopen
 
 from packaging.version import InvalidVersion, Version
 
-from . import __version__
+from .. import __version__
 
 logger = logging.getLogger("iDrive")
 

@@ -18,7 +18,10 @@ logger = logging.getLogger("iDrive")
 # Cleaned v.2
 
 class FinalizeWorker:
-    def __init__(self, finalize_queue: Queue[str], ctx: DownloadContext):
+    def __init__(self, finalize_queue: Queue[str], ctx: DownloadContext, session, storage=None, write_guard=None):
+        self.session = session
+        self.storage = storage or session.storage
+        self.write_guard = write_guard
         self.finalize_queue = finalize_queue
         self.ctx = ctx
 
@@ -44,8 +47,8 @@ class FinalizeWorker:
                     # todo make this safe under the download dir ensure within root
                     os.makedirs(os.path.dirname(record.final_user_output_path), exist_ok=True)
 
-                    safe_move_src_only(record.temp_file_path, record.final_user_output_path)
-                safe_rmtree(record.temp_file_dir)
+                    safe_move_src_only(record.temp_file_path, record.final_user_output_path, storage=self.storage)
+                safe_rmtree(record.temp_file_dir, storage=self.storage)
 
                 with state.lock:
                     state.status = FileDownloadStatus.COMPLETED
@@ -86,23 +89,27 @@ class FinalizeWorker:
 
         overall_crc = 0
 
-        with safe_open(temp_file_path, "wb") as out:
+        with safe_open(temp_file_path, "wb", storage=self.storage) as out:
             for frag in fragments:
                 frag_crc = 0
                 frag_path = source_dir / f"{frag.sequence}.part"
 
-                with safe_open(frag_path, "rb") as i_f:
+                with safe_open(frag_path, "rb", storage=self.storage) as i_f:
                     for chunk in iter(lambda: i_f.read(2 * 1024 * 1024), b""):
                         dec_chunk = dec.decrypt(chunk)
 
                         frag_crc = zlib.crc32(dec_chunk, frag_crc)
                         overall_crc = zlib.crc32(dec_chunk, overall_crc)
 
+                        if self.write_guard:
+                            self.write_guard(len(dec_chunk))
                         out.write(dec_chunk)
+                        if self.write_guard:
+                            out.flush()
 
                 frag_crc &= 0xFFFFFFFF
                 if frag_crc != frag.crc:
-                    safe_remove_file(frag_path)
+                    safe_remove_file(frag_path, storage=self.storage)
                     raise CrcIntegrityError(f"Bad fragment CRC. sequence={frag.sequence}, expected={frag.crc}, got={frag_crc}")
 
         expected = file_info.crc & 0xFFFFFFFF

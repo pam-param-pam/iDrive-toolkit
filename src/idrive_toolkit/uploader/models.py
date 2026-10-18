@@ -20,6 +20,7 @@ from ..models.Metadata import VideoMetadata
 logger = logging.getLogger("iDrive")
 
 class FileUploadStatus(Enum):
+    QUEUED = "queued"
     PENDING = "pending"
     SCANNING = "scanning"
     UPLOADING = "uploading"
@@ -69,6 +70,8 @@ class UploadInput:
     path: Path
     parent: Folder
     lock_from_id: Optional[str]
+    name: Optional[str] = None
+    frontend_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -96,8 +99,8 @@ class DiscordAttachment:
 
 @dataclass(frozen=True)
 class ChunkAttachment(DiscordAttachment):
-    sequence: Optional[int]
-    offset: Optional[int]
+    sequence: int
+    offset: int
     crc: int
 
     def __str__(self):
@@ -114,8 +117,8 @@ class ThumbnailAttachment(DiscordAttachment):
 
 @dataclass(frozen=True)
 class SubtitleAttachment(DiscordAttachment):
-    language: Optional[str]
-    is_forced: Optional[bool]
+    language: str
+    is_forced: bool
 
     def __str__(self):
         return f"SubtitleAttachment[frontend_ig={self.frontend_id!r}, language={self.language!r}, is_forced={self.is_forced}]"
@@ -127,6 +130,8 @@ class SubtitleAttachment(DiscordAttachment):
 class DiscordRequest:
     attachments: list[ChunkAttachment | ThumbnailAttachment | SubtitleAttachment | DiscordAttachment]
     retries: int = 0
+    first_attempt_at: float = 0.0
+    webhook: object = None
 
     @property
     def total_size(self):
@@ -183,6 +188,9 @@ class UploadFileState:
     error: Optional[Exception] = None
     artifacts: FileArtifacts = None
     bytes_uploaded: int = 0
+    backend_file: Optional["BackendFile"] = None
+    name: str = ""
+    path: str = ""
 
     run_event: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -287,8 +295,8 @@ class BackendThumbnail:
     channel_id: str
     message_id: str
     attachment_id: str
-    iv: str
-    key: str
+    iv: Optional[str]
+    key: Optional[str]
     message_author_id: str
 
 
@@ -300,8 +308,8 @@ class BackendSubtitle:
     attachment_id: str
     language: str
     is_forced: bool
-    iv: str
-    key: str
+    iv: Optional[str]
+    key: Optional[str]
     message_author_id: str
 
 
@@ -315,12 +323,12 @@ class BackendFile:
     encryption_method: int
     created_at: int
     duration: Optional[int]
-    iv: str
-    key: str
+    iv: Optional[str]
+    key: Optional[str]
     crc: int
-    parent_password: str
-    lock_from: str
+    parent_password: Optional[str]
+    lock_from: Optional[str]
     thumbnail: Optional[BackendThumbnail]
     videoMetadata: Optional[VideoMetadata]
-    subtitles: Optional[List[BackendSubtitle]]
-    fragments: Optional[List[BackendFragment]] = field(default_factory=list)
+    subtitles: List[BackendSubtitle]
+    fragments: List[BackendFragment] = field(default_factory=list)

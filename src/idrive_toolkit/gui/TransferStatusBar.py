@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-import time
 import tkinter as tk
 from tkinter import ttk
 from typing import Any, Callable
 
 from ..syncer.progress import TransferProgress, TransferProgressPhase
+from ..utils.transfer.speed import TransferSpeed
 
 
 class TransferStatusBar:
-    SPEED_SMOOTHING = 0.12
     POLL_MS = 500
 
     def __init__(
         self,
         parent: tk.Misc,
-        *,
+
         abort_icon: tk.PhotoImage | None,
         abort_command: Callable[[], None],
         pause_icon: tk.PhotoImage | None = None,
@@ -27,12 +26,12 @@ class TransferStatusBar:
         self.progress_var = tk.DoubleVar(value=0)
         self._transfer: Any = None
         self._direction: str | None = None
-        self._last_bytes = 0
-        self._last_time = 0.0
+        self._speed_meter = TransferSpeed()
         self._speed = 0.0
         self._aborting = False
         self._paused = False
         self._paused_status = None
+        self._sync_progress = {}
         self._pause_icon = pause_icon
         self._resume_icon = resume_icon
         self._pause_command = pause_command
@@ -86,9 +85,9 @@ class TransferStatusBar:
         self.set_pause_enabled(False)
         self._transfer = None
         self._direction = None
-        self._last_bytes = 0
-        self._last_time = 0.0
+        self._speed_meter.reset()
         self._speed = 0.0
+        self._sync_progress.clear()
 
     def set_abort_enabled(self, enabled: bool) -> None:
         self.abort_button.configure(state="normal" if enabled else "disabled")
@@ -113,48 +112,66 @@ class TransferStatusBar:
             self.set_abort_enabled(False)
             self.set_pause_enabled(False)
             return
-        if self._transfer is not None and self.is_transfer_paused(self._transfer):
+        self._sync_progress[progress.direction.value] = progress
+        visible = [
+            current
+            for current in self._sync_progress.values()
+            if current.phase != TransferProgressPhase.COMPLETE
+        ]
+        if not visible:
+            visible = [progress]
+
+        paused = self._paused or (
+            self._transfer is not None and self.is_transfer_paused(self._transfer)
+        )
+        if paused:
             self.set_paused(True)
-            self.set_progress(progress.current_bytes, progress.total_bytes)
-            if self._paused_status is None:
-                self._paused_status = self.format_sync_progress(
+            rendered = [
+                self.format_sync_progress(
                     TransferProgress(
-                        direction=progress.direction,
-                        phase=progress.phase,
-                        message="Paused files",
-                        current_bytes=progress.current_bytes,
-                        total_bytes=progress.total_bytes,
-                        completed_items=progress.completed_items,
-                        total_items=progress.total_items,
-                        failed_items=progress.failed_items,
+                        direction=current.direction,
+                        phase=current.phase,
+                        message=f"Paused {current.direction.value}",
+                        current_bytes=current.current_bytes,
+                        total_bytes=current.total_bytes,
+                        completed_items=current.completed_items,
+                        total_items=current.total_items,
+                        failed_items=current.failed_items,
                         bytes_per_second=0.0,
                         eta_seconds=None,
                     )
                 )
-            self.status_var.set(self._paused_status)
-            self.set_abort_enabled(True)
-            self.set_pause_enabled(True)
-            return
-        self.status_var.set(self.format_sync_progress(progress))
-        self.set_progress(progress.current_bytes, progress.total_bytes)
-        self.set_abort_enabled(progress.phase == TransferProgressPhase.RUNNING)
-        self.set_pause_enabled(progress.phase == TransferProgressPhase.RUNNING)
+                for current in visible
+            ]
+        else:
+            self.set_paused(False)
+            rendered = [self.format_sync_progress(current) for current in visible]
 
-    def attach_transfer(self, direction: str, transfer: Any) -> None:
+        self.status_var.set("  |  ".join(rendered))
+        self.set_progress(
+            sum(current.current_bytes for current in visible),
+            sum(current.total_bytes for current in visible),
+        )
+        running = any(current.phase == TransferProgressPhase.RUNNING for current in visible)
+        self.set_abort_enabled(running)
+        self.set_pause_enabled(running)
+
+    def attach_transfer(self, direction: str, transfer: Any, *, poll: bool = True) -> None:
         self._aborting = False
         self._transfer = transfer
         self._direction = direction
         current_bytes, _total_bytes = self.transfer_bytes(transfer, direction)
-        self._last_bytes = current_bytes
-        self._last_time = time.monotonic()
+        self._speed_meter.reset(self.transfer_speed_bytes(transfer, direction))
         self._speed = 0.0
         self._paused_status = None
         self.set_paused(False)
-        self.parent.after(0, self.poll_transfer)
+        if poll:
+            self.parent.after(0, self.poll_transfer)
 
     def clear_transfer(self) -> None:
         self._transfer = None
         self._direction = None
+        self._sync_progress.clear()
         self.set_abort_enabled(False)
         self.set_pause_enabled(False)
 
@@ -166,10 +183,12 @@ class TransferStatusBar:
             return
 
         current_bytes, total_bytes = self.transfer_bytes(transfer, direction)
-        now = time.monotonic()
+        speed_bytes = self.transfer_speed_bytes(transfer, direction)
         paused = self.is_transfer_paused(transfer)
 
         if paused:
+            self._speed_meter.reset(speed_bytes)
+            self._speed = 0.0
             self.set_paused(True)
             self.set_progress(current_bytes, total_bytes)
             if self._paused_status is None:
@@ -184,17 +203,11 @@ class TransferStatusBar:
             self.status_var.set(self._paused_status)
             self.set_abort_enabled(not self._aborting)
             self.set_pause_enabled(not self._aborting)
-            self._last_bytes = current_bytes
-            self._last_time = now
             self.parent.after(self.POLL_MS, self.poll_transfer)
             return
 
         self.set_paused(False)
-        elapsed = max(0.001, now - self._last_time)
-        instant_speed = max(0.0, (current_bytes - self._last_bytes) / elapsed)
-        self._speed = instant_speed if self._speed <= 0 else (self.SPEED_SMOOTHING * instant_speed + (1 - self.SPEED_SMOOTHING) * self._speed)
-        self._last_bytes = current_bytes
-        self._last_time = now
+        self._speed = self._speed_meter.update(speed_bytes)
 
         self.set_progress(current_bytes, total_bytes)
         if not self._aborting:
@@ -205,6 +218,13 @@ class TransferStatusBar:
             self.set_abort_enabled(False)
             self.set_pause_enabled(False)
         self.parent.after(self.POLL_MS, self.poll_transfer)
+
+    @staticmethod
+    def transfer_speed_bytes(transfer: Any, direction: str) -> int:
+        getter = getattr(transfer, "get_transferred_bytes", None)
+        if callable(getter):
+            return getter()
+        return TransferStatusBar.transfer_bytes(transfer, direction)[0]
 
     @staticmethod
     def transfer_bytes(transfer: Any, direction: str) -> tuple[int, int]:

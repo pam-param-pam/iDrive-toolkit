@@ -9,14 +9,16 @@ from .models import FileDownloadStatus, FileInfo, FilePlanningTask, FileRecord, 
 from ..exceptions import BackendHttpError, BackendInternalServerError, BackendRateLimitError, BackendServerTimeout, BackendServiceUnavailableError
 from ..models.Enums import EncryptionMethod
 from ..state.Storage import safe_remove_file
-from ..utils.networker import make_request
 
 logger = logging.getLogger("iDrive")
 
 
 class FilePlanningWorker:
     def __init__(self, temp_folder: Path, file_queue: Queue[FilePlanningTask], fragment_queue: Queue[FragmentTask],
-                 finalize_queue: Queue[str], ctx: DownloadContext,max_retries: int = 5):
+                 finalize_queue: Queue[str], ctx: DownloadContext,session, max_retries: int = 5, storage=None, write_guard=None):
+        self.session = session
+        self.storage = storage or session.storage
+        self.write_guard = write_guard
         self._temp_folder = temp_folder
         self._file_queue = file_queue
         self._fragment_queue = fragment_queue
@@ -51,7 +53,7 @@ class FilePlanningWorker:
 
         temp_file_dir = Path(self._temp_folder) / file_info.id
         temp_file_path = temp_file_dir / file_info.id
-        final_user_output_path = Path(task.target_dir) / file_info.path
+        final_user_output_path = Path(task.target_dir) / (task.output_name or file_info.path)
 
         record = FileRecord(
             file_info=file_info,
@@ -73,6 +75,13 @@ class FilePlanningWorker:
             )
             self._ctx.register({file_info.id: state}, {file_info.id: record})
             self._ctx.add_downloaded_bytes(file_info.size)
+            # Reused output is a completed download too. Consumers such as the
+            # sync pipeline rely on this notification to schedule the upload.
+            try:
+                if record.on_complete:
+                    record.on_complete(file_info.id, state)
+            except Exception:
+                logger.exception(f"[FilePlanningWorker] on_complete callback failed for file {file_info.id}")
             return
 
         if file_info.size == 0:
@@ -148,7 +157,7 @@ class FilePlanningWorker:
             if self._ctx.stop_requested.is_set():
                 raise RuntimeError("Download cancelled")
             try:
-                return make_request(method, endpoint, headers=headers, params=params)
+                return self.session.make_request(method, endpoint, headers=headers, params=params)
             except (BackendRateLimitError, BackendServerTimeout, BackendServiceUnavailableError, BackendInternalServerError, BackendHttpError) as e:
                 if not self._is_retryable(e) or attempt >= self._max_retries:
                     raise
@@ -216,7 +225,7 @@ class FilePlanningWorker:
                     downloaded_bytes += frag.size
                 else:
                     logger.info(f"[FilePlanningWorker] invalid .part (size/crc mismatch): {part_path} size={actual_size} expected={frag.size}")
-                    safe_remove_file(part_path)
+                    safe_remove_file(part_path, storage=self.storage)
                     missing.append(frag)
                     remaining_bytes += frag.size
             else:

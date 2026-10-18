@@ -26,8 +26,9 @@ class DownloadContext:
         self.download_requests = 0
         self.reserved_file_ids = set()
 
-    def reserve_files(self, file_ids: list[str], total_size: int) -> None:
+    def reserve_files(self, files: list[dict]) -> None:
         with self.lock:
+            file_ids = [file["id"] for file in files]
             seen = set()
             duplicate_input_ids = set()
             for file_id in file_ids:
@@ -44,8 +45,11 @@ class DownloadContext:
 
             self.reserved_file_ids.update(unique_file_ids)
             self.expected_files += len(file_ids)
-            self.expected_bytes += total_size
+            self.expected_bytes += sum(file["size"] for file in files)
             self.download_requests += 1
+            self.states.update({file["id"]: FileState(
+                file_id=file["id"], fragments_total=0, size_total=file["size"],
+                name=file["name"], status=FileDownloadStatus.QUEUED) for file in files})
 
     def get_expected_bytes(self) -> int:
         with self.lock:
@@ -84,7 +88,8 @@ class DownloadContext:
 
     def register(self, new_states: Dict[str, FileState], new_records: Dict[str, FileRecord]) -> None:
         with self.lock:
-            duplicates = self.states.keys() & new_states.keys()
+            duplicates = {key for key in self.states.keys() & new_states.keys()
+                          if self.states[key].status != FileDownloadStatus.QUEUED}
             if duplicates:
                 raise RuntimeError(f"Attempted to enqueue already-existing file_ids: {sorted(duplicates)}")
 
@@ -102,6 +107,16 @@ class DownloadContext:
     def get_all_states(self) -> Dict[str, FileState]:
         with self.lock:
             return dict(self.states)
+
+    def remove_state(self, file_id: str) -> bool:
+        """Remove a file state from the context. Returns True if the state was removed."""
+        with self.lock:
+            if file_id in self.states:
+                del self.states[file_id]
+                self.records.pop(file_id, None)
+                self.reserved_file_ids.discard(file_id)
+                return True
+            return False
 
     def get_failed_states(self) -> Dict[str, FileState]:
         with self.lock:

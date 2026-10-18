@@ -6,7 +6,6 @@ from typing import Optional, TYPE_CHECKING
 
 from ..models.Resource import Resource
 from ..utils.decorators import autoFetchProperty
-from ..utils.networker import make_request
 
 if TYPE_CHECKING:
     from .Folder import Folder
@@ -14,9 +13,8 @@ if TYPE_CHECKING:
 
 class Item(Resource, ABC):
 
-    def __init__(self, item_id):
-        from ..models import Folder
-        super().__init__(item_id)
+    def __init__(self, item_id, session=None):
+        super().__init__(item_id, session=session)
         self._is_dir: Optional[bool] = None
         self._name: Optional[str] = None
         self._parent: Optional[Folder] = None
@@ -26,6 +24,7 @@ class Item(Resource, ABC):
         self._in_trash_since: Optional[str] = None
         self._is_locked: Optional[bool] = None
         self._lock_from: Optional[str] = None
+        self._size: Optional[int] = None
 
     def __repr__(self):
         return self.name
@@ -33,14 +32,6 @@ class Item(Resource, ABC):
     @abstractmethod
     def _fetch_data(self):
         raise NotImplementedError
-
-    @abstractmethod
-    def _set_more_data(self, data: dict):
-        raise NotImplementedError
-
-    def _fetch_more_data(self) -> None:
-        data = make_request("GET", f"items/{self.id}/more-info", headers=self._get_password_header())
-        self._set_more_data(data)
 
     def _set_data(self, json_data: dict) -> Optional[dict]:
         unmatched_keys = {}
@@ -63,26 +54,43 @@ class Item(Resource, ABC):
                 self._is_locked = value
             elif key == "lockFrom":
                 self._lock_from = value
+            elif key == "size":
+                self._size = value
             else:
                 unmatched_keys[key] = value
 
         return unmatched_keys
 
     def inherit_password_from(self, parent: Folder) -> None:
-        if not parent.is_locked:
+        # Listing metadata is sufficient. Lazy lock properties can fetch a
+        # separately locked child merely while parsing its parent's response.
+        if not parent._is_locked:
             return
 
-        parent_lock_from = parent.lock_from
-        own_lock_from = self.lock_from
-        if own_lock_from == parent_lock_from:
+        parent_lock_from = parent._lock_from
+        own_lock_from = self._lock_from
+        if parent_lock_from is not None and own_lock_from == parent_lock_from:
             self.set_password(parent.password)
-            self._lock_from = parent.lock_from
+            self._lock_from = parent_lock_from
             self._is_locked = True
+
+    def apply_password_requirement(self, name: str | None = None) -> None:
+        """Record that this item requires a password without fetching metadata."""
+        if self._name is None:
+            self._name = name or str(self.id)
+        self._is_locked = True
+        if self._lock_from is None:
+            self._lock_from = str(self.id)
 
     @property
     @autoFetchProperty('_fetch_data')
     def name(self):
         return self._name
+
+    @property
+    @autoFetchProperty('_fetch_data')
+    def size(self):
+        raise self._size
 
     @property
     @autoFetchProperty('_fetch_data')
@@ -120,14 +128,14 @@ class Item(Resource, ABC):
         if not self.parent_id:
             raise ValueError("Root folder has no parent!")
 
-        self._parent = Folder(self.parent_id)
+        self._parent = Folder(self.parent_id, session=self.session)
         return self._parent
 
     def check_password(self, password: str):
-        make_request("GET", f"items/{self.id}/password", headers={"x-resource-password": password})
+        self.session.make_request("GET", f"items/{self.id}/password", headers={"x-resource-password": password})
 
     def rename(self, new_name: str) -> None:
-        make_request("PATCH", f"items/{self.id}/rename", {'new_name': new_name}, headers=self._get_password_header())
+        self.session.make_request("PATCH", f"items/{self.id}/rename", {'new_name': new_name}, headers=self._get_password_header())
 
     def move_to_trash(self) -> None:
         from ..utils.common import move_to_trash

@@ -1,8 +1,11 @@
+"""Collect and describe transfer failures."""
 from __future__ import annotations
 
 
 class TransferFailedError(RuntimeError):
-    pass
+    def __init__(self, message, errors=()):
+        super().__init__(message)
+        self.transfer_errors = tuple(errors)
 
 
 def raise_transfer_errors(transfer, label: str) -> None:
@@ -15,7 +18,7 @@ def raise_transfer_errors(transfer, label: str) -> None:
         lines.append(f"{index}. {name}: {_format_error_reason(error)}")
     if len(errors) > 10:
         lines.append(f"... and {len(errors) - 10} more")
-    raise TransferFailedError("\n".join(lines))
+    raise TransferFailedError("\n".join(lines), errors) from errors[0][1]
 
 
 def _collect_errors(transfer) -> list[tuple[str, BaseException]]:

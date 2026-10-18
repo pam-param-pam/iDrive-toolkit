@@ -2,37 +2,39 @@ from .Device import Device
 from .Notification import Notification
 from .Settings import Settings
 from .namedTuples import User, Perms
-from ..utils.networker import make_request
+from .SessionBound import SessionBound
 
 
-class UserProfile:
-    def __init__(self, user: dict, perms: dict, settings: dict):
+class UserProfile(SessionBound):
+    def __init__(self, user: dict, perms: dict, settings: dict, session=None):
+        super().__init__(session=session)
         self.user = User(**user)
         self.perms = Perms(**perms)
-        self.settings = Settings(**settings)
+        self.settings = Settings(session=self.session, **settings)
 
     @classmethod
-    def fetch(cls):
-        data = make_request("GET", "user/me")
+    def fetch(cls, *, session):
+        data = session.make_request("GET", "user/me")
 
         return cls(
+            session=session,
             user=data["user"],
             perms=data["perms"],
             settings=data["settings"]
         )
 
     def get_active_devices(self) -> list[Device]:
-        data = make_request("GET", "auth/devices")
+        data = self.session.make_request("GET", "auth/devices")
         devices = []
         for element in data:
-            devices.append(Device(**element))
+            devices.append(Device(session=self.session, **element))
         return devices
 
     def logout_all_devices(self) -> None:
-        make_request("POST", "auth/devices/logout-all")
+        self.session.make_request("POST", "auth/devices/logout-all")
 
     def get_notifications(self):
-        data = make_request("GET", "user/notifications")
+        data = self.session.make_request("GET", "user/notifications")
         notifs = []
         for ele in data:
             notifs.append(Notification(**ele))

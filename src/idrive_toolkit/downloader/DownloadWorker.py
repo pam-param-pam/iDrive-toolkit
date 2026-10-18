@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from queue import Full, Queue
+from queue import Full, Queue, Empty
 
 import httpx
 
@@ -9,13 +9,15 @@ from .models import FileDownloadStatus, FileState, FragmentTask, ThrottleState
 from ..exceptions import BackendHttpError, BackendInternalServerError, BackendRateLimitError, BackendServerTimeout, BackendServiceUnavailableError
 from ..exceptions import DiscordRateLimitError, DiscordServerTimeout
 from ..state.Storage import safe_mkdirs, safe_remove_file, safe_open
-from ..utils.networker import make_request
 
 logger = logging.getLogger("iDrive")
 
 
 class DownloadWorker:
-    def __init__(self, fragment_queue: Queue[FragmentTask], finalize_queue: Queue[str], ctx: DownloadContext, throttle: ThrottleState, max_retries: int) -> None:
+    def __init__(self, fragment_queue: Queue[FragmentTask], finalize_queue: Queue[str], ctx: DownloadContext, throttle: ThrottleState, max_retries: int, session, storage=None, write_guard=None) -> None:
+        self.session = session
+        self.storage = storage or session.storage
+        self.write_guard = write_guard
         self.fragment_queue = fragment_queue
         self.finalize_queue = finalize_queue
         self.ctx = ctx
@@ -23,10 +25,15 @@ class DownloadWorker:
         self.max_retries = max_retries
         self._client = httpx.Client(timeout=10.0, limits=httpx.Limits(max_connections=100, max_keepalive_connections=20))
 
-    def run(self) -> None:
+    def run(self, retire=None) -> None:
         try:
             while True:
-                fragment = self.fragment_queue.get()
+                if retire is not None and retire.is_set():
+                    break
+                try:
+                    fragment = self.fragment_queue.get(timeout=0.2)
+                except Empty:
+                    continue
                 if fragment is None:
                     self.fragment_queue.task_done()
                     break
@@ -39,22 +46,25 @@ class DownloadWorker:
                         self._mark_cancelled(state)
                         continue
 
-                    self._process_task(fragment, state)
-
-                except (DiscordRateLimitError, BackendRateLimitError, BackendServiceUnavailableError) as e:
-                    self.throttle.signal_error()
-                    self._retry_later(fragment, state, e, wait_seconds=e.wait, count_retry=True)
-
-                except (BackendServerTimeout, DiscordServerTimeout, BackendInternalServerError) as e:
-                    self._retry_later(fragment, state, e, wait_seconds=self._retry_wait(e), count_retry=True)
-
-                except BackendHttpError as e:
-                    if self._is_retryable_backend_http(e):
-                        self._retry_later(fragment, state, e, wait_seconds=self._retry_wait(e), count_retry=True)
-                    else:
+                    while True:
                         with state.lock:
-                            state.error = e
-                            state.status = FileDownloadStatus.FAILED
+                            if state.status in (FileDownloadStatus.FAILED, FileDownloadStatus.ABORTED):
+                                break
+                        try:
+                            self._process_task(fragment, state)
+                            break
+                        except (DiscordRateLimitError, BackendRateLimitError, BackendServiceUnavailableError) as e:
+                            self.throttle.signal_error()
+                            self._retry_later(fragment, state, e, e.wait, True)
+                            break
+                        except (BackendServerTimeout, DiscordServerTimeout, BackendInternalServerError) as e:
+                            self._retry_later(fragment, state, e, self._retry_wait(e), True)
+                            break
+                        except BackendHttpError as e:
+                            if not self._is_retryable_backend_http(e):
+                                raise
+                            self._retry_later(fragment, state, e, self._retry_wait(e), True)
+                            break
 
                 except Exception as e:
                     with state.lock:
@@ -85,33 +95,32 @@ class DownloadWorker:
             state.fragments_downloaded += 1
             file_is_complete = state.fragments_downloaded == state.fragments_total
 
-        if file_is_complete:
+        if file_is_complete and state.status != FileDownloadStatus.FAILED:
             self._enqueue_finalize(task.file_id)
 
-    def _retry_later(self, task: FragmentTask, state: FileState, error: Exception, wait_seconds: float, count_retry: bool) -> None:
+    def _retry_later(self, task: FragmentTask, state: FileState, error: Exception, wait_seconds: float, count_retry: bool) -> bool:
         if self._is_stopping():
             self._mark_cancelled(state)
-            return
+            return False
 
         if count_retry and task.retries >= self.max_retries:
             with state.lock:
                 state.error = error
                 state.status = FileDownloadStatus.FAILED
-            return
+            return False
 
         with state.lock:
+            if state.status in (FileDownloadStatus.FAILED, FileDownloadStatus.ABORTED):
+                return False
             state.status = FileDownloadStatus.RETRYING
+            state.error = error
 
         logger.warning(f"[DownloadWorker] {error.__class__.__name__} → retrying in {wait_seconds}s (retry {task.retries})")
 
-        if self.ctx.stop_requested.wait(wait_seconds):
-            self._mark_cancelled(state)
-            return
-
         if count_retry:
             task.retries += 1
-
-        self._requeue(task)
+        self.fragment_queue.defer(task, wait_seconds)
+        return True
 
     def _enqueue_finalize(self, file_id: str) -> None:
         self._put_until_stopped(self.finalize_queue, file_id)
@@ -153,9 +162,9 @@ class DownloadWorker:
 
         file_dir = record.temp_file_dir
         part_path = file_dir / f"{fragment.sequence}.part"
-        safe_mkdirs(file_dir)
+        safe_mkdirs(file_dir, storage=self.storage)
 
-        response_data = make_request(
+        response_data = self.session.make_request(
             "GET",
             f"ultraDownload/fragments/{fragment.fragment_id}",
             headers={"x-resource-password": task.file_password},
@@ -167,12 +176,18 @@ class DownloadWorker:
             with self._client.stream("GET", url) as r:
                 r.raise_for_status()
 
-                with safe_open(part_path, "wb") as f:
+                with safe_open(part_path, "wb", storage=self.storage) as f:
                     for chunk in r.iter_bytes(64 * 1024):
                         if not chunk:
                             continue
 
+                        if total + len(chunk) > fragment.size:
+                            raise ValueError("Fragment response exceeds declared size")
+                        if self.write_guard:
+                            self.write_guard(len(chunk))
                         f.write(chunk)
+                        if self.write_guard:
+                            f.flush()
                         total += len(chunk)
 
             return total
@@ -194,6 +209,6 @@ class DownloadWorker:
         logger.info("[FragmentDownloader] Cleaning up file after network error")
         try:
             if path.exists():
-                safe_remove_file(path)
+                safe_remove_file(path, storage=self.storage)
         except Exception:
             logger.exception("[FragmentDownloader] Failed to cleanup partial file")

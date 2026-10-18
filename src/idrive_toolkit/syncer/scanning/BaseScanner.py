@@ -55,6 +55,10 @@ class Node:
             self._hash_loader = None
         return self._hash
 
+    @property
+    def hash_pending(self) -> bool:
+        return self._hash_loader is not None
+
     def __str__(self) -> str:
         return f"NODE[{self.kind}({self.name})]"
 
@@ -91,4 +95,8 @@ class BaseScanner(ABC):
 
     @abstractmethod
     def list_children(self, node_id) -> Iterable[Node]:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def resolve_hashes(self, nodes: Iterable[Node], on_resolved=None) -> None:
         raise NotImplementedError()

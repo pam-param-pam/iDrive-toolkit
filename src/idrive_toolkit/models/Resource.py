@@ -2,10 +2,12 @@ from abc import ABC
 from typing import Optional, Union
 
 from overrides import EnforceOverrides
+from .SessionBound import SessionBound
 
 
-class Resource(ABC, EnforceOverrides):
-    def __init__(self, resource_id):
+class Resource(SessionBound, ABC, EnforceOverrides):
+    def __init__(self, resource_id, session=None):
+        super().__init__(session=session)
         self._id: str = resource_id
         self._password: Optional[str] = None
 

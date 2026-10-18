@@ -1,6 +1,4 @@
 import hashlib
-import json
-import logging
 import os
 import threading
 import zlib
@@ -9,20 +7,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .BaseScanner import BaseScanner, Node, NodeKind, NodeOrigin
-from .name_utils import remote_resource_name
-from .progress import DiffProgressCallback, DiffProgressPhase, emit_progress
-
-logger = logging.getLogger("iDrive")
-
+from .CrcCache import LocalCrcCache
+from ..name_utils import remote_resource_name
+from ..progress import DiffProgressCallback, DiffProgressPhase, emit_progress
 
 class LocalScanner(BaseScanner):
-    def __init__(self, state):
-        self.state = state
+    def __init__(self, crc_cache: LocalCrcCache):
+        self.crc_cache = crc_cache
         self._folder_hash_cache: dict[Path, str] = {}
         self._progress_callback: DiffProgressCallback | None = None
         self._hash_progress: dict[str, int] | None = None
         self._hash_progress_lock = threading.Lock()
-        self._state_lock = threading.Lock()
 
     def set_progress_callback(self, callback: DiffProgressCallback | None) -> None:
         self._progress_callback = callback
@@ -56,6 +51,12 @@ class LocalScanner(BaseScanner):
             if entry.is_symlink():
                 continue
             yield self._node_from_path(Path(entry.path))
+
+    def resolve_hashes(self, nodes, on_resolved=None) -> None:
+        for node in nodes:
+            _ = node.hash
+            if on_resolved is not None:
+                on_resolved(node)
 
     def get_folder_size(self, node_id: Path) -> int:
         return sum(file.stat().st_size for file in node_id.rglob("*") if file.is_file())
@@ -99,24 +100,15 @@ class LocalScanner(BaseScanner):
 
     def _get_file_hash(self, path: Path, *, emit_file_progress: bool = True) -> int:
         stat = path.stat()
-
-        with self._state_lock:
-            cached = self.state.get(path)
-
-        if cached and cached.size == stat.st_size and cached.mtime == stat.st_mtime:
+        cached = self.crc_cache.get(path, stat)
+        if cached is not None:
             if emit_file_progress:
                 self._increment_file_hash_progress(path)
-            return int(cached.hash)
+            return cached
 
         crc = self._crc32(path)
-
-        with self._state_lock:
-            self.state.put(
-                path=path,
-                size=stat.st_size,
-                mtime=stat.st_mtime,
-                hash=crc,
-            )
+        self.crc_cache.put(path, stat, crc)
+        self.crc_cache.flush()
 
         if emit_file_progress:
             self._increment_file_hash_progress(path)
@@ -179,33 +171,30 @@ class LocalScanner(BaseScanner):
             )
             return self._cache_folder_tree_hash(root, tree, file_hashes)[0]
         finally:
+            self.crc_cache.flush()
             self._hash_progress = previous_progress
 
     def _get_file_hashes_parallel(self, files: list[Path]) -> dict[Path, int]:
         hashes: dict[Path, int] = {}
-        pending: list[tuple[Path, int, float]] = []
+        pending = []
 
         for file in files:
             stat = file.stat()
-            with self._state_lock:
-                cached = self.state.get(file)
-
-            if cached and cached.size == stat.st_size and cached.mtime == stat.st_mtime:
-                hashes[file] = int(cached.hash)
+            cached = self.crc_cache.get(file, stat)
+            if cached is not None:
+                hashes[file] = cached
                 self._increment_file_hash_progress(file)
-                continue
-
-            pending.append((file, stat.st_size, stat.st_mtime))
+            else:
+                pending.append((file, stat))
 
         if not pending:
             return hashes
 
         if len(pending) == 1:
-            file, size, mtime = pending[0]
+            file, stat = pending[0]
             crc = self._crc32(file)
             hashes[file] = crc
-            with self._state_lock:
-                self.state.put(path=file, size=size, mtime=mtime, hash=crc)
+            self.crc_cache.put(file, stat, crc)
             self._increment_file_hash_progress(file)
             return hashes
 
@@ -213,15 +202,14 @@ class LocalScanner(BaseScanner):
 
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="local-crc") as executor:
             futures = {
-                executor.submit(self._crc32, file): (file, size, mtime)
-                for file, size, mtime in pending
+                executor.submit(self._crc32, file): (file, stat)
+                for file, stat in pending
             }
             for future in as_completed(futures):
-                file, size, mtime = futures[future]
+                file, stat = futures[future]
                 crc = future.result()
                 hashes[file] = crc
-                with self._state_lock:
-                    self.state.put(path=file, size=size, mtime=mtime, hash=crc)
+                self.crc_cache.put(file, stat, crc)
                 self._increment_file_hash_progress(file)
 
         return hashes

@@ -93,6 +93,8 @@ class FileState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     error: Optional[Exception] = None
     status: FileDownloadStatus = FileDownloadStatus.QUEUED
+    name: str = ""
+    path: str = ""
 
 
 onCompleteCallback = Optional[Callable[[str, FileState], None]]
@@ -113,6 +115,7 @@ class FilePlanningTask:
     target_dir: Path
     folder_id: Optional[str]
     on_complete: onCompleteCallback
+    output_name: Optional[str] = None
 
 
 class ThrottleState:
@@ -121,6 +124,7 @@ class ThrottleState:
         self.window = window
         self._hard_events = []
         self._byte_events = []
+        self._transferred_bytes = 0
 
     def signal_error(self) -> None:
         now = time.time()
@@ -141,6 +145,7 @@ class ThrottleState:
             return
         now = time.time()
         with self.lock:
+            self._transferred_bytes += byte_count
             self._byte_events.append((now, byte_count))
             self._prune_bytes(now)
 
@@ -162,6 +167,11 @@ class ThrottleState:
     def reset_bytes(self) -> None:
         with self.lock:
             self._byte_events.clear()
+
+    def transferred_bytes(self) -> int:
+        """Lifetime network bytes, excluding cached progress and batch resets."""
+        with self.lock:
+            return self._transferred_bytes
 
     def _prune_times(self, arr, now: float) -> None:
         cutoff = now - self.window

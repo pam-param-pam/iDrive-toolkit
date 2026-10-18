@@ -1,178 +1,91 @@
 import logging
+import time
 from dataclasses import asdict
-from queue import Queue
-from typing import List, Dict
+from queue import Empty
 
-from .UploadContext import UploadContext
-from .models import BackendFile, FileUploadStatus
-from ..exceptions import BackendHttpError, BackendInternalServerError, BackendRateLimitError, BackendServerTimeout, BackendServiceUnavailableError
-from ..utils.networker import make_request
+from .models import FileUploadStatus
+from ..utils.transfer.retry import is_transient_error
 
 logger = logging.getLogger("iDrive")
 
 
 class FileSaverWorker:
-    def __init__(self, ready_files_queue: Queue, ctx: UploadContext):
-        self._ready_files_queue = ready_files_queue
+    RETRY_BUDGET_SECONDS = 180
+    MAX_BATCH_FILES = 20
+
+    def __init__(self, ready_files_queue, ctx, session, max_retries=20):
+        self.session = session
+        self._queue = ready_files_queue
         self.ctx = ctx
+        self.max_retries = max_retries
+        self._attempts = {}
 
-        self.finished_files: List[BackendFile] = []
-        self.failed_files: List[BackendFile] = []
-        self.running = False
-
-    # ---------------- control ----------------
-
-    def stop(self) -> None:
-        self.running = False
-
-    def is_running(self) -> bool:
-        return self.running
-
-    # ---------------- main loop ----------------
-
-    def run(self) -> None:
-        if self.running:
-            logger.warning("FileSaverWorker is already running!")
-            return
-
-        self.running = True
-
-        while self.running:
-            file = self._ready_files_queue.get()
+    def run(self):
+        while True:
+            batch = [self._queue.get()]
             try:
-                if file is None:
-                    self._flush_finished_files()
-                    break
-
-                state = self.ctx.states.get(file.frontend_id)
-                if state and state.status in (FileUploadStatus.FAILED, FileUploadStatus.ABORTED):
-                    continue
-
-                self.finished_files.append(file)
-                self._save_files_if_needed()
-
-            finally:
-                self._ready_files_queue.task_done()
-
-        self.running = False
-
-    # ---------------- batching logic ----------------
-
-    def _should_save_files(self) -> bool:
-        for state in self.ctx.states.values():
-            if state.is_terminal():
-                continue
-            if not state.is_fully_uploaded():
-                return False
-        return True
-
-    def _save_files_if_needed(self) -> None:
-        total_size = sum(f.size for f in self.finished_files)
-
-        if len(self.finished_files) > 20 or total_size > 100 * 1024 * 1024 or self._should_save_files() or self.ctx.is_upload_fully_finished():
-            self._flush_finished_files()
-
-    def _flush_finished_files(self) -> None:
-        if not self.finished_files:
-            return
-
-        batch = self.finished_files
-        self.finished_files = []
-        self._save_files(batch)
-
-    # ---------------- backend interaction ----------------
-
-    def _save_files(self, files: List[BackendFile]) -> None:
-        resource_passwords: Dict[str, str] = {}
-
-        for file in files:
-            state = self.ctx.states[file.frontend_id]
-            if not state:
-                continue
-
-            parent_password = state.artifacts.parent_password
-            lock_from_id = state.artifacts.lock_from_id
-
-            if parent_password and lock_from_id:
-                resource_passwords[lock_from_id] = parent_password
-
-        attempt = 0
-        try:
-            while not self.ctx.stop_requested.is_set():
-                try:
-                    self._mark_backend_save_retrying(files, attempt)
-                    make_request("POST", "files", data={"files": [asdict(f) for f in files], "resourcePasswords": resource_passwords})
-                    self._on_backend_save(files)
-                    return
-                except Exception as exc:
-                    if not self._is_retryable_backend_save_error(exc):
-                        raise
-
-                    wait = self._backend_retry_wait(exc, attempt)
-                    logger.warning(
-                        "[FileSaverWorker] Backend save transient failure (%s) -> retrying in %.1fs "
-                        "(attempt %s, files=%s)",
-                        exc.__class__.__name__,
-                        wait,
-                        attempt,
-                        len(files),
-                    )
-                    if self.ctx.stop_requested.wait(wait):
+                while batch[-1] is not None and len(batch) < self.MAX_BATCH_FILES:
+                    try:
+                        batch.append(self._queue.get_nowait())
+                    except Empty:
+                        break
+                if self.ctx.stop_requested.is_set():
+                    if batch[-1] is None:
                         return
-                    attempt += 1
+                    continue
+                ready = []
+                for file in batch:
+                    if file is not None:
+                        state = self.ctx.get_state(file.frontend_id)
+                        if not state.is_terminal():
+                            ready.append((file, state))
+                if ready:
+                    self._save_batch(ready)
+                if batch[-1] is None:
+                    return
+            finally:
+                for _ in batch:
+                    self._queue.task_done()
 
-        except Exception as exc:
-            logger.exception(f"Save failed for files: {files}")
-            self._on_backend_save_error(files, exc)
-
-    # ---------------- result handling ----------------
-
-    def _on_backend_save(self, files: List[BackendFile]) -> None:
-        for file in files:
-            state = self.ctx.states[file.frontend_id]
-            state.status = FileUploadStatus.COMPLETED
-            # self.ctx.mark_file_saved(file.frontend_id)
-
-
-    def _on_backend_save_error(self, files: List[BackendFile], error: Exception) -> None:
-        for file in files:
-            state = self.ctx.states[file.frontend_id]
-            state.status = FileUploadStatus.SAVE_FAILED
-            state.error = error
-            self.failed_files.append(file)
-
-    def _mark_backend_save_retrying(self, files: List[BackendFile], attempt: int) -> None:
-        status = FileUploadStatus.SAVING if attempt == 0 else FileUploadStatus.RETRYING
-        for file in files:
-            state = self.ctx.states.get(file.frontend_id)
-            if state is None or state.is_terminal():
-                continue
-            state.status = status
-
-    def _is_retryable_backend_save_error(self, error: Exception) -> bool:
-        if isinstance(error, (BackendServerTimeout, BackendRateLimitError, BackendServiceUnavailableError, BackendInternalServerError)):
-            return True
-        if isinstance(error, BackendHttpError):
-            return error.status is not None and error.status >= 500
-        return False
-
-    def _backend_retry_wait(self, error: Exception, attempt: int) -> float:
-        explicit_wait = getattr(error, "wait", None)
-        if explicit_wait is not None:
-            return min(float(explicit_wait), 60.0)
-        return min(60.0, 2.0 * (2 ** min(attempt, 5)))
-
-    # ---------------- retry ----------------
-
-    def retry_failed_files(self) -> None:
-        if not self.failed_files:
-            return
-
-        batch = self.failed_files
-        self.failed_files = []
-
-        for file in batch:
-            state = self.ctx.states[file.frontend_id]
-            if state:
-                state.status = FileUploadStatus.RETRYING
-            self._ready_files_queue.put(file)
+    def _save_batch(self, ready):
+        passwords = {}
+        for file, state in ready:
+            self._attempts.setdefault(file.frontend_id, (0, time.monotonic()))
+            state.backend_file = file
+            state.status = FileUploadStatus.SAVING
+            artifacts = state.artifacts
+            if artifacts.parent_password and artifacts.lock_from_id:
+                passwords[artifacts.lock_from_id] = artifacts.parent_password
+        try:
+            self.session.make_request("POST", "files", data={
+                "files": [asdict(file) for file, _ in ready], "resourcePasswords": passwords,
+            })
+        except Exception as error:
+            if len(ready) > 1 and not is_transient_error(error):
+                # A rejected file must not mark its siblings failed. Successful
+                # requests retain frontend IDs, including during reconciliation.
+                middle = len(ready) // 2
+                self._save_batch(ready[:middle])
+                self._save_batch(ready[middle:])
+                return
+            for file, state in ready:
+                attempt, started = self._attempts[file.frontend_id]
+                delay = min(float(getattr(error, "wait", 2 ** min(attempt + 1, 6)) or 1), 60)
+                with state.lock:
+                    state.error = error
+                    can_retry = (is_transient_error(error) and attempt < self.max_retries
+                                 and time.monotonic() + delay - started <= self.RETRY_BUDGET_SECONDS)
+                    state.status = FileUploadStatus.RETRYING if can_retry else FileUploadStatus.SAVE_FAILED
+                if can_retry:
+                    self._attempts[file.frontend_id] = (attempt + 1, started)
+                    self._queue.defer(file, delay)
+                else:
+                    self._attempts.pop(file.frontend_id, None)
+                    logger.warning("Backend save failed for %s: %s", file.name, error)
+        else:
+            for file, state in ready:
+                with state.lock:
+                    state.status = FileUploadStatus.COMPLETED
+                    state.error = None
+                    state.backend_file = None
+                self._attempts.pop(file.frontend_id, None)

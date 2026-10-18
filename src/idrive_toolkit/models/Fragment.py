@@ -2,8 +2,8 @@ from ..models.Resource import Resource
 
 
 class Fragment(Resource):
-    def __init__(self, fragment_id: str,offset: int, sequence: int, size: int, crc: int):
-        super().__init__(fragment_id)
+    def __init__(self, fragment_id: str,offset: int, sequence: int, size: int, crc: int, session=None):
+        super().__init__(fragment_id, session=session)
         self.offset = offset
         self.sequence = sequence
         self.size = size

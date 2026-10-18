@@ -21,16 +21,26 @@ class NetworkError(IDriveException):
 
     source = "Network"
 
-    def __init__(self, message=None, *, response=None, cause=None):
+    def __init__(self, message=None, response=None, cause=None):
         self.response = response
         self.cause = cause
         self.underlying_exception = cause
         self.status = getattr(response, "status_code", None)
         self.headers = getattr(response, "headers", {}) or {}
-        self.text = getattr(response, "text", "") or ""
-        self.content = getattr(response, "content", b"") or b""
+        try:
+            self.text = getattr(response, "text", "") or ""
+            self.content = getattr(response, "content", b"") or b""
+        except RuntimeError:  # httpx streaming response body has not been read
+            self.text, self.content = "", b""
 
-        request = getattr(response, "request", None) or getattr(cause, "request", None)
+        request = None
+        for source in (response, cause):
+            try:
+                request = getattr(source, "request", None)
+            except RuntimeError:  # httpx exceptions may not have a request attached
+                continue
+            if request is not None:
+                break
         self.request = request
         self.method = getattr(request, "method", None)
         self.url = str(getattr(request, "url", "")) if request is not None else ""
@@ -79,7 +89,7 @@ class HttpError(NetworkError):
     Provides helpers to inspect the underlying response.
     """
 
-    def __init__(self, response, message=None, *, cause=None):
+    def __init__(self, response, message=None, cause=None):
         if not hasattr(response, "status_code"):
             raise TypeError(f"{self.__class__.__name__} requires an HTTP response object")
         super().__init__(message, response=response, cause=cause)
@@ -105,7 +115,7 @@ class DiscordHttpError(HttpError):
 
 
 class DiscordRateLimitError(DiscordHttpError):
-    def __init__(self, response, *, cause=None):
+    def __init__(self, response, cause=None):
         is_shared = response.headers.get("x-ratelimit-scope")
         if is_shared:
             header_wait = response.headers.get("retry-after")
@@ -145,7 +155,7 @@ class BackendBadMethodError(BackendHttpError):
     """Raised when 405 on backend"""
 
 class BackendRateLimitError(BackendHttpError):
-    def __init__(self, response, *, cause=None):
+    def __init__(self, response, cause=None):
         header_wait = response.headers.get("Retry-After")
 
         self.wait = _parse_retry_after(header_wait, 2.0)
@@ -161,11 +171,15 @@ class BackendRateLimitError(BackendHttpError):
 class BackendMissingOrIncorrectResourcePasswordError(BackendHttpError):
     """Raised when 469 on backend"""
 
+    def __init__(self, response, message=None, cause=None, *, session):
+        self.session = session
+        super().__init__(response, message=message, cause=cause)
+
 class BackendInternalServerError(BackendHttpError):
     """Raised when 500 on backend"""
 
 class BackendServiceUnavailableError(BackendHttpError):
-    def __init__(self, response, message=None, *, cause=None):
+    def __init__(self, response, message=None, cause=None):
         self.wait = 5.0
         super().__init__(response, message, cause=cause)
 
@@ -182,6 +196,50 @@ class BackendServiceUnavailableError(BackendHttpError):
 
 class ForcedLogoutException(GeneralError):
     """Raised when your session is invalidated, and you're forced to re login"""
+
+
+def is_session_authentication_failure(error: BaseException) -> bool:
+    """Return whether an error definitively invalidates saved credentials."""
+    seen = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (BackendUnauthorizedError, ForcedLogoutException)):
+            return True
+        if isinstance(current, BackendBadRequestError) and _bad_request_rejects_credentials(current):
+            return True
+        current = getattr(current, "__cause__", None) or getattr(current, "cause", None)
+    return False
+
+
+def _bad_request_rejects_credentials(error: BackendBadRequestError) -> bool:
+    values = [str(error), getattr(error, "text", "")]
+    payload = error.json()
+    if payload is not None:
+        values.extend(_string_values(payload))
+    message = " ".join(value.lower() for value in values if value)
+    return any(phrase in message for phrase in (
+        "bad credentials",
+        "invalid credentials",
+        "incorrect credentials",
+        "authentication credentials",
+        "invalid token",
+        "token is invalid",
+        "expired token",
+        "token has expired",
+        "invalid auth token",
+    ))
+
+
+def _string_values(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _string_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _string_values(item)
 
 class UploadNotAllowedError(GeneralError):
     """Raised when uploading is not allowed"""

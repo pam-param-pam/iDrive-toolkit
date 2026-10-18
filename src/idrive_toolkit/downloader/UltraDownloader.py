@@ -5,7 +5,7 @@ import threading
 import time
 from pathlib import Path
 from queue import Queue, Empty, Full
-from typing import List, Iterable, Optional
+from typing import List, Optional
 
 from .DownloadContext import DownloadContext
 from .DownloadWorker import DownloadWorker
@@ -13,11 +13,13 @@ from .FinalizeWorker import FinalizeWorker
 from .MetadataFetcher import MetadataFetcher
 from .FilePlanningWorker import FilePlanningWorker
 from .models import FileDownloadStatus, FilePlanningTask, FragmentTask, ThrottleState, FileState, onCompleteCallback
-from ..Config import APIConfig
 from ..models.Item import Item
-from ..state.Storage import get_storage, safe_rmtree
-from ..utils.autoScaler.AutoScalePolicy import AutoScalePolicy
-from ..utils.autoScaler.AutoScaler import AutoScaler
+from ..utils.transfer.retry import RetryableTransfer
+from ..utils.transfer.scheduled_queue import ScheduledQueue
+from ..utils.transfer.worker_pool import WorkerPool
+from ..state.Storage import cleanup_expired_transfers
+from ..utils.transfer.autoScaler.AutoScalePolicy import AutoScalePolicy
+from ..utils.transfer.autoScaler.AutoScaler import AutoScaler
 
 UPLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
     scale_up_step=3,
@@ -41,21 +43,31 @@ UPLOAD_AUTOSCALE_POLICY_TEMPLATE = AutoScalePolicy(
 logger = logging.getLogger("iDrive")
 
 
-class UltraDownloader:
+class UltraDownloader(RetryableTransfer):
     def __init__(
         self,
         min_workers: int,
         max_workers: int,
-        planner_workers: int = 2,
+        session, planner_workers: int = 2,
         file_queue_size: int = 256,
         fragment_queue_size: Optional[int] = None,
         finalize_queue_size: Optional[int] = None,
+        storage=None, write_guard=None,
+        download_folder: str | Path = "downloads",
+        recursive_folder_listing: bool = False,
+        max_retries: int = 5,
     ):
-        self.storage = get_storage()
+        self.session = session
+        self.storage = storage or session.storage
+        self.write_guard = write_guard
+        self.download_folder = Path(download_folder)
         self._temp_download_folder = self.storage.get_temp_path("downloader")
 
         self.ctx = DownloadContext()
-        self.metadata_fetcher = MetadataFetcher()
+        self.metadata_fetcher = MetadataFetcher(
+            session=self.session,
+            recursive_folder_listing=recursive_folder_listing,
+        )
 
         self.throttle = ThrottleState()
         self.policy = UPLOAD_AUTOSCALE_POLICY_TEMPLATE.with_bounds(
@@ -64,7 +76,12 @@ class UltraDownloader:
         )
         self.scaler = AutoScaler(throttle_state=self.throttle, policy=self.policy)
 
-        self.max_retries = 5
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
+        self.max_retries = max_retries
+        self.metadata_fetcher.max_retries = max_retries
+        self._init_retry()
+        self._retry_tasks = {}
         self.post_workers = min(8, max(2, os.cpu_count() or 2))
         self.planner_workers = max(1, planner_workers)
 
@@ -72,11 +89,13 @@ class UltraDownloader:
         finalize_queue_size = finalize_queue_size or max(64, self.post_workers * 4)
 
         self._file_queue: Queue[FilePlanningTask] = Queue(maxsize=file_queue_size)
-        self._fragment_queue: Queue[FragmentTask] = Queue(maxsize=fragment_queue_size)
+        self._fragment_queue = ScheduledQueue(maxsize=fragment_queue_size)
         self._finalize_queue: Queue[str] = Queue(maxsize=finalize_queue_size)
 
         self._planner_threads: List[threading.Thread] = []
-        self._download_threads: List[threading.Thread] = []
+        self._download_pool = WorkerPool(self._create_download_worker, "discord-download")
+        self.scaler.live_workers = self._download_pool.available_workers
+        self.scaler.backlog = self._fragment_queue.ready_count
         self._finalize_threads: List[threading.Thread] = []
         self._scaler_thread: Optional[threading.Thread] = None
         self._monitor_thread: Optional[threading.Thread] = None
@@ -122,11 +141,10 @@ class UltraDownloader:
             return
 
         def spawn_one():
-            t = self._start_download_thread()
-            self._download_threads.append(t)
+            return self._download_pool.spawn()
 
         def kill_one():
-            return self._try_put_sentinel(self._fragment_queue)
+            return self._download_pool.retire_one()
 
         for _ in range(self.planner_workers):
             t = self._start_planner_thread()
@@ -174,12 +192,18 @@ class UltraDownloader:
     # Public API
     # ------------------------------------------------------------------
 
-    def download(self, data: Item, target_dir: Path = APIConfig.download_folder, on_complete: onCompleteCallback = None, passwords: dict = None) -> None:
+    def set_download_folder(self, path: str | Path) -> None:
+        self.download_folder = Path(path)
+
+    def download(self, data: Item, target_dir: Path | None = None, on_complete: onCompleteCallback = None, passwords: dict = None, output_name: str | None = None) -> None:
         if self._shutdown:
             raise RuntimeError("Downloader has been shut down")
 
+        self.session.require_owner(data)
+        if output_name is not None and (data.is_dir or Path(output_name).name != output_name or output_name in ("", ".", "..") or "/" in output_name or "\\" in output_name):
+            raise ValueError("output_name must be a single filename for a file download")
         files = self.metadata_fetcher.fetch_files(data, passwords)
-        target_dir = Path(target_dir)
+        target_dir = Path(target_dir if target_dir is not None else self.download_folder)
         folder_id = data.id if data.is_dir else None
         size_estimated = sum(file["size"] for file in files)
 
@@ -187,7 +211,7 @@ class UltraDownloader:
         # particular, a low-space error must not leave the autoscaler and the
         # downloader threads running behind the caller's exception handler.
         self.check_target_dir(target_dir, size_estimated)
-        self.ctx.reserve_files([file["id"] for file in files], size_estimated)
+        self.ctx.reserve_files(files)
         self._start_workers()
 
         for raw_file in files:
@@ -197,28 +221,16 @@ class UltraDownloader:
                     target_dir=target_dir,
                     folder_id=folder_id,
                     on_complete=on_complete,
+                    output_name=output_name,
                 )
             )
 
     def get_temp_download_folder(self) -> Path:
         return self._temp_download_folder
 
-    def _get_dangling_folders(self) -> Iterable[Path]:
-        active = set(self.ctx.states.keys())
-        root = self.storage.temp_download_dir
-
-        for entry in root.iterdir():
-            if not entry.is_dir():
-                continue
-
-            if entry.name in active:
-                continue
-
-            yield entry
-
     def clear_dangling_files(self):
-        for folder in self._get_dangling_folders():
-            safe_rmtree(folder)
+        """Expire old fragments while keeping recent ones available for resume."""
+        cleanup_expired_transfers(self._temp_download_folder)
 
     # ------------------------------------------------------------------
     # State querying
@@ -232,6 +244,16 @@ class UltraDownloader:
 
     def get_failed_states(self):
         return self.ctx.get_failed_states()
+
+    def record_failure(self, file_id, node, error):
+        with self.ctx.lock:
+            state = self.ctx.states.get(file_id)
+            if state is None:
+                state = FileState(file_id=file_id, fragments_total=0, size_total=node.size or 0, name=node.name)
+                self.ctx.states[file_id] = state
+            with state.lock:
+                state.error = error
+                state.status = FileDownloadStatus.FAILED
 
     def get_download_rate(self) -> float:
         return self.throttle.bytes_rate()
@@ -262,6 +284,7 @@ class UltraDownloader:
 
     def _start_planner_thread(self) -> threading.Thread:
         planner = FilePlanningWorker(
+            session=self.session, storage=self.storage, write_guard=self.write_guard,
             temp_folder=self._temp_download_folder,
             file_queue=self._file_queue,
             fragment_queue=self._fragment_queue,
@@ -273,32 +296,39 @@ class UltraDownloader:
         t.start()
         return t
 
-    def _start_download_thread(self) -> threading.Thread:
-        worker = DownloadWorker(
+    def _create_download_worker(self):
+        return DownloadWorker(
+            session=self.session, storage=self.storage, write_guard=self.write_guard,
             fragment_queue=self._fragment_queue,
             finalize_queue=self._finalize_queue,
             ctx=self.ctx,
             throttle=self.throttle,
             max_retries=self.max_retries
         )
-        t = threading.Thread(target=worker.run, daemon=True)
-        t.start()
-        return t
 
     def _start_finalize_thread(self) -> threading.Thread:
-        worker = FinalizeWorker(self._finalize_queue, self.ctx)
+        worker = FinalizeWorker(self._finalize_queue, self.ctx, session=self.session, storage=self.storage, write_guard=self.write_guard)
         t = threading.Thread(target=worker.run, daemon=True)
         t.start()
         return t
 
+    def _retry_files(self, keys):
+        tasks = [self._retry_tasks[key] for key in keys]
+        with self.ctx.lock:
+            for key in keys:
+                state = self.ctx.states.pop(key)
+                self.ctx.downloaded_bytes -= state.bytes_downloaded
+                self.ctx.records.pop(key, None)
+        self._start_workers()
+        for task in tasks:
+            self._put_file_task(task)
+
     def join(self) -> None:
-        try:
+        def drain():
             self._file_queue.join()
             self._fragment_queue.join()
             self._finalize_queue.join()
-        finally:
-            self._stop_scaler()
-            self._stop_queue_monitor()
+        self._wait_for_attempts(drain)
 
     # ------------------------------------------------------------------
     # Optional: graceful shutdown
@@ -329,7 +359,6 @@ class UltraDownloader:
             self._mark_unfinished_cancelled()
 
         live_planner_threads = [t for t in self._planner_threads if t.is_alive()]
-        live_download_threads = [t for t in self._download_threads if t.is_alive()]
         live_finalize_threads = [t for t in self._finalize_threads if t.is_alive()]
 
         for _ in live_planner_threads:
@@ -337,10 +366,7 @@ class UltraDownloader:
         for t in live_planner_threads:
             t.join()
 
-        for _ in live_download_threads:
-            self._fragment_queue.put(None)
-        for t in live_download_threads:
-            t.join()
+        self._download_pool.close()
 
         for _ in live_finalize_threads:
             self._finalize_queue.put(None)
@@ -353,6 +379,8 @@ class UltraDownloader:
         return self._shutdown
 
     def _put_file_task(self, task: FilePlanningTask) -> None:
+        self._retry_tasks[task.raw_file["id"]] = task
+        self._retry_ready = False
         while not self.ctx.stop_requested.is_set():
             try:
                 self._file_queue.put(task, timeout=0.5)
@@ -362,22 +390,10 @@ class UltraDownloader:
 
         raise RuntimeError("Download cancelled")
 
-    def _put_sentinel(self, queue: Queue) -> None:
-        while not self.ctx.stop_requested.is_set():
-            try:
-                queue.put(None, timeout=0.5)
-                return
-            except Full:
-                continue
-
-    def _try_put_sentinel(self, queue: Queue) -> bool:
-        try:
-            queue.put(None, timeout=0.25)
-        except Full:
-            return False
-        return True
-
     def _drain_queue(self, queue: Queue) -> None:
+        if isinstance(queue, ScheduledQueue):
+            queue.discard_pending()
+            return
         while True:
             try:
                 queue.get_nowait()

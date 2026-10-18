@@ -1,21 +1,17 @@
-import threading
+from dataclasses import dataclass, field
+from urllib.parse import urlparse, urlunparse
 
 
+@dataclass
 class APIConfig:
-    base_url = None
-    base_ws = None
-    token = None
-    download_folder = "downloads"
-    user = None
-    _instance = None
-    _lock = threading.Lock()
+    """Configuration owned by one client; never process-wide state."""
 
-    def __new__(cls):
-        if cls._instance is None:
-            with cls._lock:
-                # Another thread could have created the instance
-                # before we acquired the lock. So check that the
-                # instance is still nonexistent.
-                if not cls._instance:
-                    cls._instance = super().__new__(cls)
-        return cls._instance
+    base_url: str
+    token: str | None = field(default=None, repr=False)
+    device_id: str | None = None
+
+    @property
+    def base_ws(self) -> str:
+        parsed = urlparse(self.base_url)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        return str(urlunparse(parsed._replace(scheme=scheme)).rstrip("/"))

@@ -3,7 +3,7 @@ import time
 import logging
 from typing import Any, Callable, Optional
 
-from ...utils.autoScaler.AutoScalePolicy import AutoScalePolicy
+from .AutoScalePolicy import AutoScalePolicy
 
 logger = logging.getLogger("iDrive")
 
@@ -41,6 +41,8 @@ class AutoScaler:
 
         self._pause_event = threading.Event()
         self._pause_event.set()  # running by default
+        self.live_workers = None
+        self.backlog = None
 
     # -------------------------------
     # Worker count management
@@ -165,6 +167,11 @@ class AutoScaler:
             can_scale_down = (now - self._last_scale_down_time) >= self._scale_down_cooldown
 
             with self.lock:
+                if self.live_workers is not None:
+                    self.current = self.live_workers()
+                    while self.current < self.policy.min_workers:
+                        if not self._increase_workers(spawn_func):
+                            break
                 if now < self._backoff_until:
                     logger.info(
                         "Sample skipped during backoff workers=%s rate=%.1fB/s "
@@ -188,6 +195,15 @@ class AutoScaler:
                     continue
 
                 self._observe_rate(rate)
+                if (rate <= 0 and hard_errors == 0 and self.backlog is not None
+                        and self.backlog() > 0 and can_scale_up
+                        and self._low_rate_steps >= self.policy.scale_up_window
+                        and self.current < self.policy.max_workers):
+                    # A stalled worker must not require successful traffic
+                    # before another worker is allowed to make progress.
+                    if self._increase_workers(spawn_func):
+                        self._reset_trend(rate)
+                    continue
                 self._log_sample(
                     rate=rate,
                     hard_errors=hard_errors,
@@ -350,7 +366,7 @@ class AutoScaler:
     def _should_accept_probe(self) -> bool:
         if self._probe_reference_rate is None:
             return False
-        return self._best_rate_since_scale >= self._probe_reference_rate * 1.0 + self.policy.up_improvement_factor
+        return self._best_rate_since_scale >= self._probe_reference_rate * (1.0 + self.policy.up_improvement_factor)
 
     def _should_roll_back_probe(self) -> bool:
         if self._probe_reference_rate is None:

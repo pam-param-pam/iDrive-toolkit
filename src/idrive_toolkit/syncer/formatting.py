@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from .BaseScanner import Node
-from .DiffEngine import DiffEntry, NodeStatus
+from .scanning import DiffEntry, Node, NodeStatus
 from ..models.Folder import Folder
 
 
 def entry_node(entry: DiffEntry) -> Node:
-    if entry.local is not None:
-        return entry.local
-    if entry.remote is not None:
-        return entry.remote
+    if entry.left is not None:
+        return entry.left
+    if entry.right is not None:
+        return entry.right
     raise ValueError(f"{entry.status.value} entry has no node")
 
 
@@ -17,21 +16,21 @@ def entry_name(entry: DiffEntry) -> str:
     return entry_node(entry).name
 
 
-def entry_local_label(entry: DiffEntry) -> str:
-    if entry.status == NodeStatus.ONLY_REMOTE:
+def entry_left_label(entry: DiffEntry) -> str:
+    if entry.status == NodeStatus.ONLY_RIGHT:
         return "-"
 
-    local_path = entry.local_path
-    if local_path is None:
+    left_path = entry.left_path
+    if left_path is None:
         return "-"
-    return str(local_path)
+    return str(left_path)
 
 
-def entry_remote_label(entry: DiffEntry) -> str:
-    remote_id = entry.remote_id
-    if remote_id is None:
+def entry_right_label(entry: DiffEntry) -> str:
+    right_id = entry.right_id
+    if right_id is None:
         return "-"
-    return remote_id
+    return right_id
 
 
 def remote_label(remote_root: Folder | str) -> str:

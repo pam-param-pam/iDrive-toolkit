@@ -89,15 +89,14 @@ from overrides import overrides
 
 from .namedTuples import VisitsNamedTuple
 from ..models.Resource import Resource
-from ..utils.networker import make_request
 
 logger = logging.getLogger("iDrive")
 
 
 """Stinking pile of hot garbage"""
 class Share(Resource):
-    def __init__(self, token):
-        super().__init__(token)
+    def __init__(self, token, session=None):
+        super().__init__(token, session=session)
         self.token: str = token
         self._expire: Optional[str] = None
         self._id: Optional[str] = None
@@ -129,7 +128,7 @@ class Share(Resource):
 
 
     def get_visits(self) -> list[VisitsNamedTuple]:
-        data = make_request("GET", f"shares/{self.token}/visits")
+        data = self.session.make_request("GET", f"shares/{self.token}/visits")
         visit_tuples = []
         for visit in data["accesses"]:
             visit_tuples.append(VisitsNamedTuple(**visit))

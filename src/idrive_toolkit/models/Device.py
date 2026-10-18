@@ -1,7 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
-from ..utils.networker import make_request
 
 
 @dataclass
@@ -16,6 +15,7 @@ class Device:
     country: Optional[str]
     city: Optional[str]
     device_type: str
+    session: object = field(default=None, repr=False, compare=False, kw_only=True)
 
     def logout(self):
-        make_request("DELETE", f"auth/devices/{self.device_id}")
+        self.session.make_request("DELETE", f"auth/devices/{self.device_id}")

@@ -100,8 +100,13 @@ class PrepareRequestWorker:
 
             except Exception as e:
                 logger.exception(f"Failed to prepare request on {item.path}")
-                self.ctx.add_error(e)
-                self._fail_new_request_states(initial_state_ids, e)
+                if item.frontend_id is not None:
+                    state = self.ctx.get_state(item.frontend_id)
+                    with state.lock:
+                        state.status = FileUploadStatus.FAILED
+                        state.error = e
+                else:
+                    self._fail_new_request_states(initial_state_ids, e)
 
             finally:
                 self.ctx.complete_upload_request()
@@ -117,6 +122,7 @@ class PrepareRequestWorker:
 
         path = input_item.path
         parent = input_item.parent
+        remote_name = input_item.name or path.name
         lock_from_id = input_item.lock_from_id
         prof = FileProfiler(path.name)
 
@@ -132,12 +138,18 @@ class PrepareRequestWorker:
         stat = path.stat()
         file_size = stat.st_size
         created_at = int(stat.st_mtime * 1000)
-        extension = get_file_extension(path.name)
+        extension = get_file_extension(remote_name)
 
-        frontend_id = str(uuid.uuid4())
+        frontend_id = input_item.frontend_id or str(uuid.uuid4())
+        self.ctx.retry_inputs[frontend_id] = UploadInput(
+            path=path, parent=parent, lock_from_id=lock_from_id,
+            name=input_item.name, frontend_id=frontend_id,
+        )
 
-        state = UploadFileState()
-        self.ctx.register(frontend_id, state)
+        state = self.ctx.get_all_states().get(frontend_id)
+        if state is None:
+            state = UploadFileState(name=remote_name, path=str(path))
+            self.ctx.register(frontend_id, state)
 
         self.ctx.set_status(frontend_id, FileUploadStatus.SCANNING)
 
@@ -159,7 +171,7 @@ class PrepareRequestWorker:
 
         self.ctx.set_artifacts(frontend_id, FileArtifacts(
             frontend_id=frontend_id,
-            name=path.name,
+            name=remote_name,
             extension=extension,
             created_at=created_at,
             size=file_size,
@@ -307,7 +319,17 @@ class PrepareRequestWorker:
         if req:
             yield req
 
+        with state.lock:
+            if state.status == FileUploadStatus.SCANNING:
+                state.status = FileUploadStatus.QUEUED
+
     def _put_until_stopped(self, queue: Queue, item) -> bool:
+        if queue is self._upload_queue:
+            for attachment in item.attachments:
+                state = self.ctx.states[attachment.frontend_id]
+                with state.lock:
+                    if state.status == FileUploadStatus.SCANNING:
+                        state.status = FileUploadStatus.QUEUED
         while not self.ctx.stop_requested.is_set():
             try:
                 queue.put(item, timeout=0.5)
@@ -318,7 +340,7 @@ class PrepareRequestWorker:
 
     def _fail_new_request_states(self, initial_state_ids: set[str], error: Exception) -> None:
         for file_id, state in self.ctx.get_all_states().items():
-            if file_id in initial_state_ids:
+            if file_id in initial_state_ids and state.status != FileUploadStatus.SCANNING:
                 continue
 
             with state.lock:

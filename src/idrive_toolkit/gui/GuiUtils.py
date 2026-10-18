@@ -67,12 +67,15 @@ def safe_item_label(item: Item) -> str:
 
 
 def needs_resource_password(item: Item) -> bool:
-    return item.is_locked and not item.password
+    # This is a UI preflight, not permission to access an unvisited resource.
+    # Unknown lock state is resolved by the actual operation and its 469 retry.
+    return bool(item._is_locked or item._lock_from) and not item.password
 
 
 def password_prompt_item(
     error: BackendMissingOrIncorrectResourcePasswordError,
     items: Iterable[Item | None] = (),
+    *, session,
 ) -> Item | None:
     required = _required_password_folder(error)
     if required is None:
@@ -80,18 +83,14 @@ def password_prompt_item(
 
     required_id, required_name = required
     for item in items:
-        if item is not None and str(getattr(item, "_id", item.id)) == required_id:
-            item._name = getattr(item, "_name", None) or required_name
-            item._is_locked = True
-            item._lock_from = getattr(item, "_lock_from", None) or required_id
+        if item is not None and item.session is session and str(item.id) == required_id:
+            item.apply_password_requirement(required_name)
             return item
 
     from ..models.Folder import Folder
 
-    item = Folder(required_id)
-    item._name = required_name
-    item._is_locked = True
-    item._lock_from = required_id
+    item = Folder(required_id, session=session)
+    item.apply_password_requirement(required_name)
     return item
 
 

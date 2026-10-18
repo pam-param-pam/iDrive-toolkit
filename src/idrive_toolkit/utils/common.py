@@ -5,10 +5,8 @@ from urllib.parse import unquote
 
 import requests
 
-from ..Config import APIConfig
 from ..models.Folder import Folder
 from ..models.Item import Item
-from .networker import make_request
 
 try:
     from tqdm import tqdm
@@ -27,30 +25,45 @@ def _extract_ids_and_passwords(items: List[Item]) -> dict:
     return {'ids': ids, 'resourcePasswords': resourcePasswords}
 
 
-def move_to_trash(items: List[Item]) -> None:
+def _session_for(items, session=None):
+    if session is None:
+        if not items:
+            raise ValueError("Provide at least one resource or an explicit session")
+        session = items[0].session
+    session.require_owner(*items)
+    return session
+
+
+def move_to_trash(items: List[Item], *, session=None) -> None:
+    session = _session_for(items, session)
     data = _extract_ids_and_passwords(items)
-    make_request("PATCH", f"items/moveToTrash", data)
+    session.make_request("PATCH", f"items/moveToTrash", data)
 
 
-def delete(items: List[Item]) -> None:
+def delete(items: List[Item], *, session=None) -> None:
+    session = _session_for(items, session)
     data = _extract_ids_and_passwords(items)
-    make_request("POST", f"items/delete", data)
+    session.make_request("POST", f"items/delete", data)
 
 
-def restore_from_trash(items: List[Item]) -> None:
+def restore_from_trash(items: List[Item], *, session=None) -> None:
+    session = _session_for(items, session)
     data = _extract_ids_and_passwords(items)
-    make_request("PATCH", f"items/restoreFromTrash", data)
+    session.make_request("PATCH", f"items/restoreFromTrash", data)
 
 
-def move(items: List[Item], new_parent: Folder) -> None:
+def move(items: List[Item], new_parent: Folder, *, session=None) -> None:
+    session = _session_for(items, session)
     data = _extract_ids_and_passwords(items)
+    session.require_owner(new_parent)
     data['new_parent_id'] = new_parent.id
-    make_request("PATCH", f"items/move", data)
+    session.make_request("PATCH", f"items/move", data)
 
 
-def get_zip_download_url(items: List[Item]) -> str:
+def get_zip_download_url(items: List[Item], *, session=None) -> str:
+    session = _session_for(items, session)
     data = _extract_ids_and_passwords(items)
-    data = make_request("POST", f"zip", data)
+    data = session.make_request("POST", f"zip", data)
     return data['download_url']
 
 
@@ -69,7 +82,7 @@ def parse_filename(content_disposition):
     return filename
 
 
-def download_from_url(download_url: str, path: str = None) -> str:
+def download_from_url(download_url: str, path: str = None, *, download_folder="downloads") -> str:
     # Perform the download
     response = requests.get(download_url, stream=True)
     response.raise_for_status()
@@ -79,9 +92,9 @@ def download_from_url(download_url: str, path: str = None) -> str:
     filename = parse_filename(content_disposition)
 
     if path is None:
-        # Default: construct from APIConfig
-        os.makedirs(APIConfig.download_folder, exist_ok=True)
-        path = os.path.join(APIConfig.download_folder, filename)
+        # Use the calling client's download directory
+        os.makedirs(download_folder, exist_ok=True)
+        path = os.path.join(download_folder, filename)
     elif os.path.isdir(path):
         # If path is a directory, join with filename
         path = os.path.join(path, filename)
